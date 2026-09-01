@@ -1,0 +1,65 @@
+# Dev contour for mssql_fdw_rq: MSSQL 2022 (test source) + builder (Rust/pgrx build env).
+# Usage:
+#   cp .env.example .env   # set MSSQL_SA_PASSWORD
+#   docker compose up -d
+#   docker compose exec builder bash
+#     cd wrappers && cargo pgrx test --features "mssql_fdw_rq pg15"
+name: mssql-fdw-rq-dev
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql-rq
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in wrappers/.dev/.env}
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -b -Q 'SELECT 1' > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # One-shot: creates rqtest database (schema + seed) after mssql is healthy.
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      mssql:
+        condition: service_healthy
+    volumes:
+      - ./mssql:/mssql-init:ro
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+    entrypoint: >
+      bash -c '/opt/mssql-tools18/bin/sqlcmd -C -S mssql -U sa -P "$$MSSQL_SA_PASSWORD"
+      -b -i /mssql-init/01_create_db.sql && echo "rqtest initialized"'
+    restart: "no"
+
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.builder
+    container_name: mssql-fdw-rq-builder
+    volumes:
+      # repo root (contains wrappers/, supabase-wrappers/, ...)
+      - ../..:/work
+      # keep heavy build artifacts and cargo cache out of the bind mount
+      - cargo-target:/opt/target
+      - cargo-registry:/usr/local/cargo/registry
+      - pgrx-home:/home/dev/.pgrx
+    environment:
+      CARGO_TARGET_DIR: /opt/target
+      MSSQL_HOST: mssql
+      MSSQL_PORT: "1433"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+    depends_on:
+      mssql:
+        condition: service_healthy
+    command: sleep infinity
+
+volumes:
+  cargo-target:
+  cargo-registry:
+  pgrx-home:
