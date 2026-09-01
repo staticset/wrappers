@@ -767,7 +767,7 @@ pub(crate) unsafe fn target_columns_from_tlist(tlist: *mut pg_sys::List) -> Vec<
                     .to_string_lossy()
                     .into_owned()
             } else {
-                format!("column_{}", output_num)
+                format!("column_{output_num}")
             };
             let type_oid = if (*tle).expr.is_null() {
                 pg_sys::InvalidOid

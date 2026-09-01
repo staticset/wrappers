@@ -143,6 +143,14 @@ mssql_fdw = [
     "num-traits",
     "thiserror",
 ]
+mssql_fdw_rq = [
+    "tiberius",
+    "tokio",
+    "tokio-util",
+    "num-traits",
+    "thiserror",
+    "uuid",
+]
 mysql_fdw = [
     "mysql_async",
     "chrono",
@@ -231,6 +239,7 @@ native_fdws = [
     "logflare_fdw",
     "auth0_fdw",
     "mssql_fdw",
+    "mssql_fdw_rq",
     "mysql_fdw",
     "mongodb_fdw",
     "redis_fdw",
@@ -323,7 +332,8 @@ mysql_async = { version = "0.36.1", optional = true, default-features = false, f
 mongodb = { version = "3.2", optional = true, default-features = false, features = ["rustls-tls", "dns-resolver"] }
 bson = { version = "2.13", optional = true, features = ["chrono-0_4"] }
 
-# for mssql_fdw
+# for mssql_fdw / mssql_fdw_rq
+# (uniqueidentifier support is built-in: tiberius depends on `uuid` directly)
 tiberius = { version = "0.12.2", features = [
     "tds73",
     "native-tls",
