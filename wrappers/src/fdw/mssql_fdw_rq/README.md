@@ -125,3 +125,6 @@ USER=dev cargo pgrx test pg15 --no-default-features --features "mssql_fdw_rq pg1
 
 CI: `.github/workflows/mssql-fdw-rq.yml` runs the same suite on PostgreSQL 15
 and 17 against a live MSSQL 2022 service, plus a Kerberos-feature build check.
+
+Production deployment and upgrade instructions: [`DEPLOY.md`](../../../DEPLOY.md)
+at the repository root.
