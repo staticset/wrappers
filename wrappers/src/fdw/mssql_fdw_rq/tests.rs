@@ -539,7 +539,7 @@ mod tests {
     /// pairs — the reference result required by TZ §7.2.
     fn mssql_direct(sql: &str) -> Vec<(String, String)> {
         let rt = create_async_runtime().expect("runtime");
-        let mut config = Config::from_ado_string(&format!(
+        let config = Config::from_ado_string(&format!(
             "{};User=sa;Password={}",
             mssql_conn_string(),
             mssql_password()
@@ -790,7 +790,7 @@ mod tests {
 
         let mssql = {
             let rt = create_async_runtime().expect("runtime");
-            let mut config = Config::from_ado_string(&format!(
+            let config = Config::from_ado_string(&format!(
                 "{};User=sa;Password={}",
                 mssql_conn_string(),
                 mssql_password()
