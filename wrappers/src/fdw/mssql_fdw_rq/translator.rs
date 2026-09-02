@@ -618,7 +618,28 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 over_order_seen = false;
                                 // last sort key inside OVER(): must be a
                                 // plain NOT NULL column (or NULL ordering
-                                // would silently differ in T-SQL)
+                                // would silently differ in T-SQL). PG17's
+                                // deparser appends an explicit window frame
+                                // (`ROWS … PRECEDING/…`), which trails the
+                                // sort key — lift it off first and put it
+                                // back afterwards.
+                                const FRAME_WORDS: [&str; 9] = [
+                                    "ROWS",
+                                    "RANGE",
+                                    "GROUPS",
+                                    "PRECEDING",
+                                    "FOLLOWING",
+                                    "UNBOUNDED",
+                                    "CURRENT",
+                                    "ROW",
+                                    "BETWEEN",
+                                ];
+                                let mut frame: Vec<String> = Vec::new();
+                                while out.last().is_some_and(|p| {
+                                    FRAME_WORDS.contains(&p.to_uppercase().as_str())
+                                }) {
+                                    frame.insert(0, out.pop().unwrap());
+                                }
                                 let last_desc = pop_if_word(&mut out, "desc");
                                 if !last_desc {
                                     pop_if_word(&mut out, "asc");
@@ -630,7 +651,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                         && ctx.not_null_columns.contains(&expr.to_lowercase());
                                     if !bare_not_null {
                                         return Err(TranslateError::UnsupportedConstruct {
-                                            sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                            sql_fragment: format!("ORDER BY {expr} inside OVER(…)"),
                                             reason: "nullable NULL ordering inside a window \
                                                      cannot be translated to T-SQL faithfully"
                                                 .to_string(),
@@ -639,6 +660,18 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                     if last_desc {
                                         out.push("DESC".to_string());
                                     }
+                                }
+                                // PG17's deparser materializes the default
+                                // frame (`ROWS/RANGE UNBOUNDED PRECEDING`),
+                                // which T-SQL forbids on ranking functions
+                                // and which equals T-SQL's implicit default
+                                // anyway — drop it; keep explicit frames.
+                                let is_default_frame = frame.len() == 3
+                                    && matches!(frame[0].as_str(), "ROWS" | "RANGE")
+                                    && frame[1].eq_ignore_ascii_case("UNBOUNDED")
+                                    && frame[2].eq_ignore_ascii_case("PRECEDING");
+                                if !is_default_frame {
+                                    out.extend(frame);
                                 }
                             }
                         }
@@ -859,9 +892,12 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             if !bare_not_null {
                                 return Err(TranslateError::UnsupportedConstruct {
                                     sql_fragment: "ORDER BY … NULLS … inside OVER(…)".to_string(),
-                                    reason: "nullable NULL ordering inside a window cannot be \
-                                             translated to T-SQL faithfully"
-                                        .to_string(),
+                                    reason: format!(
+                                        "nullable NULL ordering inside a window cannot be \
+                                         translated to T-SQL faithfully (expr={expr:?}, \
+                                         not_null_columns={:?})",
+                                        ctx.not_null_columns
+                                    ),
                                 });
                             }
                         }
