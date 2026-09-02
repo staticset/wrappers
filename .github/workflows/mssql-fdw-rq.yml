@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update -y -qq
           sudo apt-get install -y -qq curl ca-certificates build-essential pkg-config \
-            libssl-dev libgssapi-dev
+            libssl-dev libkrb5-dev
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc
