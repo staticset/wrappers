@@ -1,5 +1,6 @@
 use crate::stats;
 use pgrx::pg_sys;
+use pgrx::spi::Spi;
 use std::collections::HashMap;
 use std::time::Instant;
 use tiberius::{Client, Config};
@@ -126,6 +127,35 @@ impl MssqlFdwRq {
         })
     }
 
+    /// Local boolean column names for the referenced relations, so the
+    /// translator can rewrite bare boolean predicates (`WHERE flag`) into
+    /// `flag = 1`. A catalog read failure degrades to an empty set (the remote
+    /// side then rejects such queries) instead of failing the whole query.
+    fn bool_columns(relations: &[FullQueryRelation]) -> Vec<String> {
+        Spi::connect(|client| {
+            let mut out = Vec::new();
+            for rel in relations {
+                // names come from the local catalog; quotes are doubled so
+                // the regclass literal stays a literal
+                let sql = format!(
+                    "SELECT a.attname::text AS attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = '{}.{}'::pg_catalog.regclass AND a.atttypid = 'bool'::pg_catalog.regtype AND a.attnum > 0 AND NOT a.attisdropped",
+                    rel.local_schema.replace('\'', "''"),
+                    rel.local_table.replace('\'', "''"),
+                );
+                let Ok(table) = client.select(&sql, None, &[]) else {
+                    continue;
+                };
+                for row in table {
+                    if let Ok(Some(name)) = row.get_by_name::<&str, _>("attname") {
+                        out.push(name.to_lowercase());
+                    }
+                }
+            }
+            Ok::<_, pgrx::spi::SpiError>(out)
+        })
+        .unwrap_or_default()
+    }
+
     fn connect(&self) -> MssqlFdwRqResult<Client<Compat<TcpStream>>> {
         let tcp = self
             .rt
@@ -179,7 +209,13 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         catalog: Option<pg_sys::Oid>,
     ) -> MssqlFdwRqResult<()> {
         if let Some(oid) = catalog {
-            let names: Vec<&str> = options.iter().flatten().map(String::as_str).collect();
+            // the framework hands options over as "name=value" strings
+            let names: Vec<String> = options
+                .iter()
+                .flatten()
+                .map(|o| o.split('=').next().unwrap_or_default().to_string())
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let allowed = |allowed: &[&str]| -> MssqlFdwRqResult<()> {
                 for name in &names {
                     if !allowed.contains(name) {
@@ -228,6 +264,32 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         query: &RemoteQuery,
         _options: &HashMap<String, String>,
     ) -> MssqlFdwRqResult<()> {
+        if query.sql.trim().is_empty() {
+            return Err(MssqlFdwRqError::InvalidOption(
+                "no deparsed SQL was provided for remote execution".to_string(),
+            ));
+        }
+
+        // For multi-relation queries the framework deparses the TOP-LEVEL
+        // statement text; when the query runs through SPI or PL/pgSQL that
+        // is the enclosing statement, not this query. Refuse to execute
+        // anything that does not even mention the foreign tables.
+        let mentions_any = query.relations.iter().any(|rel| {
+            let lower = query.sql.to_lowercase();
+            lower.contains(&rel.local_table.to_lowercase())
+        });
+        if !mentions_any {
+            return Err(MssqlFdwRqError::UnsupportedConstruct(
+                translator::TranslateError::UnsupportedConstruct {
+                    sql_fragment: query.sql.chars().take(80).collect(),
+                    reason: "statement text does not reference the foreign tables \
+                             (full-query pushdown of joins is not available for queries \
+                             executed through SPI or PL/pgSQL)"
+                        .to_string(),
+                },
+            ));
+        }
+
         let relations: Vec<RelationMapping> = query
             .relations
             .iter()
@@ -236,9 +298,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
 
         let ctx = TranslateContext {
             relations,
-            // wired to catalog lookups (pg_attribute) in the next M1 step;
-            // until then bare boolean predicates surface as T-SQL errors
-            bool_columns: Vec::new(),
+            bool_columns: Self::bool_columns(&query.relations),
         };
         let tsql = translator::translate(&query.sql, &ctx)?;
         let params: Vec<Box<dyn tiberius::ToSql>> = query
@@ -255,6 +315,9 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         self.iter_idx = 0;
 
         let started = Instant::now();
+        if self.log_remote_query {
+            pgrx::log!("mssql_fdw_rq: remote query: {tsql}");
+        }
         let mut client = self.connect()?;
         let stream = self.rt.block_on(client.query(tsql.clone(), &param_refs))?;
         self.scan_result = self.rt.block_on(stream.into_first_result())?;
@@ -262,10 +325,9 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
 
         if self.log_remote_query {
             pgrx::log!(
-                "mssql_fdw_rq: remote query ({} rows, {} ms): {}",
+                "mssql_fdw_rq: remote query done ({} rows, {} ms)",
                 self.scan_result.len(),
-                elapsed.as_millis(),
-                tsql
+                elapsed.as_millis()
             );
         }
 

@@ -282,6 +282,8 @@ impl LimitValue {
 struct Clauses {
     limit: Option<LimitValue>,
     offset: Option<LimitValue>,
+    /// tokens consumed by the OFFSET clause (incl. optional ROWS/FETCH tail)
+    offset_len: usize,
     has_order_by: bool,
     has_setop: bool,
 }
@@ -330,22 +332,55 @@ fn analyze(toks: &[Tok]) -> Result<Clauses, TranslateError> {
             Tok::Word(w) if depth == 0 => {
                 let lw = w.to_lowercase();
                 match lw.as_str() {
-                    "offset" => match toks.get(i + 1) {
-                        Some(Tok::Num(n)) => {
-                            clauses.offset = Some(LimitValue::Num(n.clone()));
-                            i += 1;
+                    "offset" => {
+                        // OFFSET n [ROW|ROWS] [FETCH {FIRST|NEXT} n [ROW|ROWS] ONLY]
+                        match toks.get(i + 1) {
+                            Some(Tok::Num(n)) => {
+                                clauses.offset = Some(LimitValue::Num(n.clone()));
+                            }
+                            Some(Tok::Param(p)) => {
+                                clauses.offset = Some(LimitValue::Param(p.clone()));
+                            }
+                            _ => {
+                                return Err(TranslateError::UnsupportedConstruct {
+                                    sql_fragment: "OFFSET".to_string(),
+                                    reason: "OFFSET without a plain constant or parameter"
+                                        .to_string(),
+                                });
+                            }
                         }
-                        Some(Tok::Param(p)) => {
-                            clauses.offset = Some(LimitValue::Param(p.clone()));
-                            i += 1;
+                        let mut len = 2usize; // OFFSET + value
+                        if matches!(toks.get(i + 2), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("row") || w.eq_ignore_ascii_case("rows"))
+                        {
+                            len += 1;
                         }
-                        _ => {
-                            return Err(TranslateError::UnsupportedConstruct {
-                                sql_fragment: "OFFSET".to_string(),
-                                reason: "OFFSET without a plain constant or parameter".to_string(),
-                            });
+                        // FETCH FIRST|NEXT n ROW|ROWS ONLY
+                        if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("fetch"))
+                            && matches!(toks.get(i + len + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("next"))
+                            && matches!(
+                                toks.get(i + len + 2),
+                                Some(Tok::Num(_)) | Some(Tok::Param(_))
+                            )
+                        {
+                            let limit = match toks.get(i + len + 2) {
+                                Some(Tok::Num(n)) => LimitValue::Num(n.clone()),
+                                Some(Tok::Param(p)) => LimitValue::Param(p.clone()),
+                                _ => unreachable!(),
+                            };
+                            clauses.limit = Some(limit);
+                            len += 3; // FETCH FIRST/NEXT n
+                            if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("row") || w.eq_ignore_ascii_case("rows"))
+                            {
+                                len += 1;
+                            }
+                            if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("only"))
+                            {
+                                len += 1;
+                            }
                         }
-                    },
+                        clauses.offset_len = len;
+                        i += len - 1; // outer loop adds 1 more
+                    }
                     "order" => {
                         if let Some(Tok::Word(b)) = toks.get(i + 1) {
                             if b.eq_ignore_ascii_case("by") {
@@ -403,8 +438,57 @@ const PREDICATE_CONTINUATION: [&str; 16] = [
 const PREDICATE_START: [&str; 9] = [
     "where", "and", "or", "on", "(", "not", "then", "when", "case",
 ];
-/// words that may not appear as the subject of a cast / ILIKE capture
-const NON_SUBJECT_WORDS: [&str; 7] = ["and", "or", "not", "as", "on", "when", "then"];
+/// reserved words that may not appear as the subject of a cast / ILIKE
+/// capture, nor as the "function name" in front of a parenthesized subject
+const NON_SUBJECT_WORDS: [&str; 34] = [
+    "and",
+    "or",
+    "not",
+    "as",
+    "on",
+    "when",
+    "then",
+    "else",
+    "case",
+    "end",
+    "select",
+    "from",
+    "where",
+    "group",
+    "order",
+    "by",
+    "having",
+    "limit",
+    "offset",
+    "union",
+    "intersect",
+    "except",
+    "all",
+    "distinct",
+    "asc",
+    "desc",
+    "join",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "outer",
+    "cross",
+    "in",
+];
+
+/// function calls with verified T-SQL equivalents (same name and semantics);
+/// anything else followed by `(` is rejected instead of being sent to MSSQL
+const KNOWN_FUNCTIONS: [&str; 22] = [
+    "count", "sum", "avg", "min", "max", "abs", "round", "floor", "ceiling", "sqrt", "power",
+    "square", "sign", "lower", "upper", "left", "right", "replace", "concat", "coalesce", "nullif",
+    "iif",
+];
+
+/// keywords that may legitimately precede `(` and are not function calls
+const KEYWORD_CALL_WORDS: [&str; 8] = [
+    "in", "exists", "values", "any", "all", "cast", "isnull", "using",
+];
 
 pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateError> {
     let toks = lex(sql)?;
@@ -448,6 +532,9 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     let mut top_emitted = false;
     // CASE ... END tracking: casts/ILIKE may not cross an open CASE
     let mut case_depth = 0usize;
+    // current top-level clause: the deparser prints top-level AND-chains in
+    // WHERE/HAVING/ON as comma-separated lists, which must become AND
+    let mut in_condition_clause = false;
 
     let mut i = 0usize;
     while i < toks.len() {
@@ -457,6 +544,12 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "(" => depth += 1,
                     ")" => depth = depth.saturating_sub(1),
                     ";" => {
+                        i += 1;
+                        continue;
+                    }
+                    "," if in_condition_clause && depth == 0 => {
+                        // deparser's `,` at the top of a WHERE/HAVING/ON list
+                        out.push("AND".to_string());
                         i += 1;
                         continue;
                     }
@@ -519,7 +612,10 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         continue;
                     }
                     "offset" if depth == 0 => {
-                        // T-SQL OFFSET/FETCH must follow an ORDER BY
+                        // T-SQL OFFSET/FETCH must follow an ORDER BY; the
+                        // whole PG tail (ROWS / FETCH … ONLY) is re-emitted
+                        // in canonical form, so consume everything analyze
+                        // measured for this clause
                         if !clauses.has_order_by {
                             out.push("ORDER BY (SELECT NULL)".to_string());
                         }
@@ -530,7 +626,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         if let Some(limit) = &clauses.limit {
                             out.push(format!("FETCH NEXT {} ROWS ONLY", limit.render()));
                         }
-                        i += 2;
+                        i += clauses.offset_len;
                         continue;
                     }
                     "select" if depth == 0 && !first_select_seen => {
@@ -555,6 +651,47 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     }
                     "case" => case_depth += 1,
                     "end" => case_depth = case_depth.saturating_sub(1),
+                    // condition clauses: their top-level `,` lists mean AND
+                    "where" | "having" | "on" if depth == 0 => in_condition_clause = true,
+                    // structural keywords end the condition clause
+                    "select" | "from" | "group" | "order" | "limit" | "offset" | "union"
+                    | "intersect" | "except" | "join" | "inner" | "left" | "right" | "full"
+                    | "cross" | "outer" | "returning"
+                        if depth == 0 =>
+                    {
+                        in_condition_clause = false;
+                    }
+                    // PG emits `FROM ONLY tbl` to skip child tables; T-SQL
+                    // has no inheritance, so ONLY is simply dropped
+                    "only" => {
+                        i += 1;
+                        continue;
+                    }
+                    // SQL typed literals: DATE '...' / TIMESTAMP '...' /
+                    // NUMERIC '...' become CASTs; unmappable types error out
+                    _ if matches!(toks.get(i + 1), Some(Tok::Str(_)))
+                        && types::is_pg_type_name(&lw) =>
+                    {
+                        match types::pg_type_to_mssql(&lw) {
+                            Some(mssql_type) => {
+                                let Tok::Str(s) = &toks[i + 1] else {
+                                    unreachable!();
+                                };
+                                out.push(format!(
+                                    "CAST('{}' AS {mssql_type})",
+                                    s.replace('\'', "''")
+                                ));
+                                i += 2;
+                                continue;
+                            }
+                            None => {
+                                return Err(TranslateError::UnsupportedConstruct {
+                                    sql_fragment: format!("{lw} '…'"),
+                                    reason: "typed literal has no T-SQL mapping".to_string(),
+                                });
+                            }
+                        }
+                    }
                     "ilike" => {
                         translate_ilike(&toks, i, &mut out, &mut i, case_depth)?;
                         continue;
@@ -587,6 +724,18 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     continue;
                 }
 
+                // --- unknown function calls are rejected -------------------
+                if matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(")
+                    && !KNOWN_FUNCTIONS.contains(&lw.as_str())
+                    && !KEYWORD_CALL_WORDS.contains(&lw.as_str())
+                    && !NON_SUBJECT_WORDS.contains(&lw.as_str())
+                {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: format!("{w}(…)"),
+                        reason: "function has no verified T-SQL equivalent".to_string(),
+                    });
+                }
+
                 out.push(w.clone());
             }
         }
@@ -600,23 +749,33 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
 /// `,` and `)`, no space after `(`. Whitespace-insensitive either way, but
 /// this keeps the emitted T-SQL close to what a human would write.
 fn join_pieces(out: &[String]) -> String {
+    // keywords that keep a space before a following `(`
+    const SPACED_BEFORE_PAREN: [&str; 14] = [
+        "AND", "OR", "NOT", "WHERE", "ON", "THEN", "ELSE", "WHEN", "LIKE", "IN", "IS", "NULL",
+        "BETWEEN", "HAVING",
+    ];
     let mut ret = String::new();
+    let mut prev: Option<&str> = None;
     for piece in out {
         if ret.is_empty() {
             ret.push_str(piece);
+            prev = Some(piece);
             continue;
         }
         let no_space_before = matches!(piece.as_str(), ")" | "," | ".")
             || (piece == "("
-                && ret
-                    .chars()
-                    .last()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ']'));
-        let no_space_after = matches!(ret.chars().last(), Some('(' | '.'));
+                && prev.is_some_and(|p| {
+                    p.chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ']')
+                        && !SPACED_BEFORE_PAREN.contains(&p)
+                }));
+        let no_space_after = matches!(prev, Some("(") | Some("."));
         if !no_space_before && !no_space_after {
             ret.push(' ');
         }
         ret.push_str(piece);
+        prev = Some(piece);
     }
     ret
 }
@@ -829,9 +988,19 @@ fn translate_is(
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case("true") => ("true", 3),
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case("false") => ("false", 3),
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case("unknown") => ("unknown", 3),
-            _ => return Ok(()), // IS NOT NULL passes through unchanged
+            // `IS NOT NULL` passes through unchanged (emit and advance!)
+            _ => {
+                out.push("IS".to_string());
+                *next_i = i + 1;
+                return Ok(());
+            }
         },
-        _ => return Ok(()), // IS NULL passes through unchanged
+        // `IS NULL` passes through unchanged (emit and advance!)
+        _ => {
+            out.push("IS".to_string());
+            *next_i = i + 1;
+            return Ok(());
+        }
     };
 
     let start = capture_subject(out, case_depth)?;

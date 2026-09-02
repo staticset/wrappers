@@ -150,6 +150,7 @@ mssql_fdw_rq = [
     "num-traits",
     "thiserror",
     "uuid",
+    "chrono",
 ]
 mysql_fdw = [
     "mysql_async",

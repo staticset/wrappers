@@ -595,10 +595,12 @@ unsafe fn full_query_sql_from_planner(root: *mut pg_sys::PlannerInfo) -> Option<
             return None;
         }
 
-        // pg_get_querydef is useful for simple query trees, but it has been
-        // fragile around partially-normalized multi-relation trees. For joins,
-        // CTE-like inputs, and other non-relation RTEs, prefer the original
-        // statement text sliced from debug_query_string.
+        // pg_get_querydef works for single-relation trees but crashes on
+        // multi-relation (join) trees while the planner holds them. For
+        // those, fall back to the original statement text; note this is the
+        // TOP-LEVEL statement, so queries executed through SPI or PL/pgSQL
+        // resolve to the enclosing statement, not the query being planned.
+        // FDWs should reject such queries themselves (see mssql_fdw_rq).
         if query_has_multiple_base_relations(root) || query_has_non_relation_inputs(root) {
             return current_statement_sql_from_debug_query_string(root);
         }
@@ -1493,9 +1495,13 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
                 "get_foreign_plan: full-query output columns={}",
                 output_columns.len()
             );
+            // Deparse only for the executable node: intermediate join
+            // carriers leave sql empty and the final upper relation fills
+            // it in (pg_get_querydef on a mid-planning join tree crashes).
+            let executable = state.full_query_executable;
             if let Some(full_query) = state.full_query.as_mut() {
                 full_query.columns = output_columns.clone();
-                if full_query.sql.is_empty() {
+                if full_query.sql.is_empty() && executable {
                     debug2!("get_foreign_plan: deparsing full-query SQL");
                     let Some(sql) = full_query_sql_from_planner(root) else {
                         report_error(

@@ -51,6 +51,8 @@ services:
       - pgrx-home:/home/dev/.pgrx
     environment:
       CARGO_TARGET_DIR: /opt/target
+      # pgrx test framework requires USER to be set
+      USER: dev
       MSSQL_HOST: mssql
       MSSQL_PORT: "1433"
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}

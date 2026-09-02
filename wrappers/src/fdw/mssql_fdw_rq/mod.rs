@@ -3,7 +3,8 @@ mod mssql_fdw_rq;
 mod translator;
 mod types;
 
-#[cfg(test)]
+// not cfg-gated here: `cargo pgrx test` builds the extension with
+// `cargo build` (no cfg(test)), and the pg_test module must land in it
 mod tests;
 
 use pgrx::pg_sys::panic::ErrorReport;
@@ -28,6 +29,9 @@ pub(super) enum MssqlFdwRqError {
 
     #[error("mssql_fdw_rq: column conversion failure: {0}")]
     ConversionError(#[from] std::num::TryFromIntError),
+
+    #[error("mssql_fdw_rq: datetime conversion failure: {0}")]
+    DateTimeError(String),
 
     #[error("mssql_fdw_rq: {0}")]
     TiberiusError(#[from] tiberius::error::Error),

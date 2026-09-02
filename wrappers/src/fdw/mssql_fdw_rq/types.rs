@@ -3,12 +3,15 @@
 
 use std::str::FromStr;
 
+use chrono::{Datelike, Timelike};
 use num_traits::ToPrimitive;
+use pgrx::datum::{Date, Time, Timestamp, TimestampWithTimeZone};
 use pgrx::pg_sys;
-use pgrx::{PgBuiltInOids, PgOid, prelude::to_timestamp};
+use pgrx::varlena::rust_byte_slice_to_bytea;
+use pgrx::{PgBuiltInOids, PgOid};
 use tiberius::ToSql;
 use tiberius::numeric::Decimal;
-use tiberius::time::chrono::{NaiveDate, NaiveDateTime};
+use tiberius::time::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
 use supabase_wrappers::prelude::*;
 
@@ -39,6 +42,48 @@ pub(super) fn pg_type_to_mssql(pg_name: &str) -> Option<&'static str> {
         "time" | "time without time zone" => "time",
         _ => return None,
     })
+}
+
+/// Recognize a PostgreSQL type name (used for SQL typed literals like
+/// `DATE '2026-01-01'`). Includes types we cannot map so the translator can
+/// reject their literals explicitly.
+pub(super) fn is_pg_type_name(name: &str) -> bool {
+    const TYPE_NAMES: [&str; 33] = [
+        "int2",
+        "int4",
+        "int8",
+        "smallint",
+        "int",
+        "integer",
+        "bigint",
+        "real",
+        "float4",
+        "float8",
+        "double",
+        "numeric",
+        "decimal",
+        "money",
+        "bool",
+        "boolean",
+        "text",
+        "varchar",
+        "char",
+        "bpchar",
+        "name",
+        "uuid",
+        "bytea",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "json",
+        "jsonb",
+        "xml",
+        "float",
+        "bit",
+    ];
+    TYPE_NAMES.contains(&name)
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +163,26 @@ pub(super) fn value_to_sql(
             Cell::Uuid(v) => Ok(Box::new(uuid::Uuid::from_bytes(*v.as_bytes()))),
             other => param_type_mismatch("uuid", other),
         },
-        // date/time/bytea parameters are not bound in the skeleton yet
+        PgOid::BuiltIn(PgBuiltInOids::DATEOID) => match cell {
+            Cell::Date(v) => Ok(Box::new(date_to_naive(v)?)),
+            other => param_type_mismatch("date", other),
+        },
+        PgOid::BuiltIn(PgBuiltInOids::TIMEOID) => match cell {
+            Cell::Time(v) => Ok(Box::new(time_to_naive(v)?)),
+            other => param_type_mismatch("time", other),
+        },
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID) => match cell {
+            Cell::Timestamp(v) => Ok(Box::new(timestamp_to_naive(v)?)),
+            other => param_type_mismatch("timestamp", other),
+        },
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPTZOID) => match cell {
+            Cell::Timestamptz(v) => Ok(Box::new(timestamptz_to_utc(v)?)),
+            other => param_type_mismatch("timestamptz", other),
+        },
+        PgOid::BuiltIn(PgBuiltInOids::BYTEAOID) => match cell {
+            Cell::Bytea(v) => Ok(Box::new(unsafe { bytea_to_vec(*v) })),
+            other => param_type_mismatch("bytea", other),
+        },
         other_oid => Err(MssqlFdwRqError::UnsupportedParameterType(format!(
             "oid {}",
             other_oid.value()
@@ -161,6 +225,102 @@ fn numeric_to_decimal(v: &pgrx::AnyNumeric) -> MssqlFdwRqResult<Box<dyn ToSql>> 
     Ok(Box::new(d))
 }
 
+// ---------------------------------------------------------------------------
+// Date/time conversions (parts-based, keeps sub-second precision)
+// ---------------------------------------------------------------------------
+
+fn dt_err(e: impl std::fmt::Display) -> MssqlFdwRqError {
+    MssqlFdwRqError::DateTimeError(e.to_string())
+}
+
+fn date_to_naive(v: &Date) -> MssqlFdwRqResult<NaiveDate> {
+    NaiveDate::from_ymd_opt(v.year(), v.month() as u32, v.day() as u32).ok_or_else(|| {
+        dt_err(format!(
+            "invalid date {}-{}-{}",
+            v.year(),
+            v.month(),
+            v.day()
+        ))
+    })
+}
+
+fn time_to_naive(v: &Time) -> MssqlFdwRqResult<NaiveTime> {
+    let sec = v.second();
+    let (sec, micro) = (sec.trunc() as u32, (sec.fract() * 1e6).round() as u32);
+    NaiveTime::from_hms_micro_opt(v.hour() as u32, v.minute() as u32, sec, micro)
+        .ok_or_else(|| dt_err(format!("invalid time {}", v.hour())))
+}
+
+fn timestamp_to_naive(v: &Timestamp) -> MssqlFdwRqResult<NaiveDateTime> {
+    let sec = v.second();
+    let (sec, micro) = (sec.trunc() as u32, (sec.fract() * 1e6).round() as u32);
+    let date =
+        NaiveDate::from_ymd_opt(v.year(), v.month() as u32, v.day() as u32).ok_or_else(|| {
+            dt_err(format!(
+                "invalid date {}-{}-{}",
+                v.year(),
+                v.month(),
+                v.day()
+            ))
+        })?;
+    date.and_hms_micro_opt(v.hour() as u32, v.minute() as u32, sec, micro)
+        .ok_or_else(|| dt_err("invalid time of day".to_string()))
+}
+
+fn timestamptz_to_utc(v: &TimestampWithTimeZone) -> MssqlFdwRqResult<DateTime<Utc>> {
+    Ok(timestamp_to_naive(&Timestamp::from(*v))?.and_utc())
+}
+
+fn naive_time_to_pgrx(v: NaiveTime) -> MssqlFdwRqResult<Time> {
+    let sec = f64::from(v.second()) + f64::from(v.nanosecond()) / 1e9;
+    Time::new(v.hour() as u8, v.minute() as u8, sec).map_err(dt_err)
+}
+
+fn naive_dt_to_pgrx(v: NaiveDateTime) -> MssqlFdwRqResult<Timestamp> {
+    let sec = f64::from(v.second()) + f64::from(v.and_utc().timestamp_subsec_nanos()) / 1e9;
+    Timestamp::new(
+        v.year(),
+        v.month() as u8,
+        v.day() as u8,
+        v.hour() as u8,
+        v.minute() as u8,
+        sec,
+    )
+    .map_err(dt_err)
+}
+
+fn utc_to_pgrx(v: DateTime<Utc>) -> MssqlFdwRqResult<TimestampWithTimeZone> {
+    let sec = f64::from(v.second()) + f64::from(v.timestamp_subsec_nanos()) / 1e9;
+    TimestampWithTimeZone::new(
+        v.year(),
+        v.month() as u8,
+        v.day() as u8,
+        v.hour() as u8,
+        v.minute() as u8,
+        sec,
+    )
+    .map_err(dt_err)
+}
+
+/// Copy the payload of a PostgreSQL `bytea` datum into an owned buffer.
+///
+/// # Safety
+/// `ptr` must be a valid `bytea` datum (4-byte varlena header, as produced by
+/// the server for on-disk/` toast-free` datums handed to FDWs).
+unsafe fn bytea_to_vec(ptr: *mut pg_sys::bytea) -> Vec<u8> {
+    // SAFETY: caller guarantees a valid bytea datum with a 4-byte varlena
+    // header; we only read within its varsize() bounds.
+    unsafe {
+        if ptr.is_null() {
+            return Vec::new();
+        }
+        // varsize() includes the 4-byte varlena header
+        let total = pgrx::varlena::varsize(ptr as *const pg_sys::varlena);
+        let len = total.saturating_sub(4);
+        std::slice::from_raw_parts((ptr as *const u8).add(4), len).to_vec()
+    }
+}
+
 fn null_to_sql(type_oid: pg_sys::Oid) -> MssqlFdwRqResult<Box<dyn ToSql>> {
     let boxed: Box<dyn ToSql> = match PgOid::from(type_oid) {
         PgOid::BuiltIn(PgBuiltInOids::BOOLOID) => Box::new(None::<bool>),
@@ -175,6 +335,11 @@ fn null_to_sql(type_oid: pg_sys::Oid) -> MssqlFdwRqResult<Box<dyn ToSql>> {
         | PgOid::BuiltIn(PgBuiltInOids::BPCHAROID)
         | PgOid::BuiltIn(PgBuiltInOids::NAMEOID) => Box::new(None::<String>),
         PgOid::BuiltIn(PgBuiltInOids::UUIDOID) => Box::new(None::<uuid::Uuid>),
+        PgOid::BuiltIn(PgBuiltInOids::DATEOID) => Box::new(None::<NaiveDate>),
+        PgOid::BuiltIn(PgBuiltInOids::TIMEOID) => Box::new(None::<NaiveTime>),
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID) => Box::new(None::<NaiveDateTime>),
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPTZOID) => Box::new(None::<DateTime<Utc>>),
+        PgOid::BuiltIn(PgBuiltInOids::BYTEAOID) => Box::new(None::<Vec<u8>>),
         other_oid => {
             return Err(MssqlFdwRqError::UnsupportedParameterType(format!(
                 "NULL parameter with oid {}",
@@ -233,49 +398,89 @@ pub(super) fn field_to_cell(
             src_row.try_get::<i16, &str>(col_name)?.map(Cell::I16)
         }
         PgOid::BuiltIn(PgBuiltInOids::INT4OID) => {
-            src_row.try_get::<i32, &str>(col_name)?.map(Cell::I32)
+            // MSSQL aggregate results are int32 even when Postgres expects
+            // int4 from smallint inputs; widen where lossless
+            if let Ok(v) = src_row.try_get::<i32, &str>(col_name) {
+                v.map(Cell::I32)
+            } else {
+                src_row
+                    .try_get::<i16, &str>(col_name)?
+                    .map(|v| Cell::I32(i32::from(v)))
+            }
         }
         PgOid::BuiltIn(PgBuiltInOids::INT8OID) => {
-            src_row.try_get::<i64, &str>(col_name)?.map(Cell::I64)
+            // T-SQL COUNT()/SUM(int) return int32; Postgres expects int8
+            if let Ok(v) = src_row.try_get::<i64, &str>(col_name) {
+                v.map(Cell::I64)
+            } else if let Ok(v) = src_row.try_get::<i32, &str>(col_name) {
+                v.map(|x| Cell::I64(i64::from(x)))
+            } else {
+                src_row
+                    .try_get::<i16, &str>(col_name)?
+                    .map(|x| Cell::I64(i64::from(x)))
+            }
         }
         PgOid::BuiltIn(PgBuiltInOids::FLOAT4OID) => {
             src_row.try_get::<f32, &str>(col_name)?.map(Cell::F32)
         }
         PgOid::BuiltIn(PgBuiltInOids::FLOAT8OID) => {
-            src_row.try_get::<f64, &str>(col_name)?.map(Cell::F64)
+            if let Ok(v) = src_row.try_get::<f64, &str>(col_name) {
+                v.map(Cell::F64)
+            } else {
+                src_row
+                    .try_get::<f32, &str>(col_name)?
+                    .map(|v| Cell::F64(f64::from(v)))
+            }
         }
-        PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => src_row
-            .try_get::<Decimal, &str>(col_name)?
-            .and_then(|v| v.to_f64())
-            .map(pgrx::AnyNumeric::try_from)
-            .transpose()?
-            .map(Cell::Numeric),
+        PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => {
+            // decimal, or an int/float aggregate result coerced to numeric
+            if let Ok(v) = src_row.try_get::<Decimal, &str>(col_name) {
+                v.and_then(|d| d.to_f64())
+                    .map(pgrx::AnyNumeric::try_from)
+                    .transpose()?
+                    .map(Cell::Numeric)
+            } else if let Ok(v) = src_row.try_get::<i64, &str>(col_name) {
+                v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
+            } else if let Ok(v) = src_row.try_get::<i32, &str>(col_name) {
+                v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
+            } else {
+                let v = src_row.try_get::<f64, &str>(col_name)?;
+                v.and_then(|x| pgrx::AnyNumeric::try_from(x).ok())
+                    .map(Cell::Numeric)
+            }
+        }
         PgOid::BuiltIn(PgBuiltInOids::TEXTOID) => src_row
             .try_get::<&str, &str>(col_name)?
             .map(|v| Cell::String(v.to_owned())),
         PgOid::BuiltIn(PgBuiltInOids::UUIDOID) => src_row
             .try_get::<uuid::Uuid, &str>(col_name)?
             .map(|v| Cell::Uuid(pgrx::datum::Uuid::from_bytes(*v.as_bytes()))),
-        PgOid::BuiltIn(PgBuiltInOids::DATEOID) => {
-            src_row.try_get::<NaiveDate, &str>(col_name)?.map(|v| {
-                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let ts = to_timestamp(v.signed_duration_since(epoch).num_seconds() as f64);
-                Cell::Date(pgrx::prelude::Date::from(ts))
+        PgOid::BuiltIn(PgBuiltInOids::DATEOID) => src_row
+            .try_get::<NaiveDate, &str>(col_name)?
+            .map(|v| {
+                Date::new(v.year(), v.month() as u8, v.day() as u8)
+                    .map_err(dt_err)
+                    .map(Cell::Date)
             })
-        }
-        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID) => {
-            src_row.try_get::<NaiveDateTime, &str>(col_name)?.map(|v| {
-                let ts = to_timestamp(v.and_utc().timestamp() as f64);
-                Cell::Timestamp(ts.to_utc())
-            })
-        }
-        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPTZOID) => {
-            src_row.try_get::<NaiveDateTime, &str>(col_name)?.map(|v| {
-                let ts = to_timestamp(v.and_utc().timestamp() as f64);
-                Cell::Timestamptz(ts)
-            })
-        }
-        // bytea (varbinary) and time round-trips land in the next M1 iteration
+            .transpose()?,
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID) => src_row
+            .try_get::<NaiveDateTime, &str>(col_name)?
+            .map(naive_dt_to_pgrx)
+            .transpose()?
+            .map(Cell::Timestamp),
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPTZOID) => src_row
+            .try_get::<DateTime<Utc>, &str>(col_name)?
+            .map(utc_to_pgrx)
+            .transpose()?
+            .map(Cell::Timestamptz),
+        PgOid::BuiltIn(PgBuiltInOids::TIMEOID) => src_row
+            .try_get::<NaiveTime, &str>(col_name)?
+            .map(naive_time_to_pgrx)
+            .transpose()?
+            .map(Cell::Time),
+        PgOid::BuiltIn(PgBuiltInOids::BYTEAOID) => src_row
+            .try_get::<&[u8], &str>(col_name)?
+            .map(|v| Cell::Bytea(rust_byte_slice_to_bytea(v).into_pg())),
         _ => return Err(MssqlFdwRqError::UnsupportedColumnType(tgt_col.name.clone())),
     };
 
