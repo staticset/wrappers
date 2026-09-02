@@ -86,7 +86,7 @@ jobs:
       - name: Initialize rqtest on the MSSQL service
         run: |
           CID=$(docker ps -q -f ancestor=mcr.microsoft.com/mssql/server:2022-latest)
-          docker cp wrappers/.dev/mssql/01_create_db.sql "$CID":/init.sql
+          docker cp .dev/mssql/01_create_db.sql "$CID":/init.sql
           docker exec "$CID" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
             -P "$MSSQL_SA_PASSWORD" -b -i /init.sql
 
