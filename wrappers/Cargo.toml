@@ -151,6 +151,11 @@ mssql_fdw_rq = [
     "thiserror",
     "uuid",
     "chrono",
+    "futures-util",
+]
+mssql_fdw_rq_kerberos = [
+    "mssql_fdw_rq",
+    "tiberius/integrated-auth-gssapi",
 ]
 mysql_fdw = [
     "mysql_async",

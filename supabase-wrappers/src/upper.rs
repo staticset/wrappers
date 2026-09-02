@@ -467,36 +467,24 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
         }
 
         let fdw_private = (*input_rel).fdw_private;
-        if fdw_private.is_null() {
-            debug2!("add_full_query_upper_path: input rel has no fdw_private");
-            return false;
-        }
-        debug2!("add_full_query_upper_path: input rel has fdw_private");
-
-        let input_state = PgBox::<FdwState<E, W>>::from_pg(fdw_private as _);
-        let mut remote_query_policy = input_state.remote_query_policy;
+        // Set-operation inputs are append relations without FDW state; those
+        // still get a full-query path, built from a fresh instance of the
+        // first relation's server instead of the input relation's state.
+        let input_state = if fdw_private.is_null() {
+            debug2!("add_full_query_upper_path: input rel has no fdw_private (setop?)");
+            None
+        } else {
+            debug2!("add_full_query_upper_path: input rel has fdw_private");
+            Some(PgBox::<FdwState<E, W>>::from_pg(fdw_private as _))
+        };
+        let mut remote_query_policy = input_state
+            .as_ref()
+            .map(|state| state.remote_query_policy)
+            .unwrap_or_default();
         debug2!(
             "add_full_query_upper_path: initial remote policy wants={}",
             remote_query_policy.wants_remote_query()
         );
-        if !remote_query_policy.wants_remote_query() {
-            let context = remote_query_context_from_planner(root, false);
-            debug2!(
-                "add_full_query_upper_path: recomputed context foreign_count={} upper={} multiple_base={}",
-                context.foreign_relation_count,
-                context.has_upper_operations,
-                context.has_multiple_base_relations
-            );
-            remote_query_policy = input_state
-                .instance
-                .as_ref()
-                .map(|instance| instance.remote_query_policy(&context))
-                .unwrap_or_default();
-        }
-        if !remote_query_policy.wants_remote_query() {
-            debug2!("add_full_query_upper_path: remote query policy does not want pushdown");
-            return false;
-        }
 
         let columns = target_columns_from_reltarget(output_rel);
         debug2!(
@@ -513,6 +501,31 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
             debug2!("add_full_query_upper_path: full query has no relation");
             return false;
         };
+
+        if !remote_query_policy.wants_remote_query() {
+            let context = remote_query_context_from_planner(root, false);
+            debug2!(
+                "add_full_query_upper_path: recomputed context foreign_count={} upper={} multiple_base={}",
+                context.foreign_relation_count,
+                context.has_upper_operations,
+                context.has_multiple_base_relations
+            );
+            remote_query_policy = if let Some(instance) = input_state
+                .as_ref()
+                .and_then(|state| state.instance.as_ref())
+            {
+                instance.remote_query_policy(&context)
+            } else {
+                let instance = crate::instance::create_fdw_instance_from_server_id::<E, W>(
+                    first_relation.server_oid,
+                );
+                instance.remote_query_policy(&context)
+            };
+        }
+        if !remote_query_policy.wants_remote_query() {
+            debug2!("add_full_query_upper_path: remote query policy does not want pushdown");
+            return false;
+        }
 
         let is_final = stage == pg_sys::UpperRelationKind::UPPERREL_FINAL;
         debug2!("add_full_query_upper_path: is_final={is_final}");

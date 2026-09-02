@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
-use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use supabase_wrappers::prelude::*;
 
@@ -33,8 +33,10 @@ pub(crate) struct MssqlFdwRq {
     rt: Runtime,
     config: Config,
     log_remote_query: bool,
-    scan_result: Vec<tiberius::Row>,
-    iter_idx: usize,
+    /// rows arrive from a background task through a bounded channel, so
+    /// large results never sit fully in memory (TZ §6.1 streaming)
+    rx: Option<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>,
+    rows_out: i64,
     tgt_cols: Vec<Column>,
 }
 
@@ -127,18 +129,19 @@ impl MssqlFdwRq {
         })
     }
 
-    /// Local boolean column names for the referenced relations, so the
-    /// translator can rewrite bare boolean predicates (`WHERE flag`) into
-    /// `flag = 1`. A catalog read failure degrades to an empty set (the remote
-    /// side then rejects such queries) instead of failing the whole query.
-    fn bool_columns(relations: &[FullQueryRelation]) -> Vec<String> {
+    /// Local column flags the translator needs: boolean columns (bare bit
+    /// predicates become `= 1`) and NOT NULL columns (only those may be
+    /// sorted without a NULL tiebreaker). A catalog read failure degrades to
+    /// empty sets instead of failing the whole query.
+    fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>) {
         Spi::connect(|client| {
-            let mut out = Vec::new();
+            let mut bools = Vec::new();
+            let mut not_nulls = Vec::new();
             for rel in relations {
                 // names come from the local catalog; quotes are doubled so
                 // the regclass literal stays a literal
                 let sql = format!(
-                    "SELECT a.attname::text AS attname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = '{}.{}'::pg_catalog.regclass AND a.atttypid = 'bool'::pg_catalog.regtype AND a.attnum > 0 AND NOT a.attisdropped",
+                    "SELECT a.attname::text AS attname, (a.atttypid = 'bool'::pg_catalog.regtype) AS is_bool, a.attnotnull AS not_null FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = '{}.{}'::pg_catalog.regclass AND a.attnum > 0 AND NOT a.attisdropped",
                     rel.local_schema.replace('\'', "''"),
                     rel.local_table.replace('\'', "''"),
                 );
@@ -146,25 +149,78 @@ impl MssqlFdwRq {
                     continue;
                 };
                 for row in table {
-                    if let Ok(Some(name)) = row.get_by_name::<&str, _>("attname") {
-                        out.push(name.to_lowercase());
+                    let (Ok(Some(name)), Ok(Some(is_bool)), Ok(Some(not_null))) = (
+                        row.get_by_name::<&str, _>("attname"),
+                        row.get_by_name::<bool, _>("is_bool"),
+                        row.get_by_name::<bool, _>("not_null"),
+                    ) else {
+                        continue;
+                    };
+                    let name = name.to_lowercase();
+                    if is_bool {
+                        bools.push(name.clone());
+                    }
+                    if not_null {
+                        not_nulls.push(name);
                     }
                 }
             }
-            Ok::<_, pgrx::spi::SpiError>(out)
+            Ok::<_, pgrx::spi::SpiError>((bools, not_nulls))
         })
         .unwrap_or_default()
     }
 
-    fn connect(&self) -> MssqlFdwRqResult<Client<Compat<TcpStream>>> {
-        let tcp = self
-            .rt
-            .block_on(TcpStream::connect(self.config.get_addr()))?;
-        tcp.set_nodelay(true)?;
-        let client = self
-            .rt
-            .block_on(Client::connect(self.config.clone(), tcp.compat_write()))?;
-        Ok(client)
+    /// Execute the query on a background task that streams rows through a
+    /// bounded channel: `iter_scan` pulls one row at a time, so arbitrarily
+    /// large results never materialize in memory (TZ §6.1). Dropping the
+    /// receiver stops the task.
+    fn spawn_streaming_query(
+        &self,
+        tsql: String,
+        params: Vec<Box<dyn tiberius::ToSql>>,
+    ) -> MssqlFdwRqResult<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>
+    {
+        use futures_util::StreamExt;
+
+        const CHANNEL_CAPACITY: usize = 256;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let config = self.config.clone();
+        self.rt.spawn(async move {
+            let tcp = match TcpStream::connect(config.get_addr()).await {
+                Ok(tcp) => tcp,
+                Err(e) => {
+                    let _ = tx.send(Err(e.into())).await;
+                    return;
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            let mut client = match Client::connect(config, tcp.compat_write()).await {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            let refs: Vec<&dyn tiberius::ToSql> = params
+                .iter()
+                .map(|b| &**b as &dyn tiberius::ToSql)
+                .collect();
+            let mut row_stream = match client.query(tsql, &refs).await {
+                Ok(stream) => stream.into_row_stream(),
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            while let Some(item) = row_stream.next().await {
+                if tx.send(item).await.is_err() {
+                    // receiver dropped: the scan was cancelled
+                    break;
+                }
+            }
+        });
+        Ok(rx)
     }
 }
 
@@ -179,7 +235,17 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             }
         };
         let mut config = Config::from_ado_string(&conn_str)?;
-        if let Some(auth) = Self::user_mapping_auth(server.server_oid)? {
+        if server.options.get("auth").map(String::as_str) == Some("kerberos") {
+            // Windows Integrated / Kerberos: negotiate via GSSAPI (TZ §5.1 M2)
+            #[cfg(feature = "mssql_fdw_rq_kerberos")]
+            config.authentication(tiberius::AuthMethod::Integrated);
+            #[cfg(not(feature = "mssql_fdw_rq_kerberos"))]
+            return Err(MssqlFdwRqError::InvalidOption(
+                "server option auth='kerberos' requires building the extension \
+                 with the mssql_fdw_rq_kerberos feature"
+                    .to_string(),
+            ));
+        } else if let Some(auth) = Self::user_mapping_auth(server.server_oid)? {
             config.authentication(auth);
         } else if !conn_str.to_ascii_lowercase().contains("user=") {
             return Err(MssqlFdwRqError::InvalidOption(
@@ -198,8 +264,8 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             rt,
             config,
             log_remote_query,
-            scan_result: Vec::new(),
-            iter_idx: 0,
+            rx: None,
+            rows_out: 0,
             tgt_cols: Vec::new(),
         })
     }
@@ -227,7 +293,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 Ok(())
             };
             if oid == FOREIGN_SERVER_RELATION_ID {
-                allowed(&["conn_string", "conn_string_id", "log_remote_query"])?;
+                allowed(&["conn_string", "conn_string_id", "log_remote_query", "auth"])?;
                 if !names.contains(&"conn_string") && !names.contains(&"conn_string_id") {
                     return Err(MssqlFdwRqError::InvalidOption(
                         "either 'conn_string' or 'conn_string_id' is required".to_string(),
@@ -296,9 +362,11 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .map(Self::relation_mapping)
             .collect::<MssqlFdwRqResult<_>>()?;
 
+        let (bool_columns, not_null_columns) = Self::column_flags(&query.relations);
         let ctx = TranslateContext {
             relations,
-            bool_columns: Self::bool_columns(&query.relations),
+            bool_columns,
+            not_null_columns,
         };
         let tsql = translator::translate(&query.sql, &ctx)?;
         let params: Vec<Box<dyn tiberius::ToSql>> = query
@@ -306,41 +374,18 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .iter()
             .map(|p| types::value_to_sql(p.value.as_ref(), p.type_oid))
             .collect::<MssqlFdwRqResult<_>>()?;
-        let param_refs: Vec<&dyn tiberius::ToSql> = params
-            .iter()
-            .map(|b| &**b as &dyn tiberius::ToSql)
-            .collect();
 
         self.tgt_cols = query.columns.clone();
-        self.iter_idx = 0;
-
         let started = Instant::now();
-        if self.log_remote_query {
-            pgrx::log!("mssql_fdw_rq: remote query: {tsql}");
-        }
-        let mut client = self.connect()?;
-        let stream = self.rt.block_on(client.query(tsql.clone(), &param_refs))?;
-        self.scan_result = self.rt.block_on(stream.into_first_result())?;
-        let elapsed = started.elapsed();
-
+        self.rx = Some(self.spawn_streaming_query(tsql.clone(), params)?);
+        self.rows_out = 0;
         if self.log_remote_query {
             pgrx::log!(
-                "mssql_fdw_rq: remote query done ({} rows, {} ms)",
-                self.scan_result.len(),
-                elapsed.as_millis()
+                "mssql_fdw_rq: remote query dispatched ({} ms): {}",
+                started.elapsed().as_millis(),
+                tsql
             );
         }
-
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsIn,
-            self.scan_result.len() as i64,
-        );
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsOut,
-            self.scan_result.len() as i64,
-        );
 
         Ok(())
     }
@@ -362,7 +407,6 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         let remote_table = require_option("table", options)?.to_string();
 
         self.tgt_cols = columns.to_vec();
-        self.iter_idx = 0;
 
         let cols = if columns.is_empty() {
             "*".to_string()
@@ -429,52 +473,58 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             sql.push_str(&conds.join(" AND "));
         }
 
-        let param_refs: Vec<&dyn tiberius::ToSql> = params
-            .iter()
-            .map(|b| &**b as &dyn tiberius::ToSql)
-            .collect();
-
-        let mut client = self.connect()?;
-        let stream = self.rt.block_on(client.query(sql.clone(), &param_refs))?;
-        self.scan_result = self.rt.block_on(stream.into_first_result())?;
-
         if self.log_remote_query {
             pgrx::log!("mssql_fdw_rq: remote query: {sql}");
         }
-
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsIn,
-            self.scan_result.len() as i64,
-        );
+        self.rx = Some(self.spawn_streaming_query(sql, params)?);
+        self.rows_out = 0;
 
         Ok(())
     }
 
     fn iter_scan(&mut self, row: &mut Row) -> MssqlFdwRqResult<Option<()>> {
-        if self.iter_idx >= self.scan_result.len() {
-            return Ok(None);
+        // pull exactly one row from the streaming channel; the connection
+        // task stays parked until the next call
+        let item = match self.rx.as_mut() {
+            Some(rx) => self.rt.block_on(rx.recv()),
+            None => return Ok(None),
+        };
+        match item {
+            Some(Ok(src_row)) => {
+                let mut tgt_row = Row::new();
+                for tgt_col in &self.tgt_cols {
+                    let cell = types::field_to_cell(&src_row, tgt_col)?;
+                    tgt_row.push(&tgt_col.name, cell);
+                }
+                row.replace_with(tgt_row);
+                self.rows_out += 1;
+                Ok(Some(()))
+            }
+            Some(Err(e)) => Err(e.into()),
+            None => {
+                // stream exhausted: finalize the row counters
+                stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsIn, self.rows_out);
+                stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsOut, self.rows_out);
+                self.rx = None;
+                Ok(None)
+            }
         }
-
-        let src_row = &self.scan_result[self.iter_idx];
-        let mut tgt_row = Row::new();
-        for tgt_col in &self.tgt_cols {
-            let cell = types::field_to_cell(src_row, tgt_col)?;
-            tgt_row.push(&tgt_col.name, cell);
-        }
-        row.replace_with(tgt_row);
-        self.iter_idx += 1;
-
-        Ok(Some(()))
     }
 
     fn re_scan(&mut self) -> MssqlFdwRqResult<()> {
-        self.iter_idx = 0;
-        Ok(())
+        // a stream cannot be rewound, and re-running the query would double
+        // the round trips; reject rescan explicitly instead of misbehaving
+        Err(MssqlFdwRqError::UnsupportedConstruct(
+            translator::TranslateError::UnsupportedConstruct {
+                sql_fragment: "RESCAN".to_string(),
+                reason: "rescans are not supported by the streaming executor".to_string(),
+            },
+        ))
     }
 
     fn end_scan(&mut self) -> MssqlFdwRqResult<()> {
-        self.scan_result.clear();
+        // dropping the receiver cancels the background query task
+        self.rx = None;
         Ok(())
     }
 

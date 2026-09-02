@@ -888,6 +888,10 @@ pub(crate) unsafe fn query_has_upper_operations(root: *mut pg_sys::PlannerInfo) 
             || !(*query).limitOffset.is_null()
             || !(*query).limitCount.is_null()
             || !(*query).setOperations.is_null()
+            // simple UNION ALL arms are pulled up into append_rel_list before
+            // planning, leaving setOperations empty; those are still
+            // upper-level shapes a full-query FDW may want to own
+            || !(*root).append_rel_list.is_null()
     }
 }
 

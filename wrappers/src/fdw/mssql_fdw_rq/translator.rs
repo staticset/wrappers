@@ -31,6 +31,11 @@ pub struct TranslateContext {
     /// local column names (lowercase) whose PostgreSQL type is `boolean`;
     /// bare references to them in predicate position become `= 1` / `= 0`
     pub bool_columns: Vec<String>,
+    /// local column names (lowercase) that are NOT NULL — only those may be
+    /// sorted without a NULL tiebreaker (PostgreSQL and T-SQL disagree on
+    /// implicit NULL ordering: PG puts NULLs last for ASC / first for DESC,
+    /// while T-SQL always treats NULL as the smallest value)
+    pub not_null_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,9 +264,23 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// Depth-0 clause analysis (LIMIT / OFFSET / ORDER BY / set operations)
-// ---------------------------------------------------------------------------
+/// Match a LIMIT/OFFSET value token: the deparser prints constants as
+/// `'3'::bigint` (string + cast) and parameters as `$1::bigint`.
+/// Returns the value and how many extra tokens the cast tail occupies.
+fn limit_value_at(toks: &[Tok], at: usize) -> Option<(LimitValue, usize)> {
+    let (value, next) = match toks.get(at)? {
+        Tok::Num(n) => (LimitValue::Num(n.clone()), at + 1),
+        Tok::Str(s) => (LimitValue::Num(s.clone()), at + 1),
+        Tok::Param(p) => (LimitValue::Param(p.clone()), at + 1),
+        _ => return None,
+    };
+    // optional ::type cast tail
+    let mut tail = 0usize;
+    if matches!(toks.get(next), Some(Tok::Op(o)) if o == "::") {
+        tail = 1 + type_token_len(&toks[next + 1..]);
+    }
+    Some((value, tail))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum LimitValue {
@@ -284,6 +303,9 @@ struct Clauses {
     offset: Option<LimitValue>,
     /// tokens consumed by the OFFSET clause (incl. optional ROWS/FETCH tail)
     offset_len: usize,
+    /// tokens consumed by the LIMIT clause (2 for `LIMIT n`, 5 for the
+    /// deparser's `FETCH FIRST n ROWS ONLY` form)
+    limit_len: usize,
     has_order_by: bool,
     has_setop: bool,
 }
@@ -306,16 +328,14 @@ fn analyze(toks: &[Tok]) -> Result<Clauses, TranslateError> {
                         reason: "LIMIT inside a subquery is not supported in v1".to_string(),
                     });
                 }
-                match toks.get(i + 1) {
-                    Some(Tok::Num(n)) => {
-                        clauses.limit = Some(LimitValue::Num(n.clone()));
-                        i += 1;
+                match limit_value_at(toks, i + 1) {
+                    Some((value, cast_tail)) => {
+                        clauses.limit = Some(value);
+                        clauses.limit_len = 2 + cast_tail;
+                        i += 1 + cast_tail;
                     }
-                    Some(Tok::Param(p)) => {
-                        clauses.limit = Some(LimitValue::Param(p.clone()));
-                        i += 1;
-                    }
-                    Some(Tok::Word(a)) if a.eq_ignore_ascii_case("all") => {
+                    None if matches!(toks.get(i + 1), Some(Tok::Word(a)) if a.eq_ignore_ascii_case("all")) =>
+                    {
                         return Err(TranslateError::UnsupportedConstruct {
                             sql_fragment: "LIMIT ALL".to_string(),
                             reason: "LIMIT ALL is not supported".to_string(),
@@ -334,41 +354,26 @@ fn analyze(toks: &[Tok]) -> Result<Clauses, TranslateError> {
                 match lw.as_str() {
                     "offset" => {
                         // OFFSET n [ROW|ROWS] [FETCH {FIRST|NEXT} n [ROW|ROWS] ONLY]
-                        match toks.get(i + 1) {
-                            Some(Tok::Num(n)) => {
-                                clauses.offset = Some(LimitValue::Num(n.clone()));
-                            }
-                            Some(Tok::Param(p)) => {
-                                clauses.offset = Some(LimitValue::Param(p.clone()));
-                            }
-                            _ => {
-                                return Err(TranslateError::UnsupportedConstruct {
-                                    sql_fragment: "OFFSET".to_string(),
-                                    reason: "OFFSET without a plain constant or parameter"
-                                        .to_string(),
-                                });
-                            }
-                        }
-                        let mut len = 2usize; // OFFSET + value
-                        if matches!(toks.get(i + 2), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("row") || w.eq_ignore_ascii_case("rows"))
+                        let Some((value, cast_tail)) = limit_value_at(toks, i + 1) else {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: "OFFSET".to_string(),
+                                reason: "OFFSET without a plain constant or parameter".to_string(),
+                            });
+                        };
+                        clauses.offset = Some(value);
+                        let mut len = 2 + cast_tail; // OFFSET + value (+ ::cast)
+                        if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("row") || w.eq_ignore_ascii_case("rows"))
                         {
                             len += 1;
                         }
                         // FETCH FIRST|NEXT n ROW|ROWS ONLY
                         if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("fetch"))
                             && matches!(toks.get(i + len + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("next"))
-                            && matches!(
-                                toks.get(i + len + 2),
-                                Some(Tok::Num(_)) | Some(Tok::Param(_))
-                            )
+                            && let Some((limit, fetch_cast_tail)) =
+                                limit_value_at(toks, i + len + 2)
                         {
-                            let limit = match toks.get(i + len + 2) {
-                                Some(Tok::Num(n)) => LimitValue::Num(n.clone()),
-                                Some(Tok::Param(p)) => LimitValue::Param(p.clone()),
-                                _ => unreachable!(),
-                            };
                             clauses.limit = Some(limit);
-                            len += 3; // FETCH FIRST/NEXT n
+                            len += 3 + fetch_cast_tail; // FETCH FIRST/NEXT n (+ ::cast)
                             if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("row") || w.eq_ignore_ascii_case("rows"))
                             {
                                 len += 1;
@@ -387,6 +392,26 @@ fn analyze(toks: &[Tok]) -> Result<Clauses, TranslateError> {
                                 clauses.has_order_by = true;
                                 i += 1;
                             }
+                        }
+                    }
+                    // the deparser prints `LIMIT n` as FETCH FIRST n ROWS ONLY
+                    // when there is no OFFSET
+                    "fetch" if depth == 0 => {
+                        if matches!(toks.get(i + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("next"))
+                            && let Some((limit, cast_tail)) = limit_value_at(toks, i + 2)
+                        {
+                            clauses.limit = Some(limit);
+                            let mut len = 3 + cast_tail;
+                            if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("row") || w.eq_ignore_ascii_case("rows"))
+                            {
+                                len += 1;
+                            }
+                            if matches!(toks.get(i + len), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("only"))
+                            {
+                                len += 1;
+                            }
+                            clauses.limit_len = len;
+                            i += len - 1;
                         }
                     }
                     "union" | "intersect" | "except" => clauses.has_setop = true,
@@ -479,15 +504,42 @@ const NON_SUBJECT_WORDS: [&str; 34] = [
 
 /// function calls with verified T-SQL equivalents (same name and semantics);
 /// anything else followed by `(` is rejected instead of being sent to MSSQL
-const KNOWN_FUNCTIONS: [&str; 22] = [
-    "count", "sum", "avg", "min", "max", "abs", "round", "floor", "ceiling", "sqrt", "power",
-    "square", "sign", "lower", "upper", "left", "right", "replace", "concat", "coalesce", "nullif",
-    "iif",
+const KNOWN_FUNCTIONS: [&str; 30] = [
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "abs",
+    "round",
+    "floor",
+    "ceiling",
+    "sqrt",
+    "power",
+    "square",
+    "sign",
+    "lower",
+    "upper",
+    "left",
+    "right",
+    "replace",
+    "concat",
+    "coalesce",
+    "nullif",
+    "iif", // window functions (identical names and OVER syntax in T-SQL)
+    "row_number",
+    "rank",
+    "dense_rank",
+    "ntile",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
 ];
 
 /// keywords that may legitimately precede `(` and are not function calls
-const KEYWORD_CALL_WORDS: [&str; 8] = [
-    "in", "exists", "values", "any", "all", "cast", "isnull", "using",
+const KEYWORD_CALL_WORDS: [&str; 9] = [
+    "in", "exists", "values", "any", "all", "cast", "isnull", "using", "over",
 ];
 
 pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateError> {
@@ -536,13 +588,61 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     // WHERE/HAVING/ON as comma-separated lists, which must become AND
     let mut in_condition_clause = false;
 
+    // top-level ORDER BY tracking: PostgreSQL's implicit NULL ordering
+    // (ASC → NULLS LAST, DESC → NULLS FIRST) differs from T-SQL's (NULL is
+    // always smallest), so nullable sort keys need a CASE tiebreaker
+    let mut in_order = false;
+    let mut order_item_closed = true;
+    // Some(depth) while inside the parentheses of `OVER ( ... )`
+    let mut over_paren_depth: Option<usize> = None;
+    let mut next_opens_over = false;
+    let mut over_order_seen = false;
+
     let mut i = 0usize;
     while i < toks.len() {
         match &toks[i] {
             Tok::Op(o) => {
                 match o.as_str() {
-                    "(" => depth += 1,
-                    ")" => depth = depth.saturating_sub(1),
+                    "(" => {
+                        depth += 1;
+                        if next_opens_over {
+                            over_paren_depth = Some(depth);
+                            next_opens_over = false;
+                        }
+                    }
+                    ")" => {
+                        depth = depth.saturating_sub(1);
+                        if over_paren_depth == Some(depth + 1) {
+                            over_paren_depth = None;
+                            if over_order_seen {
+                                over_order_seen = false;
+                                // last sort key inside OVER(): must be a
+                                // plain NOT NULL column (or NULL ordering
+                                // would silently differ in T-SQL)
+                                let last_desc = pop_if_word(&mut out, "desc");
+                                if !last_desc {
+                                    pop_if_word(&mut out, "asc");
+                                }
+                                if let Ok(start) = capture_subject(&out, case_depth) {
+                                    let expr = out[start..].join(" ");
+                                    let bare_not_null = out.len() - start == 1
+                                        && !expr.contains(' ')
+                                        && ctx.not_null_columns.contains(&expr.to_lowercase());
+                                    if !bare_not_null {
+                                        return Err(TranslateError::UnsupportedConstruct {
+                                            sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                            reason: "nullable NULL ordering inside a window \
+                                                     cannot be translated to T-SQL faithfully"
+                                                .to_string(),
+                                        });
+                                    }
+                                    if last_desc {
+                                        out.push("DESC".to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ";" => {
                         i += 1;
                         continue;
@@ -550,6 +650,16 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "," if in_condition_clause && depth == 0 => {
                         // deparser's `,` at the top of a WHERE/HAVING/ON list
                         out.push("AND".to_string());
+                        i += 1;
+                        continue;
+                    }
+                    "," if in_order && depth == 0 => {
+                        // close the previous ORDER BY item, start the next
+                        if !order_item_closed {
+                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            order_item_closed = true;
+                        }
+                        out.push(",".to_string());
                         i += 1;
                         continue;
                     }
@@ -598,6 +708,11 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // value token already validated by analyze(); TOP was
                         // injected at the SELECT, otherwise the OFFSET/FETCH
                         // clause belongs at this position (right after ORDER BY)
+                        if in_order && !order_item_closed {
+                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            order_item_closed = true;
+                        }
+                        in_order = false;
                         if use_fetch && clauses.offset.is_none() {
                             if !clauses.has_order_by {
                                 out.push("ORDER BY (SELECT NULL)".to_string());
@@ -608,7 +723,28 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 clauses.limit.as_ref().unwrap().render()
                             ));
                         }
-                        i += 2;
+                        i += clauses.limit_len.max(2);
+                        continue;
+                    }
+                    // deparser's `FETCH FIRST n ROWS ONLY` LIMIT form (no
+                    // OFFSET): the canonical clause was emitted already
+                    "fetch" if depth == 0 && clauses.limit_len > 0 && clauses.offset.is_none() => {
+                        if in_order && !order_item_closed {
+                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            order_item_closed = true;
+                        }
+                        in_order = false;
+                        if use_fetch && !top_emitted {
+                            if !clauses.has_order_by {
+                                out.push("ORDER BY (SELECT NULL)".to_string());
+                            }
+                            out.push("OFFSET 0 ROWS".to_string());
+                            out.push(format!(
+                                "FETCH NEXT {} ROWS ONLY",
+                                clauses.limit.as_ref().unwrap().render()
+                            ));
+                        }
+                        i += clauses.limit_len;
                         continue;
                     }
                     "offset" if depth == 0 => {
@@ -616,6 +752,11 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // whole PG tail (ROWS / FETCH … ONLY) is re-emitted
                         // in canonical form, so consume everything analyze
                         // measured for this clause
+                        if in_order && !order_item_closed {
+                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            order_item_closed = true;
+                        }
+                        in_order = false;
                         if !clauses.has_order_by {
                             out.push("ORDER BY (SELECT NULL)".to_string());
                         }
@@ -653,18 +794,123 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "end" => case_depth = case_depth.saturating_sub(1),
                     // condition clauses: their top-level `,` lists mean AND
                     "where" | "having" | "on" if depth == 0 => in_condition_clause = true,
-                    // structural keywords end the condition clause
-                    "select" | "from" | "group" | "order" | "limit" | "offset" | "union"
-                    | "intersect" | "except" | "join" | "inner" | "left" | "right" | "full"
-                    | "cross" | "outer" | "returning"
+                    // top-level ORDER BY opens sort-key tracking; inside
+                    // OVER() it only arms the closing-parenthesis check
+                    "order" if matches!(toks.get(i + 1), Some(Tok::Word(b)) if b.eq_ignore_ascii_case("by")) =>
+                    {
+                        if depth == 0 {
+                            in_condition_clause = false;
+                            in_order = true;
+                            order_item_closed = false;
+                        } else if over_paren_depth.is_some()
+                            && depth >= over_paren_depth.unwrap_or(usize::MAX)
+                        {
+                            over_order_seen = true;
+                        }
+                        out.push("ORDER BY".to_string());
+                        i += 2;
+                        continue;
+                    }
+                    // structural keywords end the condition clause and the
+                    // ORDER BY list
+                    "select" | "from" | "group" | "limit" | "offset" | "union" | "intersect"
+                    | "except" | "join" | "inner" | "left" | "right" | "full" | "cross"
+                    | "outer" | "returning"
                         if depth == 0 =>
                     {
                         in_condition_clause = false;
+                        if in_order && !order_item_closed {
+                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            order_item_closed = true;
+                        }
+                        in_order = false;
+                    }
+                    // `OVER ( ... )` needs separate NULL-ordering handling
+                    "over" if matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") => {
+                        next_opens_over = true;
+                        out.push("OVER".to_string());
+                        i += 1;
+                        continue;
+                    }
+                    // direction terminates an ORDER BY item; inside OVER()
+                    // a nullable sort key cannot be corrected safely
+                    "asc" | "desc" if in_order && depth == 0 && over_paren_depth.is_none() => {
+                        let desc = lw == "desc";
+                        if matches!(toks.get(i + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("nulls"))
+                        {
+                            // the NULLS branch below owns the item rewrite
+                            out.push(if desc { "DESC" } else { "ASC" }.to_string());
+                        } else {
+                            close_order_item(&mut out, ctx, case_depth, Some(desc))?;
+                            order_item_closed = true;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    "asc" | "desc"
+                        if over_paren_depth.is_some()
+                            && depth >= over_paren_depth.unwrap_or(usize::MAX) =>
+                    {
+                        if let Ok(start) = capture_subject(&out, case_depth) {
+                            let expr = out[start..].join(" ");
+                            let bare_not_null = out.len() - start == 1
+                                && !expr.contains(' ')
+                                && ctx.not_null_columns.contains(&expr.to_lowercase());
+                            if !bare_not_null {
+                                return Err(TranslateError::UnsupportedConstruct {
+                                    sql_fragment: "ORDER BY … NULLS … inside OVER(…)".to_string(),
+                                    reason: "nullable NULL ordering inside a window cannot be \
+                                             translated to T-SQL faithfully"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        out.push(lw.to_uppercase());
+                        i += 1;
+                        continue;
                     }
                     // PG emits `FROM ONLY tbl` to skip child tables; T-SQL
                     // has no inheritance, so ONLY is simply dropped
                     "only" => {
                         i += 1;
+                        continue;
+                    }
+                    // ORDER BY … NULLS FIRST/LAST: T-SQL has no NULLS
+                    // syntax. Its implicit rule is "NULL is smallest" (ASC →
+                    // NULLS FIRST, DESC → NULLS LAST); matching forms just
+                    // drop the word, the opposite ones add a CASE tiebreaker.
+                    "nulls" if matches!(toks.get(i + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("last")) =>
+                    {
+                        let pg_last = toks.get(i + 1).is_some_and(
+                            |w| matches!(w, Tok::Word(x) if x.eq_ignore_ascii_case("last")),
+                        );
+                        let dir_desc = pop_if_word(&mut out, "desc");
+                        if !dir_desc {
+                            pop_if_word(&mut out, "asc");
+                        }
+                        let tsql_default_last = dir_desc; // NULL smallest
+                        if pg_last != tsql_default_last {
+                            // opposite of T-SQL default → prepend CASE tiebreaker
+                            let start = capture_subject(&out, case_depth)?;
+                            let expr = out[start..].join(" ");
+                            out.truncate(start);
+                            out.push(format!(
+                                "CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END{}",
+                                if dir_desc { " DESC" } else { "" }
+                            ));
+                            out.push(",".to_string());
+                            out.push(expr);
+                            if dir_desc {
+                                out.push("DESC".to_string());
+                            }
+                        } else {
+                            // matches the T-SQL default: keep the plain term
+                            if dir_desc {
+                                out.push("DESC".to_string());
+                            }
+                        }
+                        order_item_closed = true;
+                        i += 2;
                         continue;
                     }
                     // SQL typed literals: DATE '...' / TIMESTAMP '...' /
@@ -742,7 +988,49 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
         i += 1;
     }
 
+    // an ORDER BY list can end with the statement itself
+    if in_order && !order_item_closed {
+        close_order_item(&mut out, ctx, case_depth, None)?;
+    }
+
     Ok(join_pieces(&out))
+}
+
+/// Finish one top-level ORDER BY item: re-emit it with a NULL tiebreaker
+/// that reproduces PostgreSQL's implicit NULL ordering (ASC → NULLS LAST,
+/// DESC → NULLS FIRST) unless the item is a plain NOT NULL column, which
+/// needs no correction in T-SQL.
+fn close_order_item(
+    out: &mut Vec<String>,
+    ctx: &TranslateContext,
+    case_depth: usize,
+    desc: Option<bool>,
+) -> Result<(), TranslateError> {
+    let start = capture_subject(out, case_depth)?;
+    let expr = out[start..].join(" ");
+    let bare_not_null = out.len() - start == 1
+        && !expr.contains(' ')
+        && ctx.not_null_columns.contains(&expr.to_lowercase());
+
+    if bare_not_null {
+        if desc == Some(true) {
+            out.push("DESC".to_string());
+        }
+        return Ok(());
+    }
+
+    out.truncate(start);
+    let d = desc.unwrap_or(false);
+    out.push(format!(
+        "CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END{}",
+        if d { " DESC" } else { "" }
+    ));
+    out.push(",".to_string());
+    out.push(expr);
+    if d {
+        out.push("DESC".to_string());
+    }
+    Ok(())
 }
 
 /// Join rendered pieces into a statement: no space around `.`, no space before

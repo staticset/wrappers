@@ -14,6 +14,7 @@ mod unit {
                 remote_table: "Orders".into(),
             }],
             bool_columns: vec!["active".into()],
+            not_null_columns: vec!["id".into()],
         }
     }
 
@@ -295,6 +296,100 @@ mod unit {
         );
     }
 
+    // -- window functions (TZ §10 M2) ------------------------------------
+
+    #[test]
+    fn window_function_passes_through_with_top() {
+        // the deparser prints LIMIT as `'3'::bigint`; window sort keys must
+        // be NOT NULL columns (id), otherwise the query is rejected
+        assert_tsql(
+            " SELECT id, row_number() OVER (PARTITION BY customer_id ORDER BY id DESC) AS rn\
+             \n   FROM ONLY dbo_orders\
+             \n LIMIT '3'::bigint",
+            &orders_ctx(),
+            "SELECT TOP (3) id, row_number() OVER(PARTITION BY customer_id ORDER BY id DESC) \
+             AS rn FROM [dbo].[Orders]",
+        );
+    }
+
+    #[test]
+    fn window_function_not_null_order_key() {
+        assert_tsql(
+            "SELECT id, rank() OVER (ORDER BY id) AS r FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT id, rank() OVER(ORDER BY id) AS r FROM [dbo].[Orders]",
+        );
+    }
+
+    #[test]
+    fn window_function_nullable_order_key_rejected() {
+        assert_unsupported(
+            "SELECT id, rank() OVER (ORDER BY amount) AS r FROM public.dbo_orders",
+            &orders_ctx(),
+            "OVER",
+        );
+    }
+
+    // -- NULL ordering (top-level ORDER BY) -------------------------------
+
+    #[test]
+    fn order_by_not_null_key_needs_no_tiebreaker() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY id LIMIT 5",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY id OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+    }
+
+    #[test]
+    fn order_by_nullable_key_gets_case_tiebreaker() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY amount LIMIT 5",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END, amount OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY amount DESC LIMIT 5",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END DESC, amount DESC \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+    }
+
+    #[test]
+    fn explicit_nulls_matching_tsql_default_dropped() {
+        // ASC NULLS FIRST and DESC NULLS LAST are exactly T-SQL's defaults
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY amount ASC NULLS FIRST LIMIT 5",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY amount \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY amount DESC NULLS LAST LIMIT 5",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY amount DESC \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+    }
+
+    #[test]
+    fn deparser_cast_limit_form() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders LIMIT '10'::bigint",
+            &orders_ctx(),
+            "SELECT TOP (10) id FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY id\
+             \n FETCH FIRST '7'::bigint ROWS ONLY",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY id OFFSET 0 ROWS FETCH NEXT 7 ROWS ONLY",
+        );
+    }
+
     #[test]
     fn bool_literals() {
         assert_tsql(
@@ -320,7 +415,7 @@ mod unit {
         assert_tsql(
             "SELECT c.name, SUM(o.amount) AS total FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC LIMIT 5",
             &two_tables_ctx(),
-            "SELECT c.name, SUM(o.amount) AS total FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT c.name, SUM(o.amount) AS total FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY CASE WHEN total IS NULL THEN 1 ELSE 0 END DESC, total DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 
@@ -554,7 +649,7 @@ mod tests {
                  OPTIONS (user 'sa', password '{password}')"
             ),
             "CREATE FOREIGN TABLE rqj_orders (\
-               id bigint, customer_id uuid, status text, total_amount numeric(18,2), \
+               id bigint NOT NULL, customer_id uuid, status text, total_amount numeric(18,2), \
                shipping_fee numeric(10,2), order_date date, placed_at timestamp, \
                shipped_at timestamptz\
              ) SERVER rqj_srv OPTIONS (schema 'dbo', table 'orders')"
@@ -657,6 +752,80 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(cnt, 25);
+    }
+
+    #[pg_test]
+    fn window_function_matches_reference() {
+        setup_committed();
+
+        // TZ §10 M2: ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) as one
+        // remote operator; runs through dblink (top-level statement, see
+        // join test) and is compared with the same query on MSSQL directly.
+        // The window sort key must be a NOT NULL column (rqj_orders.id).
+        let pg = Spi::connect(|c| {
+            let rows = c
+                .select(
+                    "SELECT * FROM dblink(\
+                         format('host=localhost port=%s dbname=rqjoin_test', current_setting('port')), \
+                         $$SELECT id::text AS name, rn::text AS total \
+                           FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id \
+                                     ORDER BY id DESC) AS rn \
+                                 FROM rqj_orders) t \
+                           ORDER BY id$$\
+                     ) AS t(name text, total text)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            rows.filter_map(|r| {
+                let name = r.get_by_name::<&str, _>("name").unwrap().map(str::to_owned);
+                let total = r
+                    .get_by_name::<&str, _>("total")
+                    .unwrap()
+                    .map(str::to_owned);
+                name.zip(total)
+            })
+            .collect::<Vec<_>>()
+        });
+
+        let mssql = {
+            let rt = create_async_runtime().expect("runtime");
+            let mut config = Config::from_ado_string(&format!(
+                "{};User=sa;Password={}",
+                mssql_conn_string(),
+                mssql_password()
+            ))
+            .expect("ado");
+            let tcp = rt
+                .block_on(TcpStream::connect(config.get_addr()))
+                .expect("tcp");
+            tcp.set_nodelay(true).expect("nodelay");
+            let mut client = rt
+                .block_on(Client::connect(config, tcp.compat_write()))
+                .expect("connect");
+            let stream = rt
+                .block_on(client.query(
+                    "SELECT CAST(id AS nvarchar(20)) AS name, CAST(rn AS nvarchar(10)) AS total \
+                     FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id \
+                               ORDER BY id DESC) AS rn FROM dbo.orders) t \
+                     ORDER BY id",
+                    &[],
+                ))
+                .expect("query");
+            let rows = rt.block_on(stream.into_first_result()).expect("result");
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.try_get::<&str, _>("name").unwrap().unwrap().to_string(),
+                        r.try_get::<&str, _>("total").unwrap().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(pg, mssql);
+        // all 60 orders, one rank each partition position
+        assert_eq!(pg.len(), 60);
     }
 
     #[pg_test(error = "option 'rowid_column' is required")]
