@@ -19,6 +19,13 @@ DISTINCT / window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`,
 identifier mapping / date-time-bytea round-trips / streaming execution /
 Kerberos (Windows Integrated) authentication.
 
+Plain single-table scans push down `IN` lists (`= ANY`), `NOT IN` (`<> ALL`)
+and other array comparisons, `IS [NOT] NULL`, `LIKE`/`ILIKE`; an `OR` across
+several columns cannot become scan quals and is routed to the full-query
+path, so it still executes as one remote statement. Join results are matched
+to the target list by position when output columns carry no name (e.g.
+`SELECT o.id, c.code FROM … JOIN …`).
+
 Anything outside the supported set fails with an explicit
 `UnsupportedConstruct { sql_fragment, reason }` — never silently wrong SQL.
 
@@ -109,7 +116,8 @@ Manual checklist (not covered by CI):
   (psql, drivers, BI tools) are unaffected.
 - Rescans (`RESCAN` plan nodes) are rejected by the streaming executor.
 - LOB(MAX) types (`nvarchar(max)` etc.), `xml`, JSON and spatial types are
-  rejected explicitly; arrays are not supported in v1.
+  rejected explicitly; array-valued columns are not supported in v1
+  (`IN` / `= ANY` / `<> ALL` filters over regular columns are).
 - `LIMIT ALL`, `DISTINCT ON`, POSIX regex operators, subquery `LIMIT` are
   rejected explicitly.
 

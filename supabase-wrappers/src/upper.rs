@@ -461,10 +461,6 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
             debug2!("add_full_query_upper_path: missing planner relation state");
             return false;
         }
-        if !query_requires_full_query(root) {
-            debug2!("add_full_query_upper_path: query does not require full-query path");
-            return false;
-        }
 
         let fdw_private = (*input_rel).fdw_private;
         // Set-operation inputs are append relations without FDW state; those
@@ -477,6 +473,21 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
             debug2!("add_full_query_upper_path: input rel has fdw_private");
             Some(PgBox::<FdwState<E, W>>::from_pg(fdw_private as _))
         };
+
+        // The tree shape misses one remote-query case: restriction clauses
+        // the table-scan layer could not extract as quals (e.g. an OR across
+        // two columns) leave the query single-relation with no upper
+        // operations, but its scan state already decided a plain scan cannot
+        // faithfully represent it (requires_full_query). Trust that decision
+        // as well, or PostgreSQL is left with only the penalized base path.
+        let shape_requires_full_query = query_requires_full_query(root)
+            || input_state
+                .as_ref()
+                .is_some_and(|state| state.requires_full_query);
+        if !shape_requires_full_query {
+            debug2!("add_full_query_upper_path: query does not require full-query path");
+            return false;
+        }
         let mut remote_query_policy = input_state
             .as_ref()
             .map(|state| state.remote_query_policy)

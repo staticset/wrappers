@@ -23,6 +23,135 @@ fn bracket_name(name: &str) -> MssqlFdwRqResult<String> {
     Ok(format!("[{name}]"))
 }
 
+/// Map a PostgreSQL qual operator name to its T-SQL rendering; returns the
+/// whole predicate shape for the pattern operators (ILIKE needs LOWER on
+/// both sides, mirroring the full-query translator).
+fn sql_predicate(field: &str, oper: &str, param: &str) -> String {
+    match oper {
+        "~~" => format!("{field} LIKE {param}"),
+        "!~~" => format!("{field} NOT LIKE {param}"),
+        "~~*" => format!("LOWER({field}) LIKE LOWER({param})"),
+        "!~~*" => format!("LOWER({field}) NOT LIKE LOWER({param})"),
+        o => format!("{field} {o} {param}"),
+    }
+}
+
+/// Render one qual into a T-SQL predicate, appending typed parameters for
+/// every value (values are never concatenated into the SQL text, TZ §5.4).
+fn render_qual(
+    qual: &Qual,
+    params: &mut Vec<Box<dyn tiberius::ToSql>>,
+) -> MssqlFdwRqResult<String> {
+    let field = bracket_name(&qual.field)?;
+    let oper = qual.operator.as_str();
+
+    // ScalarArrayOpExpr quals: `x = ANY (array)` (use_or) or `x <> ALL (…)`
+    if let Value::Array(cells) = &qual.value {
+        return render_array_qual(&field, oper, qual.use_or, cells, params);
+    }
+
+    match &qual.value {
+        Value::Cell(Cell::Bool(b)) if oper == "is" => Ok(format!("{field} = {}", *b as u8)),
+        Value::Cell(Cell::Bool(b)) if oper == "is not" => Ok(format!("{field} <> {}", *b as u8)),
+        // NullTest quals arrive as is/is not with the literal cell "null"
+        Value::Cell(Cell::String(s)) if oper == "is" && s == "null" => {
+            Ok(format!("{field} IS NULL"))
+        }
+        Value::Cell(Cell::String(s)) if oper == "is not" && s == "null" => {
+            Ok(format!("{field} IS NOT NULL"))
+        }
+        Value::Cell(cell) => {
+            let n = params.len() + 1;
+            let cond = sql_predicate(&field, oper, &format!("@P{n}"));
+            params.push(types::cell_to_sql(cell)?);
+            Ok(cond)
+        }
+        // handled by the array branch above
+        Value::Array(_) => unreachable!("array quals are rendered by render_array_qual"),
+    }
+}
+
+/// Render an array qual: `= ANY` becomes `IN` (and `<> ALL` → `NOT IN`);
+/// other operators expand into OR-chains (ANY) / AND-chains (ALL).
+fn render_array_qual(
+    field: &str,
+    oper: &str,
+    use_or: bool,
+    cells: &[Cell],
+    params: &mut Vec<Box<dyn tiberius::ToSql>>,
+) -> MssqlFdwRqResult<String> {
+    // `x = ANY ('{}')` is FALSE and `x <> ALL ('{}')` is TRUE; T-SQL has no
+    // empty IN list, so the degenerate cases become constants
+    if cells.is_empty() {
+        return Ok(if use_or {
+            "1 = 0".to_string()
+        } else {
+            "1 = 1".to_string()
+        });
+    }
+
+    let mut placeholders = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let n = params.len() + 1;
+        placeholders.push(format!("@P{n}"));
+        params.push(types::cell_to_sql(cell)?);
+    }
+
+    if use_or && oper == "=" {
+        return Ok(format!("{field} IN ({})", placeholders.join(", ")));
+    }
+    if !use_or && oper == "<>" {
+        return Ok(format!("{field} NOT IN ({})", placeholders.join(", ")));
+    }
+
+    let conds: MssqlFdwRqResult<Vec<String>> = placeholders
+        .iter()
+        .map(|p| Ok(sql_predicate(field, oper, p)))
+        .collect();
+    Ok(format!(
+        "({})",
+        conds?.join(if use_or { " OR " } else { " AND " })
+    ))
+}
+
+/// Build the plain-scan statement for one table: the requested column list
+/// plus one WHERE condition per qual. Pure function (unit-tested); the
+/// parameters come back separately for binding by the executor.
+pub(super) fn plain_scan_sql(
+    remote_schema: &str,
+    remote_table: &str,
+    columns: &[Column],
+    quals: &[Qual],
+) -> MssqlFdwRqResult<(String, Vec<Box<dyn tiberius::ToSql>>)> {
+    let cols = if columns.is_empty() {
+        "*".to_string()
+    } else {
+        columns
+            .iter()
+            .map(|c| bracket_name(&c.name))
+            .collect::<MssqlFdwRqResult<Vec<_>>>()?
+            .join(", ")
+    };
+
+    let mut sql = format!(
+        "SELECT {cols} FROM {}.{}",
+        bracket_name(remote_schema)?,
+        bracket_name(remote_table)?
+    );
+
+    let mut params: Vec<Box<dyn tiberius::ToSql>> = Vec::new();
+    let mut conds: Vec<String> = Vec::new();
+    for qual in quals {
+        conds.push(render_qual(qual, &mut params)?);
+    }
+    if !conds.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conds.join(" AND "));
+    }
+
+    Ok((sql, params))
+}
+
 #[wrappers_fdw(
     version = "0.1.0",
     author = "Rubicon",
@@ -408,70 +537,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
 
         self.tgt_cols = columns.to_vec();
 
-        let cols = if columns.is_empty() {
-            "*".to_string()
-        } else {
-            columns
-                .iter()
-                .map(|c| bracket_name(&c.name))
-                .collect::<MssqlFdwRqResult<Vec<_>>>()?
-                .join(", ")
-        };
-
-        let mut sql = format!(
-            "SELECT {cols} FROM {}.{}",
-            bracket_name(&remote_schema)?,
-            bracket_name(&remote_table)?
-        );
-
-        // quals become typed T-SQL parameters (@P1, @P2, ...); values are
-        // never concatenated into the SQL text (TZ §5.4)
-        let mut params: Vec<Box<dyn tiberius::ToSql>> = Vec::new();
-        let mut conds: Vec<String> = Vec::new();
-        for qual in quals {
-            if qual.use_or {
-                return Err(MssqlFdwRqError::UnsupportedConstruct(
-                    translator::TranslateError::UnsupportedConstruct {
-                        sql_fragment: "ANY (array)".to_string(),
-                        reason: "array quals are not supported in plain scans yet".to_string(),
-                    },
-                ));
-            }
-            let field = bracket_name(&qual.field)?;
-            let oper = qual.operator.as_str();
-            match &qual.value {
-                Value::Cell(Cell::Bool(b)) if oper == "is" => {
-                    conds.push(format!("{field} = {}", *b as u8));
-                }
-                Value::Cell(Cell::Bool(b)) if oper == "is not" => {
-                    conds.push(format!("{field} <> {}", *b as u8));
-                }
-                Value::Cell(cell) => {
-                    let n = params.len() + 1;
-                    conds.push(format!(
-                        "{field} {} @P{n}",
-                        match oper {
-                            "~~" => "LIKE".to_string(),
-                            "!~~" => "NOT LIKE".to_string(),
-                            o => o.to_string(),
-                        }
-                    ));
-                    params.push(types::cell_to_sql(cell)?);
-                }
-                Value::Array(_) => {
-                    return Err(MssqlFdwRqError::UnsupportedConstruct(
-                        translator::TranslateError::UnsupportedConstruct {
-                            sql_fragment: "array qual".to_string(),
-                            reason: "array quals are not supported in plain scans yet".to_string(),
-                        },
-                    ));
-                }
-            }
-        }
-        if !conds.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conds.join(" AND "));
-        }
+        let (sql, params) = plain_scan_sql(&remote_schema, &remote_table, columns, quals)?;
 
         if self.log_remote_query {
             pgrx::log!("mssql_fdw_rq: remote query: {sql}");
@@ -492,8 +558,8 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         match item {
             Some(Ok(src_row)) => {
                 let mut tgt_row = Row::new();
-                for tgt_col in &self.tgt_cols {
-                    let cell = types::field_to_cell(&src_row, tgt_col)?;
+                for (pos, tgt_col) in self.tgt_cols.iter().enumerate() {
+                    let cell = types::field_to_cell(&src_row, tgt_col, pos)?;
                     tgt_row.push(&tgt_col.name, cell);
                 }
                 row.replace_with(tgt_row);

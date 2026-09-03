@@ -454,6 +454,151 @@ mod unit {
         assert_eq!(m("json"), None);
         assert_eq!(m("geometry"), None);
     }
+
+    // -- plain-scan SQL building (begin_scan) --------------------------------------
+
+    mod plain_scan {
+        use pgrx::pg_sys;
+        use supabase_wrappers::prelude::{Cell, Column, Qual, Value};
+
+        use super::super::super::mssql_fdw_rq::plain_scan_sql;
+
+        fn qual(field: &str, operator: &str, value: Value, use_or: bool) -> Qual {
+            Qual {
+                field: field.to_string(),
+                operator: operator.to_string(),
+                value,
+                use_or,
+                param: None,
+            }
+        }
+
+        fn col(name: &str) -> Column {
+            Column {
+                name: name.to_string(),
+                num: 1,
+                type_oid: pg_sys::Oid::INVALID,
+            }
+        }
+
+        fn sql_for(quals: &[Qual]) -> String {
+            plain_scan_sql("dbo", "Orders", &[col("id"), col("note")], quals)
+                .map(|(sql, _)| sql)
+                .unwrap_or_else(|e| panic!("plain_scan_sql failed: {e}"))
+        }
+
+        #[test]
+        fn equality_binds_parameter() {
+            assert_eq!(
+                sql_for(&[qual("id", "=", Value::Cell(Cell::I64(7)), false)]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] = @P1"
+            );
+        }
+
+        #[test]
+        fn in_list_becomes_in() {
+            // `x = ANY (…)` — the production case 1 shape
+            assert_eq!(
+                sql_for(&[qual(
+                    "id",
+                    "=",
+                    Value::Array(vec![Cell::I64(1), Cell::I64(26), Cell::I64(51)]),
+                    true,
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] IN (@P1, @P2, @P3)"
+            );
+        }
+
+        #[test]
+        fn not_in_list_becomes_not_in() {
+            assert_eq!(
+                sql_for(&[qual(
+                    "id",
+                    "<>",
+                    Value::Array(vec![Cell::I64(1), Cell::I64(2)]),
+                    false,
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] NOT IN (@P1, @P2)"
+            );
+        }
+
+        #[test]
+        fn any_with_other_operator_becomes_or_chain() {
+            assert_eq!(
+                sql_for(&[qual(
+                    "id",
+                    "<",
+                    Value::Array(vec![Cell::I64(10), Cell::I64(20)]),
+                    true,
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE ([id] < @P1 OR [id] < @P2)"
+            );
+        }
+
+        #[test]
+        fn empty_any_is_false_and_empty_all_is_true() {
+            assert_eq!(
+                sql_for(&[qual("id", "=", Value::Array(vec![]), true)]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE 1 = 0"
+            );
+            assert_eq!(
+                sql_for(&[qual("id", "<>", Value::Array(vec![]), false)]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE 1 = 1"
+            );
+        }
+
+        #[test]
+        fn null_test_renders_is_null() {
+            // NullTest quals arrive as is/is not with the literal cell "null"
+            assert_eq!(
+                sql_for(&[qual(
+                    "note",
+                    "is",
+                    Value::Cell(Cell::String("null".to_string())),
+                    false
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [note] IS NULL"
+            );
+            assert_eq!(
+                sql_for(&[qual(
+                    "note",
+                    "is not",
+                    Value::Cell(Cell::String("null".to_string())),
+                    false
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [note] IS NOT NULL"
+            );
+        }
+
+        #[test]
+        fn ilike_wraps_both_sides_in_lower() {
+            assert_eq!(
+                sql_for(&[qual(
+                    "note",
+                    "~~*",
+                    Value::Cell(Cell::String("a%".to_string())),
+                    false
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE LOWER([note]) LIKE LOWER(@P1)"
+            );
+        }
+
+        #[test]
+        fn multiple_quals_join_with_and() {
+            assert_eq!(
+                sql_for(&[
+                    qual("id", "=", Value::Cell(Cell::I64(1)), false),
+                    qual(
+                        "note",
+                        "~~",
+                        Value::Cell(Cell::String("a%".to_string())),
+                        false
+                    ),
+                ]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] = @P1 AND [note] LIKE @P2"
+            );
+        }
+    }
 } // mod unit
 
 // ---------------------------------------------------------------------------
@@ -907,6 +1052,105 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(delivered, 15); // 20 minus ids 4, 8, 12, 16, 20
+    }
+
+    #[pg_test]
+    fn in_list_filter_pushes_down() {
+        setup();
+
+        // production case 1: `IN (…)` arrives as an ANY (array) qual and must
+        // push down to the plain scan as one condition, not be rejected
+        let mut ids: Vec<i64> = Spi::connect(|c| {
+            c.select(
+                "SELECT id FROM rq_orders WHERE id IN (1, 26, 51, 999)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<i64, _>("id").unwrap())
+            .collect()
+        });
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 26, 51]);
+    }
+
+    #[pg_test]
+    fn or_across_columns_runs_remotely() {
+        setup();
+
+        // production case 2: an OR across two columns cannot become scan
+        // quals; the whole statement must run as one remote query, with no
+        // local Filter node above the Foreign Scan
+        let plan = Spi::connect(|c| {
+            c.select(
+                "EXPLAIN (COSTS OFF) SELECT id FROM rq_orders \
+                 WHERE id = 1 OR total_amount > 2000",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| {
+                r.get_by_name::<&str, _>("QUERY PLAN")
+                    .unwrap()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        });
+        assert!(plan.contains("Foreign Scan"), "plan: {plan}");
+        assert!(!plan.contains("Filter"), "plan: {plan}");
+
+        // seed: total_amount = 120 + n*37, so > 2000 means ids 51..60, plus
+        // the explicit id = 1 → 11 rows in total
+        let mut ids: Vec<i64> = Spi::connect(|c| {
+            c.select(
+                "SELECT id FROM rq_orders WHERE id = 1 OR total_amount > 2000",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<i64, _>("id").unwrap())
+            .collect()
+        });
+        ids.sort_unstable();
+        let expected: Vec<i64> = (1..=60i64)
+            .filter(|n| *n == 1 || 120 + n * 37 > 2000)
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(ids.len(), 11);
+    }
+
+    #[pg_test]
+    fn join_without_output_aliases() {
+        setup_committed();
+
+        // production case 3: join-path target lists carry positional names
+        // (column_N) that do not exist in the remote result; cells must be
+        // matched by position. The customer with code 2 owns orders 1, 26, 51
+        let rows: Vec<(i64, i32)> = Spi::connect(|c| {
+            c.select(
+                "SELECT * FROM dblink(\
+                     format('host=localhost port=%s dbname=rqjoin_test', current_setting('port')), \
+                     $$SELECT o.id, c.code FROM rqj_orders o \
+                       JOIN rqj_customers c ON o.customer_id = c.id \
+                       WHERE c.code = 2$$\
+                 ) AS t(id bigint, code int)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| {
+                let id = r.get_by_name::<i64, _>("id").unwrap()?;
+                let code = r.get_by_name::<i32, _>("code").unwrap()?;
+                Some((id, code))
+            })
+            .collect()
+        });
+        let mut ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 26, 51]);
+        // a positional mix-up (id ↔ code) would surface here
+        assert!(rows.iter().all(|(_, code)| *code == 2), "rows: {rows:?}");
     }
 
     #[pg_test]

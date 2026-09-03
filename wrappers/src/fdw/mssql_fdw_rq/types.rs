@@ -387,76 +387,94 @@ fn cell_kind(cell: &Cell) -> &'static str {
 pub(super) fn field_to_cell(
     src_row: &tiberius::Row,
     tgt_col: &Column,
+    pos: usize,
 ) -> MssqlFdwRqResult<Option<Cell>> {
+    // Resolve the result column by name. Two full-query shapes cannot be
+    // matched by name: join-path target lists carry positional names
+    // (`column_N`) that never exist in the remote result, and a join may
+    // select identically-named columns from two tables. Both fall back to
+    // the result position, which mirrors the PostgreSQL target list order.
     let col_name = tgt_col.name.as_str();
+    let name_positions: Vec<usize> = src_row
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name() == col_name)
+        .map(|(i, _)| i)
+        .collect();
+    let idx = if name_positions.len() == 1 {
+        name_positions[0]
+    } else {
+        pos
+    };
 
     let ret = match PgOid::from(tgt_col.type_oid) {
         PgOid::BuiltIn(PgBuiltInOids::BOOLOID) => {
-            src_row.try_get::<bool, &str>(col_name)?.map(Cell::Bool)
+            src_row.try_get::<bool, usize>(idx)?.map(Cell::Bool)
         }
         PgOid::BuiltIn(PgBuiltInOids::INT2OID) => {
-            src_row.try_get::<i16, &str>(col_name)?.map(Cell::I16)
+            src_row.try_get::<i16, usize>(idx)?.map(Cell::I16)
         }
         PgOid::BuiltIn(PgBuiltInOids::INT4OID) => {
             // MSSQL aggregate results are int32 even when Postgres expects
             // int4 from smallint inputs; widen where lossless
-            if let Ok(v) = src_row.try_get::<i32, &str>(col_name) {
+            if let Ok(v) = src_row.try_get::<i32, usize>(idx) {
                 v.map(Cell::I32)
             } else {
                 src_row
-                    .try_get::<i16, &str>(col_name)?
+                    .try_get::<i16, usize>(idx)?
                     .map(|v| Cell::I32(i32::from(v)))
             }
         }
         PgOid::BuiltIn(PgBuiltInOids::INT8OID) => {
             // T-SQL COUNT()/SUM(int) return int32; Postgres expects int8
-            if let Ok(v) = src_row.try_get::<i64, &str>(col_name) {
+            if let Ok(v) = src_row.try_get::<i64, usize>(idx) {
                 v.map(Cell::I64)
-            } else if let Ok(v) = src_row.try_get::<i32, &str>(col_name) {
+            } else if let Ok(v) = src_row.try_get::<i32, usize>(idx) {
                 v.map(|x| Cell::I64(i64::from(x)))
             } else {
                 src_row
-                    .try_get::<i16, &str>(col_name)?
+                    .try_get::<i16, usize>(idx)?
                     .map(|x| Cell::I64(i64::from(x)))
             }
         }
         PgOid::BuiltIn(PgBuiltInOids::FLOAT4OID) => {
-            src_row.try_get::<f32, &str>(col_name)?.map(Cell::F32)
+            src_row.try_get::<f32, usize>(idx)?.map(Cell::F32)
         }
         PgOid::BuiltIn(PgBuiltInOids::FLOAT8OID) => {
-            if let Ok(v) = src_row.try_get::<f64, &str>(col_name) {
+            if let Ok(v) = src_row.try_get::<f64, usize>(idx) {
                 v.map(Cell::F64)
             } else {
                 src_row
-                    .try_get::<f32, &str>(col_name)?
+                    .try_get::<f32, usize>(idx)?
                     .map(|v| Cell::F64(f64::from(v)))
             }
         }
         PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => {
             // decimal, or an int/float aggregate result coerced to numeric
-            if let Ok(v) = src_row.try_get::<Decimal, &str>(col_name) {
+            if let Ok(v) = src_row.try_get::<Decimal, usize>(idx) {
                 v.and_then(|d| d.to_f64())
                     .map(pgrx::AnyNumeric::try_from)
                     .transpose()?
                     .map(Cell::Numeric)
-            } else if let Ok(v) = src_row.try_get::<i64, &str>(col_name) {
+            } else if let Ok(v) = src_row.try_get::<i64, usize>(idx) {
                 v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
-            } else if let Ok(v) = src_row.try_get::<i32, &str>(col_name) {
+            } else if let Ok(v) = src_row.try_get::<i32, usize>(idx) {
                 v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
             } else {
-                let v = src_row.try_get::<f64, &str>(col_name)?;
+                let v = src_row.try_get::<f64, usize>(idx)?;
                 v.and_then(|x| pgrx::AnyNumeric::try_from(x).ok())
                     .map(Cell::Numeric)
             }
         }
         PgOid::BuiltIn(PgBuiltInOids::TEXTOID) => src_row
-            .try_get::<&str, &str>(col_name)?
+            .try_get::<&str, usize>(idx)?
             .map(|v| Cell::String(v.to_owned())),
         PgOid::BuiltIn(PgBuiltInOids::UUIDOID) => src_row
-            .try_get::<uuid::Uuid, &str>(col_name)?
+            .try_get::<uuid::Uuid, usize>(idx)?
             .map(|v| Cell::Uuid(pgrx::datum::Uuid::from_bytes(*v.as_bytes()))),
         PgOid::BuiltIn(PgBuiltInOids::DATEOID) => src_row
-            .try_get::<NaiveDate, &str>(col_name)?
+            .try_get::<NaiveDate, usize>(idx)?
             .map(|v| {
                 Date::new(v.year(), v.month() as u8, v.day() as u8)
                     .map_err(dt_err)
@@ -464,22 +482,22 @@ pub(super) fn field_to_cell(
             })
             .transpose()?,
         PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID) => src_row
-            .try_get::<NaiveDateTime, &str>(col_name)?
+            .try_get::<NaiveDateTime, usize>(idx)?
             .map(naive_dt_to_pgrx)
             .transpose()?
             .map(Cell::Timestamp),
         PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPTZOID) => src_row
-            .try_get::<DateTime<Utc>, &str>(col_name)?
+            .try_get::<DateTime<Utc>, usize>(idx)?
             .map(utc_to_pgrx)
             .transpose()?
             .map(Cell::Timestamptz),
         PgOid::BuiltIn(PgBuiltInOids::TIMEOID) => src_row
-            .try_get::<NaiveTime, &str>(col_name)?
+            .try_get::<NaiveTime, usize>(idx)?
             .map(naive_time_to_pgrx)
             .transpose()?
             .map(Cell::Time),
         PgOid::BuiltIn(PgBuiltInOids::BYTEAOID) => src_row
-            .try_get::<&[u8], &str>(col_name)?
+            .try_get::<&[u8], usize>(idx)?
             .map(|v| Cell::Bytea(rust_byte_slice_to_bytea(v).into_pg())),
         _ => return Err(MssqlFdwRqError::UnsupportedColumnType(tgt_col.name.clone())),
     };
