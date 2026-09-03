@@ -871,18 +871,50 @@ mod tests {
 
     #[pg_test]
     fn prepared_statement_parameter() {
-        setup();
+        setup_committed();
 
-        // 3. prepared statement parameter $1 -> @P1 (TZ §10 #3); the
-        // customer of order 1 (code 2) owns orders 1, 26, 51
-        let cid: String = Spi::get_one("SELECT customer_id::text FROM rq_orders WHERE id = 1")
+        // 3. prepared statement parameter $1 -> @P1 (TZ §10 #3). Runs
+        // through dblink so PREPARE/EXECUTE are real top-level statements of
+        // a dedicated session — like production drivers use them. (SPI-side
+        // PREPARE/EXECUTE inside a #[pg_test] hit a pgrx type-read race on
+        // PG17: "cache lookup failed for type 0" from reading the EXECUTE
+        // result, see pgrx datum::lookup_type_name.)
+        // The customer of order 1 (code 2) owns orders 1, 26, 51. A named
+        // dblink connection keeps PREPARE and EXECUTE in one session.
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqprep', {conn})")).unwrap();
+        let cid: String = Spi::connect(|c| {
+            c.select(
+                "SELECT * FROM dblink('rqprep', \
+                 $$SELECT customer_id::text FROM rqj_orders WHERE id = 1$$) AS t(cid text)",
+                None,
+                &[],
+            )
             .unwrap()
-            .unwrap();
-        Spi::run("PREPARE p(uuid) AS SELECT count(*) FROM rq_orders WHERE customer_id = $1")
-            .unwrap();
-        let cnt = Spi::get_one::<i64>(&format!("EXECUTE p('{cid}')"))
+            .filter_map(|r| r.get_by_name::<&str, _>("cid").unwrap().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("customer id")
+        });
+        Spi::run(
+            "SELECT dblink_exec('rqprep', \
+             $$PREPARE p(uuid) AS SELECT count(*) FROM rqj_orders \
+               WHERE customer_id = $1$$)",
+        )
+        .unwrap();
+        let cnt = Spi::connect(|c| {
+            c.select(
+                &format!("SELECT * FROM dblink('rqprep', $$EXECUTE p('{cid}')$$) AS t(cnt bigint)"),
+                None,
+                &[],
+            )
             .unwrap()
-            .unwrap();
+            .filter_map(|r| r.get_by_name::<i64, _>("cnt").unwrap())
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("count")
+        });
+        Spi::run("SELECT dblink_disconnect('rqprep')").unwrap();
         assert_eq!(cnt, 3);
     }
 
