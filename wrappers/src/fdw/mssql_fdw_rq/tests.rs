@@ -399,6 +399,106 @@ mod unit {
         );
     }
 
+    // -- deparser IN-list form: x = ANY (ARRAY[…]) (TZ §10 M3) -----------
+
+    #[test]
+    fn deparser_any_array_becomes_in() {
+        // how PostgreSQL deparses `x IN (142, 143)` inside a full query
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid = ANY (ARRAY[142, 143]::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (142, 143))",
+        );
+    }
+
+    #[test]
+    fn deparser_all_array_becomes_not_in() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid <> ALL (ARRAY[1, 2]::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid NOT IN (1, 2))",
+        );
+    }
+
+    #[test]
+    fn deparser_any_other_operator_becomes_or_chain() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE amount < ANY (ARRAY[10, 20]::numeric[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (amount < 10 OR amount < 20)",
+        );
+    }
+
+    #[test]
+    fn deparser_any_empty_array_is_false() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid = ANY (ARRAY[]::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (1 = 0)",
+        );
+    }
+
+    #[test]
+    fn deparser_any_text_array_quotes_items() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE note = ANY (ARRAY['a''b', 'c']::text[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note IN ('a''b', 'c'))",
+        );
+    }
+
+    #[test]
+    fn deparser_any_array_constant_becomes_in() {
+        // constant-folded IN-list: array in output form '{v1,v2}' + cast
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid = ANY ('{142,143}'::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (142, 143))",
+        );
+    }
+
+    #[test]
+    fn deparser_any_array_constant_drops_nulls() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid = ANY ('{5,NULL}'::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (5))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid = ANY ('{NULL}'::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (1 = 0)",
+        );
+    }
+
+    #[test]
+    fn deparser_any_array_constant_strings() {
+        // PostgreSQL's array output always quotes string elements
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE note = ANY ('{\"a\"\"b\",\"c\"}'::text[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note IN ('a\"b', 'c'))",
+        );
+    }
+
+    #[test]
+    fn array_subscript_outside_any_all_still_rejected() {
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE note[1] = 'x'",
+            &orders_ctx(),
+            "[",
+        );
+    }
+
     // -- joins / aggregates (pass-through sanity) ----------------------------------
 
     #[test]
@@ -1104,6 +1204,20 @@ mod tests {
         });
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 26, 51]);
+    }
+
+    #[pg_test]
+    fn in_list_with_aggregate_pushes_down() {
+        setup();
+
+        // production case 4: an aggregate forces the statement through the
+        // full-query translator, where the deparser prints the IN-list as
+        // `id = ANY (ARRAY[…]::bigint[])`
+        let cnt =
+            Spi::get_one::<i64>("SELECT count(*) FROM rq_orders WHERE id IN (1, 26, 51, 999)")
+                .unwrap()
+                .unwrap();
+        assert_eq!(cnt, 3);
     }
 
     #[pg_test]

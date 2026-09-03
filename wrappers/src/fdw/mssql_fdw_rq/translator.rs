@@ -89,7 +89,7 @@ enum Tok {
 const MULTI_CHAR_OPS: [&str; 8] = ["::", "||", "<=", ">=", "<>", "!=", "<<", ">>"];
 // characters that have a different meaning (or no meaning) in T-SQL and are
 // therefore rejected instead of mistranslated
-const FORBIDDEN_CHARS: [char; 6] = ['~', '^', '@', '#', '?', '['];
+const FORBIDDEN_CHARS: [char; 5] = ['~', '^', '@', '#', '?'];
 
 fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
     let chars: Vec<char> = src.chars().collect();
@@ -229,11 +229,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
             continue;
         }
 
-        if FORBIDDEN_CHARS.contains(&c) || c == ']' {
+        if FORBIDDEN_CHARS.contains(&c) {
             let reason = match c {
                 '~' => "POSIX regex operators are not supported".to_string(),
                 '^' => "power operator has no T-SQL equivalent (^ is XOR in T-SQL)".to_string(),
-                '[' | ']' => "array subscripts are not supported in v1".to_string(),
                 _ => "character is not part of the supported PG-SQL subset".to_string(),
             };
             return Err(TranslateError::UnsupportedConstruct {
@@ -249,7 +248,9 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
             continue;
         }
 
-        if "()=<>+-*/%.,;&|!".contains(c) {
+        // '[' and ']' lex fine but are only valid inside ANY/ALL (ARRAY[…]);
+        // the transform loop rejects them anywhere else
+        if "()=<>+-*/%.,;&|![]".contains(c) {
             out.push(Tok::Op(c.to_string()));
             i += 1;
             continue;
@@ -603,6 +604,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
         match &toks[i] {
             Tok::Op(o) => {
                 match o.as_str() {
+                    // '[' and ']' lex, but only the ANY/ALL (ARRAY[…]) form
+                    // consumes them; anything else is an array subscript
+                    "[" | "]" => {
+                        return Err(TranslateError::UnsupportedConstruct {
+                            sql_fragment: o.clone(),
+                            reason: "array subscripts are not supported in v1".to_string(),
+                        });
+                    }
                     "(" => {
                         depth += 1;
                         if next_opens_over {
@@ -974,6 +983,11 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             }
                         }
                     }
+                    "any" | "all" if matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") => {
+                        let is_any = lw == "any";
+                        translate_any_all(&toks, i, &mut out, &mut i, case_depth, is_any)?;
+                        continue;
+                    }
                     "ilike" => {
                         translate_ilike(&toks, i, &mut out, &mut i, case_depth)?;
                         continue;
@@ -1293,6 +1307,238 @@ fn translate_ilike(
         format!("({body})")
     });
     *next_i = i + 2;
+    Ok(())
+}
+
+/// Parse an array constant in PostgreSQL output form: `'{v1,v2,…}'`. String
+/// elements are quoted with `"…"` (inner quotes doubled); NULL elements never
+/// satisfy `= ANY` / fail `<> ALL`, so they are dropped; boolean elements are
+/// printed as t/f. Anything not numeric, quoted, NULL or t/f is rejected.
+fn parse_array_literal(s: &str) -> Result<Vec<String>, TranslateError> {
+    let t = s.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("'{t}'"),
+            reason: "ANY/ALL array constant must be in '{…}' form".to_string(),
+        });
+    }
+    let inner = &t[1..t.len() - 1];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // split on commas, respecting "…" quotes with doubled inner quotes
+    let mut raw_items: Vec<(String, bool)> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        let mut cur = String::new();
+        let mut quoted = false;
+        if chars.peek() == Some(&'"') {
+            quoted = true;
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('"') => {
+                        if chars.peek() == Some(&'"') {
+                            cur.push('"');
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(c) => cur.push(c),
+                    None => break,
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                cur.push(c);
+                chars.next();
+            }
+        }
+        raw_items.push((cur, quoted));
+        match chars.next() {
+            Some(',') => continue,
+            _ => break,
+        }
+    }
+
+    let mut items = Vec::with_capacity(raw_items.len());
+    for (raw, quoted) in raw_items {
+        if quoted {
+            items.push(format!("'{}'", raw.replace('\'', "''")));
+        } else {
+            match raw.trim() {
+                "NULL" => continue, // never matches = ANY / <> ALL
+                "t" => items.push("1".to_string()),
+                "f" => items.push("0".to_string()),
+                v if !v.is_empty()
+                    && v.chars().all(|c| {
+                        c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')
+                    }) =>
+                {
+                    items.push(v.to_string());
+                }
+                other => {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: format!("'{{{other}}}'"),
+                        reason: "array constant contains an unsupported element".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(items)
+}
+
+/// `x = ANY (ARRAY[v1, v2, …]::type[])` / `x <> ALL (ARRAY[…])` — the shape
+/// PostgreSQL's deparser uses for IN-lists inside full queries (e.g. when an
+/// aggregate or LIMIT forces the whole statement through translation).
+/// Rewritten to IN / NOT IN; other operators expand into OR-chains (ANY) /
+/// AND-chains (ALL), mirroring the plain-scan qual rendering.
+fn translate_any_all(
+    toks: &[Tok],
+    i: usize,
+    out: &mut Vec<String>,
+    next_i: &mut usize,
+    case_depth: usize,
+    is_any: bool,
+) -> Result<(), TranslateError> {
+    // expected tail: ( ARRAY [ items ] [::type []] )
+    let malformed = |what: &str| TranslateError::UnsupportedConstruct {
+        sql_fragment: what.to_string(),
+        reason: "only ANY/ALL over ARRAY[…] literals are supported \
+                 (the deparser form of an IN-list)"
+            .to_string(),
+    };
+
+    // the comparison operator was already emitted; take it off first, then
+    // the subject must be a single simple expression
+    const ANY_ALL_OPERATORS: [&str; 6] = ["=", "<>", "<", ">", "<=", ">="];
+    let Some(oper) = out.last().cloned() else {
+        return Err(malformed(if is_any { "ANY (…)" } else { "ALL (…)" }));
+    };
+    if !ANY_ALL_OPERATORS.contains(&oper.as_str()) {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("{oper} ANY/ALL (…)"),
+            reason: "ANY/ALL is only supported over simple comparison operators".to_string(),
+        });
+    }
+    out.pop();
+    let start = capture_subject(out, case_depth)?;
+    if out.len() - start != 1 {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: if is_any { "ANY (…)" } else { "ALL (…)" }.to_string(),
+            reason: "ANY/ALL subject is not a simple column reference".to_string(),
+        });
+    }
+    let field = out[start].clone();
+    out.truncate(start);
+
+    // two deparser shapes: `ARRAY[v1, v2]` (ArrayExpr) and `'{v1,v2}'::type[]`
+    // (a constant-folded IN-list)
+    let mut items: Vec<String> = Vec::new();
+    let mut k;
+    if matches!(toks.get(i + 2), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("array"))
+        && matches!(toks.get(i + 3), Some(Tok::Op(o)) if o == "[")
+    {
+        let mut j = i + 4;
+        loop {
+            match toks.get(j) {
+                Some(Tok::Op(o)) if o == "]" => {
+                    j += 1;
+                    break;
+                }
+                Some(Tok::Op(o)) if o == "," && !items.is_empty() => {
+                    j += 1;
+                }
+                Some(Tok::Op(o)) if o == "-" && matches!(toks.get(j + 1), Some(Tok::Num(_))) => {
+                    if let Some(Tok::Num(n)) = toks.get(j + 1) {
+                        items.push(format!("-{n}"));
+                    }
+                    j += 2;
+                }
+                Some(Tok::Num(n)) => {
+                    items.push(n.clone());
+                    j += 1;
+                }
+                Some(Tok::Str(s)) => {
+                    items.push(format!("'{}'", s.replace('\'', "''")));
+                    j += 1;
+                }
+                Some(Tok::Param(p)) => {
+                    items.push(format!("@P{p}"));
+                    j += 1;
+                }
+                Some(Tok::Word(w)) if w.eq_ignore_ascii_case("true") => {
+                    items.push("1".to_string());
+                    j += 1;
+                }
+                Some(Tok::Word(w)) if w.eq_ignore_ascii_case("false") => {
+                    items.push("0".to_string());
+                    j += 1;
+                }
+                _ => {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: "ARRAY[…]".to_string(),
+                        reason: "array literal contains a non-literal element".to_string(),
+                    });
+                }
+            }
+        }
+        k = j;
+    } else if let Some(Tok::Str(s)) = toks.get(i + 2) {
+        items = parse_array_literal(s)?;
+        k = i + 3;
+    } else {
+        return Err(malformed(if is_any { "ANY (…)" } else { "ALL (…)" }));
+    }
+    // optional `::type[]` cast tail, then the closing parenthesis
+    if matches!(toks.get(k), Some(Tok::Op(o)) if o == "::") {
+        let len = type_token_len(&toks[k + 1..]);
+        if len == 0 {
+            return Err(malformed("::"));
+        }
+        k += 1 + len;
+        if matches!(toks.get(k), Some(Tok::Op(o)) if o == "[") {
+            if !matches!(toks.get(k + 1), Some(Tok::Op(o)) if o == "]") {
+                return Err(TranslateError::UnsupportedConstruct {
+                    sql_fragment: "[…]".to_string(),
+                    reason: "array subscripts are not supported in v1".to_string(),
+                });
+            }
+            k += 2;
+        }
+    }
+    if !matches!(toks.get(k), Some(Tok::Op(o)) if o == ")") {
+        return Err(malformed(if is_any { "ANY (…" } else { "ALL (…" }));
+    }
+    k += 1;
+
+    let rendered = if items.is_empty() {
+        // `x = ANY ('{}')` is FALSE and `x <> ALL ('{}')` is TRUE
+        if is_any {
+            "(1 = 0)".to_string()
+        } else {
+            "(1 = 1)".to_string()
+        }
+    } else if is_any && oper == "=" {
+        format!("({field} IN ({}))", items.join(", "))
+    } else if !is_any && oper == "<>" {
+        format!("({field} NOT IN ({}))", items.join(", "))
+    } else {
+        let joiner = if is_any { " OR " } else { " AND " };
+        let conds: Vec<String> = items
+            .iter()
+            .map(|v| format!("{field} {oper} {v}"))
+            .collect();
+        format!("({})", conds.join(joiner))
+    };
+    out.push(rendered);
+    *next_i = k;
     Ok(())
 }
 
