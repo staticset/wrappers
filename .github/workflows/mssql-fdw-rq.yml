@@ -49,6 +49,12 @@ jobs:
       MSSQL_HOST: localhost
       MSSQL_PORT: "1433"
       MSSQL_SA_PASSWORD: MssqlRq_2026!Pass
+      # Plain `cargo test` binaries reference postgres server symbols that are
+      # only resolved at runtime (see .cargo/config.toml). setup-rust-toolchain
+      # exports RUSTFLAGS for later steps, and any RUSTFLAGS in the environment
+      # makes cargo ignore the [target] rustflags from .cargo/config.toml —
+      # restate the flag here so the test link keeps working.
+      RUSTFLAGS: "-Clink-arg=-Wl,--unresolved-symbols=ignore-all"
 
     steps:
       - uses: actions/checkout@v4
