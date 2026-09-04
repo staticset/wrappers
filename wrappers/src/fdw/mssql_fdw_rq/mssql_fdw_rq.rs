@@ -767,8 +767,9 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         let params: Vec<Box<dyn tiberius::ToSql>> = vec![Box::new(stmt.remote_schema.clone())];
         let mut rx = self.spawn_streaming_query(sql.to_string(), params)?;
 
-        // (table → ordered column definitions) preserving remote order
-        let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+        // (remote table → local name → ordered column definitions)
+        // preserving remote order
+        let mut tables: Vec<(String, String, Vec<String>)> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
         let catalog_null = || {
             MssqlFdwRqError::InvalidOption(
@@ -818,15 +819,21 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 Some(v) if v.eq_ignore_ascii_case("NO")
             );
 
-            // honor LIMIT TO / EXCEPT
+            // honor LIMIT TO / EXCEPT. LIMIT TO matches case-insensitively
+            // and the created table keeps the LIST entry's spelling: after
+            // parsing, PostgreSQL re-filters the returned statements with a
+            // case-SENSITIVE comparison against the (downcased) list, and a
+            // mixed-case remote name would otherwise be dropped silently.
             let listed = stmt
                 .table_list
                 .iter()
-                .any(|t| t.eq_ignore_ascii_case(&table));
-            let wanted = match stmt.list_type {
-                ImportSchemaType::FdwImportSchemaLimitTo => listed,
-                ImportSchemaType::FdwImportSchemaExcept => !listed,
-                ImportSchemaType::FdwImportSchemaAll => true,
+                .find(|t| t.eq_ignore_ascii_case(&table));
+            let (wanted, local_name) = match stmt.list_type {
+                ImportSchemaType::FdwImportSchemaLimitTo => {
+                    (listed.is_some(), listed.cloned().unwrap_or_default())
+                }
+                ImportSchemaType::FdwImportSchemaExcept => (listed.is_none(), table.clone()),
+                ImportSchemaType::FdwImportSchemaAll => (true, table.clone()),
             };
             if !wanted {
                 continue;
@@ -845,10 +852,10 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             };
 
             let i = *index.entry(table.clone()).or_insert_with(|| {
-                tables.push((table.clone(), Vec::new()));
+                tables.push((table.clone(), local_name.clone(), Vec::new()));
                 tables.len() - 1
             });
-            tables[i].1.push(format!(
+            tables[i].2.push(format!(
                 "\"{}\" {}{}",
                 column.replace('"', "\"\""),
                 pg_type,
@@ -864,15 +871,15 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         let quote_literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
         let stmts: Vec<String> = tables
             .into_iter()
-            .filter(|(_, cols)| !cols.is_empty())
-            .map(|(table, cols)| {
+            .filter(|(_, _, cols)| !cols.is_empty())
+            .map(|(remote_table, local_name, cols)| {
                 format!(
                     "CREATE FOREIGN TABLE {} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
-                    quote_ident(&table),
+                    quote_ident(&local_name),
                     cols.join(", "),
                     quote_ident(&stmt.server_name),
                     quote_literal(&stmt.remote_schema),
-                    quote_literal(&table),
+                    quote_literal(&remote_table),
                 )
             })
             .collect();
