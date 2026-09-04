@@ -549,8 +549,19 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 }
             } else if oid == FOREIGN_TABLE_RELATION_ID {
                 // schema_name/table_name are the tds_fdw/Navigator spellings;
-                // schema/table are this FDW's native ones
-                allowed(&["schema", "schema_name", "table", "table_name", "updatable"])?;
+                // schema/table are this FDW's native ones. column_name is the
+                // postgres_fdw-style column mapping: accepted and ignored —
+                // Navigator's introspection helpers use it for case-only
+                // renames (table_name → TABLE_NAME), which T-SQL resolves
+                // case-insensitively anyway.
+                allowed(&[
+                    "schema",
+                    "schema_name",
+                    "table",
+                    "table_name",
+                    "updatable",
+                    "column_name",
+                ])?;
                 if !names.contains(&"table") && !names.contains(&"table_name") {
                     return Err(MssqlFdwRqError::InvalidOption(
                         "option 'table' (or 'table_name') is required".to_string(),
