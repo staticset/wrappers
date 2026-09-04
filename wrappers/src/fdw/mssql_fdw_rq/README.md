@@ -104,6 +104,40 @@ Manual checklist (not covered by CI):
 5. `select count(*) from dbo_orders;` — check `wrappers_fdw_stats` and the
    MSSQL `sys.dm_exec_sessions.auth_scheme` column shows `Kerberos`.
 
+## Sber Navigator integration
+
+Navigator manages source types through its `data.tdicdatawrapper` dictionary
+(nid, sname, sdatawrapper, joptions, screateserver, salterserver) and
+generates DDL in the tds_fdw dialect. This FDW speaks that dialect, so a
+single-hop source (Navigator → wrappers → MSSQL) can be registered instead
+of the postgres_fdw bridge:
+
+- foreign tables accept the `schema_name` / `table_name` option spellings
+  (alongside the native `schema` / `table`), and user mappings accept
+  `username` alongside `user`;
+- `IMPORT FOREIGN SCHEMA` introspects `INFORMATION_SCHEMA` (BASE TABLEs
+  only, `LIMIT TO` / `EXCEPT` honored) and emits statements with the
+  Navigator-compatible options. Mixed-case remote names are created under
+  the list entry's spelling — PostgreSQL re-filters returned statements
+  case-sensitively against the (downcased) LIMIT TO list.
+
+Registering the source type in Navigator's UI is one dictionary row (run
+by the Navigator administrator; adjust the FDW name to the database where
+the extension lives — `mssql_wrapper`):
+
+```sql
+INSERT INTO data.tdicdatawrapper
+  (nid, sname, sdatawrapper, joptions, screateserver, salterserver)
+VALUES (21, 'MS SQL (Rubicon)', 'mssql_wrapper', /* host/port/dbname/
+  options/sLogin/sHash params, mirror the MS SQL row */ …,
+  'CREATE SERVER [**sDBForeignName**] FOREIGN DATA WRAPPER mssql_wrapper
+     OPTIONS (conn_string ''Server=[**sHost**],[**sPort**];Database=[**sDBName**];
+              IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true[**sOptions**]'');
+   CREATE USER MAPPING FOR as_admin SERVER [**sDBForeignName**]
+     OPTIONS (user ''[**sLogin**]'', password ''[**sHash**]'');',
+  /* ALTER variants with SET conn_string / SET user / SET password */ …);
+```
+
 ## Limitations
 
 - **Set operations** (`UNION [ALL]` / `INTERSECT` / `EXCEPT`): PostgreSQL's
