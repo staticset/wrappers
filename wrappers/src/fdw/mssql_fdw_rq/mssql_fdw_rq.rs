@@ -23,6 +23,16 @@ fn bracket_name(name: &str) -> MssqlFdwRqResult<String> {
     Ok(format!("[{name}]"))
 }
 
+/// Does an ADO-style connection string carry a user? tiberius parses the
+/// canonical `User ID=` and the `UID=` alias; a bare `user=` key does not
+/// exist in its grammar.
+fn conn_str_has_user(conn_str: &str) -> bool {
+    conn_str.split(';').any(|kv| {
+        let key = kv.trim_start().to_ascii_lowercase();
+        key.starts_with("user id=") || key.starts_with("uid=") || key.starts_with("user=")
+    })
+}
+
 /// Map a PostgreSQL qual operator name to its T-SQL rendering; returns the
 /// whole predicate shape for the pattern operators (ILIKE needs LOWER on
 /// both sides, mirroring the full-query translator).
@@ -47,7 +57,14 @@ fn render_qual(
 
     // ScalarArrayOpExpr quals: `x = ANY (array)` (use_or) or `x <> ALL (…)`
     if let Value::Array(cells) = &qual.value {
-        return render_array_qual(&field, oper, qual.use_or, cells, params);
+        return render_array_qual(
+            &field,
+            oper,
+            qual.use_or,
+            qual.array_had_nulls,
+            cells,
+            params,
+        );
     }
 
     match &qual.value {
@@ -72,17 +89,25 @@ fn render_qual(
 }
 
 /// Render an array qual: `= ANY` becomes `IN` (and `<> ALL` → `NOT IN`);
-/// other operators expand into OR-chains (ANY) / AND-chains (ALL).
+/// other operators expand into OR-chains (ANY) / AND-chains (ALL). NULL
+/// elements of the source array are re-added literally — PostgreSQL and
+/// T-SQL agree on the three-valued IN/NOT IN semantics, and dropping them
+/// would flip `x <> ALL('{1,NULL}')` from "no rows" to "every x <> 1".
 fn render_array_qual(
     field: &str,
     oper: &str,
     use_or: bool,
+    had_nulls: bool,
     cells: &[Cell],
     params: &mut Vec<Box<dyn tiberius::ToSql>>,
 ) -> MssqlFdwRqResult<String> {
     // `x = ANY ('{}')` is FALSE and `x <> ALL ('{}')` is TRUE; T-SQL has no
-    // empty IN list, so the degenerate cases become constants
+    // empty IN list, so the degenerate cases become constants. An all-NULL
+    // array never yields TRUE for either operator.
     if cells.is_empty() {
+        if had_nulls {
+            return Ok("1 = 0".to_string());
+        }
         return Ok(if use_or {
             "1 = 0".to_string()
         } else {
@@ -98,19 +123,37 @@ fn render_array_qual(
     }
 
     if use_or && oper == "=" {
-        return Ok(format!("{field} IN ({})", placeholders.join(", ")));
+        let list = placeholders.join(", ");
+        let list = if had_nulls {
+            format!("{list}, NULL")
+        } else {
+            list
+        };
+        return Ok(format!("{field} IN ({list})"));
     }
     if !use_or && oper == "<>" {
-        return Ok(format!("{field} NOT IN ({})", placeholders.join(", ")));
+        let list = placeholders.join(", ");
+        let list = if had_nulls {
+            format!("{list}, NULL")
+        } else {
+            list
+        };
+        return Ok(format!("{field} NOT IN ({list})"));
     }
 
     let conds: MssqlFdwRqResult<Vec<String>> = placeholders
         .iter()
         .map(|p| Ok(sql_predicate(field, oper, p)))
         .collect();
+    let mut conds = conds?;
+    if had_nulls {
+        // UNKNOWN under three-valued logic — the same contribution the NULL
+        // element makes inside PostgreSQL's ANY/ALL
+        conds.push(format!("{field} {oper} NULL"));
+    }
     Ok(format!(
         "({})",
-        conds?.join(if use_or { " OR " } else { " AND " })
+        conds.join(if use_or { " OR " } else { " AND " })
     ))
 }
 
@@ -214,6 +257,17 @@ pub(crate) struct MssqlFdwRq {
 impl MssqlFdwRq {
     const FDW_NAME: &'static str = "MssqlFdwRq";
 
+    /// Flush row counters into the statistics view. Rows of a stream that is
+    /// abandoned mid-flight (a LIMIT further up the plan stops pulling, a
+    /// rescan restarts the scan) would otherwise never be counted.
+    fn flush_row_stats(&mut self) {
+        if self.rows_out != 0 {
+            stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsIn, self.rows_out);
+            stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsOut, self.rows_out);
+            self.rows_out = 0;
+        }
+    }
+
     /// Read the current user's user-mapping options for this server, if a
     /// mapping exists (the framework itself only exposes server options).
     unsafe fn user_mapping_options(server_oid: pg_sys::Oid) -> HashMap<String, String> {
@@ -303,7 +357,8 @@ impl MssqlFdwRq {
     /// Local column flags the translator needs: boolean columns (bare bit
     /// predicates become `= 1`) and NOT NULL columns (only those may be
     /// sorted without a NULL tiebreaker). A catalog read failure degrades to
-    /// empty sets instead of failing the whole query.
+    /// empty sets with a visible notice instead of failing the whole query —
+    /// otherwise bool predicates fail on the server with an opaque error.
     fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>) {
         Spi::connect(|client| {
             let mut bools = Vec::new();
@@ -338,7 +393,13 @@ impl MssqlFdwRq {
             }
             Ok::<_, pgrx::spi::SpiError>((bools, not_nulls))
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            pgrx::notice!(
+                "mssql_fdw_rq: could not read column flags from the local catalog ({e}); \
+                 bare boolean predicates and NULL-safe sorting are unavailable for this query"
+            );
+            (Vec::new(), Vec::new())
+        })
     }
 
     /// Execute the query on a background task that streams rows through a
@@ -418,9 +479,9 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             ));
         } else if let Some(auth) = Self::user_mapping_auth(server.server_oid)? {
             config.authentication(auth);
-        } else if !conn_str.to_ascii_lowercase().contains("user=") {
+        } else if !conn_str_has_user(&conn_str) {
             return Err(MssqlFdwRqError::InvalidOption(
-                "no credentials: provide a user mapping (user/password) or User=/Password= in conn_string"
+                "no credentials: provide a user mapping (user/password) or User ID=/UID= in conn_string"
                     .to_string(),
             ));
         }
@@ -487,6 +548,10 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         true
     }
 
+    fn supports_remote_query_static() -> bool {
+        true
+    }
+
     fn remote_query_policy(&self, context: &RemoteQueryContext) -> RemoteQueryPolicy {
         // bridge-FDW semantics: when every relation is a foreign table of this
         // same server the query must run remotely; mixed queries, or queries
@@ -516,12 +581,15 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         // For multi-relation queries the framework deparses the TOP-LEVEL
         // statement text; when the query runs through SPI or PL/pgSQL that
         // is the enclosing statement, not this query. Refuse to execute
-        // anything that does not even mention the foreign tables.
-        let mentions_any = query.relations.iter().any(|rel| {
-            let lower = query.sql.to_lowercase();
-            lower.contains(&rel.local_table.to_lowercase())
-        });
-        if !mentions_any {
+        // anything that does not actually reference the foreign tables as
+        // whole identifiers — a substring hit (`users` inside `appusers` or
+        // inside a string literal) must not green-light the wrong text.
+        let relations: Vec<RelationMapping> = query
+            .relations
+            .iter()
+            .map(Self::relation_mapping)
+            .collect::<MssqlFdwRqResult<_>>()?;
+        if !translator::mentions_relation(&query.sql, &relations) {
             return Err(MssqlFdwRqError::UnsupportedConstruct(
                 translator::TranslateError::UnsupportedConstruct {
                     sql_fragment: query.sql.chars().take(80).collect(),
@@ -532,12 +600,6 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 },
             ));
         }
-
-        let relations: Vec<RelationMapping> = query
-            .relations
-            .iter()
-            .map(Self::relation_mapping)
-            .collect::<MssqlFdwRqResult<_>>()?;
 
         let (bool_columns, not_null_columns) = Self::column_flags(&query.relations);
         let ctx = TranslateContext {
@@ -627,8 +689,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             Some(Err(e)) => Err(e.into()),
             None => {
                 // stream exhausted: finalize the row counters
-                stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsIn, self.rows_out);
-                stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsOut, self.rows_out);
+                self.flush_row_stats();
                 self.rx = None;
                 Ok(None)
             }
@@ -651,12 +712,15 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         }
         self.rx = None;
         self.rx = Some(self.spawn_streaming_query(sql, params)?);
-        self.rows_out = 0;
+        // rows of the abandoned stream still count toward the statistics
+        self.flush_row_stats();
         Ok(())
     }
 
     fn end_scan(&mut self) -> MssqlFdwRqResult<()> {
-        // dropping the receiver cancels the background query task
+        // dropping the receiver cancels the background query task; rows
+        // already pulled from it still count toward the statistics
+        self.flush_row_stats();
         self.rx = None;
         Ok(())
     }

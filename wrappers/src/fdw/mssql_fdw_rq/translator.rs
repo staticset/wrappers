@@ -8,7 +8,7 @@
 //! yields a structured [`TranslateError::UnsupportedConstruct`] — never
 //! silently wrong SQL.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::types;
@@ -593,22 +593,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
 
     // relation lookups (local names are matched case-insensitively: PG folds
     // unquoted identifiers, and we only ever create lowercase foreign tables)
-    let mut by_two: HashMap<(String, String), &RelationMapping> = HashMap::new();
-    let mut by_table: HashMap<String, &RelationMapping> = HashMap::new();
-    for rel in &ctx.relations {
-        by_two.insert(
-            (
-                rel.local_schema.to_lowercase(),
-                rel.local_table.to_lowercase(),
-            ),
-            rel,
-        );
-        // bare unqualified names only resolve for the default search_path
-        // schema (public); this mirrors how the deparser omits qualification
-        if rel.local_schema.eq_ignore_ascii_case("public") {
-            by_table.insert(rel.local_table.to_lowercase(), rel);
-        }
-    }
+    let maps = relation_maps(&ctx.relations);
 
     // decide LIMIT strategy
     let use_top = clauses.limit.is_some()
@@ -769,11 +754,11 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 out.push(o.clone());
             }
             Tok::Num(n) => out.push(n.clone()),
-            Tok::Str(s) => out.push(format!("'{}'", s.replace('\'', "''"))),
+            Tok::Str(s) => out.push(tsql_string_literal(s)),
             Tok::Param(p) => out.push(format!("@P{p}")),
             Tok::QIdent(name) => {
                 // quoted names take part in relation matching too
-                if let Some((remote, consumed)) = match_relation(&toks, i, &by_two, &by_table) {
+                if let Some((remote, consumed)) = match_relation(&toks, i, &maps)? {
                     out.push(remote);
                     i += consumed;
                     continue;
@@ -782,7 +767,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
             }
             Tok::Word(w) => {
                 // --- relation renaming ------------------------------------
-                if let Some((remote, consumed)) = match_relation(&toks, i, &by_two, &by_table) {
+                if let Some((remote, consumed)) = match_relation(&toks, i, &maps)? {
                     out.push(remote);
                     i += consumed;
                     continue;
@@ -1038,8 +1023,8 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                     unreachable!();
                                 };
                                 out.push(format!(
-                                    "CAST('{}' AS {mssql_type})",
-                                    s.replace('\'', "''")
+                                    "CAST({} AS {mssql_type})",
+                                    tsql_string_literal(s)
                                 ));
                                 i += 2;
                                 continue;
@@ -1426,7 +1411,7 @@ fn translate_ilike(
     let rhs = match toks.get(i + 1) {
         Some(Tok::Word(w)) => w.clone(),
         Some(Tok::QIdent(q)) => bracket_ident(q)?,
-        Some(Tok::Str(s)) => format!("'{}'", s.replace('\'', "''")),
+        Some(Tok::Str(s)) => tsql_string_literal(s),
         _ => {
             return Err(TranslateError::UnsupportedConstruct {
                 sql_fragment: "ILIKE".to_string(),
@@ -1512,10 +1497,14 @@ fn parse_array_literal(s: &str) -> Result<Vec<String>, TranslateError> {
     let mut items = Vec::with_capacity(raw_items.len());
     for (raw, quoted) in raw_items {
         if quoted {
-            items.push(format!("'{}'", raw.replace('\'', "''")));
+            items.push(tsql_string_literal(&raw));
         } else {
             match raw.trim() {
-                "NULL" => continue, // never matches = ANY / <> ALL
+                // T-SQL IN/NOT IN share PostgreSQL's three-valued semantics,
+                // so NULL elements must stay in the list: dropping them
+                // would flip `x <> ALL('{1,NULL}')` from "no rows" to
+                // "every x <> 1"
+                "NULL" => items.push("NULL".to_string()),
                 "t" => items.push("1".to_string()),
                 "f" => items.push("0".to_string()),
                 v if !v.is_empty()
@@ -1609,7 +1598,7 @@ fn translate_any_all(
                     j += 1;
                 }
                 Some(Tok::Str(s)) => {
-                    items.push(format!("'{}'", s.replace('\'', "''")));
+                    items.push(tsql_string_literal(s));
                     j += 1;
                 }
                 Some(Tok::Param(p)) => {
@@ -1622,6 +1611,11 @@ fn translate_any_all(
                 }
                 Some(Tok::Word(w)) if w.eq_ignore_ascii_case("false") => {
                     items.push("0".to_string());
+                    j += 1;
+                }
+                Some(Tok::Word(w)) if w.eq_ignore_ascii_case("null") => {
+                    // keep NULL elements: IN/NOT IN semantics match PG
+                    items.push("NULL".to_string());
                     j += 1;
                 }
                 _ => {
@@ -1742,12 +1736,70 @@ fn translate_is(
 /// Try to rename `schema.table` / `"schema"."table"` / bare `table` at `i`
 /// into `[remote_schema].[remote_table]`. Returns the rendered name and how
 /// many tokens were consumed.
+/// Lookup maps for relation renaming: qualified `schema.table` always
+/// resolves; bare table names resolve only when exactly one relation carries
+/// that name across all schemas (the deparser qualifies everything, but
+/// client-supplied join text can be bare). A name claimed by two relations
+/// is ambiguous and rejected at match time instead of silently resolving to
+/// the wrong table.
+struct RelationMaps<'a> {
+    by_two: HashMap<(String, String), &'a RelationMapping>,
+    by_table: HashMap<String, &'a RelationMapping>,
+    ambiguous_bare: HashSet<String>,
+}
+
+fn relation_maps(relations: &[RelationMapping]) -> RelationMaps<'_> {
+    let mut maps = RelationMaps {
+        by_two: HashMap::new(),
+        by_table: HashMap::new(),
+        ambiguous_bare: HashSet::new(),
+    };
+    for rel in relations {
+        maps.by_two.insert(
+            (
+                rel.local_schema.to_lowercase(),
+                rel.local_table.to_lowercase(),
+            ),
+            rel,
+        );
+        let bare = rel.local_table.to_lowercase();
+        if maps.by_table.contains_key(&bare) || maps.ambiguous_bare.contains(&bare) {
+            maps.by_table.remove(&bare);
+            maps.ambiguous_bare.insert(bare);
+        } else {
+            maps.by_table.insert(bare, rel);
+        }
+    }
+    maps
+}
+
+/// Does `sql` reference any of `relations` as a whole identifier? Used as a
+/// safety net before executing client-supplied statement text remotely: a
+/// substring hit (`users` inside `appusers`, or inside a string literal)
+/// must not green-light the wrong text. Text that cannot even be lexed
+/// counts as "does not mention".
+pub(super) fn mentions_relation(sql: &str, relations: &[RelationMapping]) -> bool {
+    let toks = match lex(sql) {
+        Ok(toks) => toks,
+        Err(_) => return false,
+    };
+    let maps = relation_maps(relations);
+    for i in 0..toks.len() {
+        if matches!(match_relation(&toks, i, &maps), Ok(Some(_))) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Try to rename `schema.table` / `"schema"."table"` / bare `table` at `i`
+/// into `[remote_schema].[remote_table]`. Returns the rendered name and how
+/// many tokens were consumed, or an error for an ambiguous bare name.
 fn match_relation(
     toks: &[Tok],
     i: usize,
-    by_two: &HashMap<(String, String), &RelationMapping>,
-    by_table: &HashMap<String, &RelationMapping>,
-) -> Option<(String, usize)> {
+    maps: &RelationMaps<'_>,
+) -> Result<Option<(String, usize)>, TranslateError> {
     let as_word = |t: &Tok| -> Option<String> {
         match t {
             Tok::Word(w) => Some(w.to_lowercase()),
@@ -1764,36 +1816,45 @@ fn match_relation(
     ) && o == "."
         && !matches!(toks.get(i + 3), Some(Tok::Op(op)) if op == ".")
     {
-        if let Some(rel) = by_two.get(&(a, b)) {
-            return Some((
+        if let Some(rel) = maps.by_two.get(&(a, b)) {
+            return Ok(Some((
                 format!(
                     "{}.{}",
-                    bracket_ident(&rel.remote_schema).ok()?,
-                    bracket_ident(&rel.remote_table).ok()?
+                    bracket_ident(&rel.remote_schema)?,
+                    bracket_ident(&rel.remote_table)?
                 ),
                 3,
-            ));
+            )));
         }
-        return None;
+        return Ok(None);
     }
 
-    // one-part: bare table name from the public schema
+    // one-part: bare table name, unambiguous across schemas
     if let Some(name) = toks.get(i).and_then(as_word)
         && !matches!(toks.get(i + 1), Some(Tok::Op(op)) if op == ".")
         && (i == 0 || !matches!(toks.get(i - 1), Some(Tok::Op(op)) if op == "."))
-        && let Some(rel) = by_table.get(&name)
     {
-        return Some((
-            format!(
-                "{}.{}",
-                bracket_ident(&rel.remote_schema).ok()?,
-                bracket_ident(&rel.remote_table).ok()?
-            ),
-            1,
-        ));
+        if maps.ambiguous_bare.contains(&name) {
+            return Err(TranslateError::UnsupportedConstruct {
+                sql_fragment: name,
+                reason: "bare table name is ambiguous between foreign tables of \
+                         different schemas; qualify it with the schema name"
+                    .to_string(),
+            });
+        }
+        if let Some(rel) = maps.by_table.get(&name) {
+            return Ok(Some((
+                format!(
+                    "{}.{}",
+                    bracket_ident(&rel.remote_schema)?,
+                    bracket_ident(&rel.remote_table)?
+                ),
+                1,
+            )));
+        }
     }
 
-    None
+    Ok(None)
 }
 
 fn bracket_ident(name: &str) -> Result<String, TranslateError> {
@@ -1801,6 +1862,19 @@ fn bracket_ident(name: &str) -> Result<String, TranslateError> {
         return Err(TranslateError::InvalidIdentifier(name.to_string()));
     }
     Ok(format!("[{name}]"))
+}
+
+/// Render a string literal for T-SQL. Values containing non-ASCII characters
+/// get the `N'…'` form so a server collation with a legacy code page cannot
+/// silently mangle them into `?`; plain literals keep varchar comparison
+/// semantics (and index use) for the ASCII case.
+fn tsql_string_literal(s: &str) -> String {
+    let escaped = s.replace('\'', "''");
+    if s.is_ascii() {
+        format!("'{escaped}'")
+    } else {
+        format!("N'{escaped}'")
+    }
 }
 
 /// Check whether the last meaningful piece is one of `words`. A dangling

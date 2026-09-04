@@ -21,117 +21,88 @@ pub(crate) unsafe fn form_array_from_datum(
     datum: Datum,
     is_null: bool,
     typoid: pg_sys::Oid,
-) -> Option<Vec<Cell>> {
+) -> Option<(Vec<Cell>, bool)> {
+    // Collect the array's elements as non-null cells, reporting whether any
+    // element was NULL: NULLs cannot travel inside `Cell`s, but callers must
+    // preserve them semantically (see `Qual::array_had_nulls`).
+    macro_rules! elements {
+        ($ty:ty, $elem:ident, $cell:ident) => {
+            |arr: &Array<$ty>| {
+                let had_nulls = arr.iter().any(|v| v.is_none());
+                let cells = arr
+                    .iter()
+                    .filter(|v| v.is_some())
+                    .map(|v| Cell::$cell(v.expect("non-null array element")))
+                    .collect::<Vec<_>>();
+                (cells, had_nulls)
+            }
+        };
+    }
+
     let oid = PgOid::from(typoid);
     match oid {
         PgOid::BuiltIn(PgBuiltInOids::BOOLARRAYOID) => {
-            unsafe { Array::<bool>::from_polymorphic_datum(datum, is_null, pg_sys::BOOLOID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::Bool(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<bool>::from_polymorphic_datum(datum, is_null, pg_sys::BOOLOID) }
+                .as_ref()
+                .map(elements!(bool, BOOLOID, Bool))
         }
         PgOid::BuiltIn(PgBuiltInOids::CHARARRAYOID) => {
-            unsafe { Array::<i8>::from_polymorphic_datum(datum, is_null, pg_sys::CHAROID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::I8(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<i8>::from_polymorphic_datum(datum, is_null, pg_sys::CHAROID) }
+                .as_ref()
+                .map(elements!(i8, CHAROID, I8))
         }
         PgOid::BuiltIn(PgBuiltInOids::INT2ARRAYOID) => {
-            unsafe { Array::<i16>::from_polymorphic_datum(datum, is_null, pg_sys::INT2OID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::I16(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<i16>::from_polymorphic_datum(datum, is_null, pg_sys::INT2OID) }
+                .as_ref()
+                .map(elements!(i16, INT2OID, I16))
         }
         PgOid::BuiltIn(PgBuiltInOids::FLOAT4ARRAYOID) => {
-            unsafe { Array::<f32>::from_polymorphic_datum(datum, is_null, pg_sys::FLOAT4OID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::F32(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<f32>::from_polymorphic_datum(datum, is_null, pg_sys::FLOAT4OID) }
+                .as_ref()
+                .map(elements!(f32, FLOAT4OID, F32))
         }
         PgOid::BuiltIn(PgBuiltInOids::INT4ARRAYOID) => {
-            unsafe { Array::<i32>::from_polymorphic_datum(datum, is_null, pg_sys::INT4OID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::I32(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<i32>::from_polymorphic_datum(datum, is_null, pg_sys::INT4OID) }
+                .as_ref()
+                .map(elements!(i32, INT4OID, I32))
         }
         PgOid::BuiltIn(PgBuiltInOids::FLOAT8ARRAYOID) => {
-            unsafe { Array::<f64>::from_polymorphic_datum(datum, is_null, pg_sys::FLOAT8OID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::F64(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<f64>::from_polymorphic_datum(datum, is_null, pg_sys::FLOAT8OID) }
+                .as_ref()
+                .map(elements!(f64, FLOAT8OID, F64))
         }
         PgOid::BuiltIn(PgBuiltInOids::INT8ARRAYOID) => {
-            unsafe { Array::<i64>::from_polymorphic_datum(datum, is_null, pg_sys::INT8OID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::I64(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<i64>::from_polymorphic_datum(datum, is_null, pg_sys::INT8OID) }
+                .as_ref()
+                .map(elements!(i64, INT8OID, I64))
         }
         PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID) => {
-            unsafe { Array::<String>::from_polymorphic_datum(datum, is_null, pg_sys::TEXTOID) }.map(
-                |arr| {
-                    arr.iter()
+            unsafe { Array::<String>::from_polymorphic_datum(datum, is_null, pg_sys::TEXTOID) }
+                .as_ref()
+                .map(|arr| {
+                    let had_nulls = arr.iter().any(|v| v.is_none());
+                    let cells = arr
+                        .iter()
                         .filter(|v| v.is_some())
-                        .map(|v| Cell::String(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+                        .map(|v| Cell::String(v.expect("non-null array element").to_string()))
+                        .collect::<Vec<_>>();
+                    (cells, had_nulls)
+                })
         }
         PgOid::BuiltIn(PgBuiltInOids::DATEARRAYOID) => {
-            unsafe { Array::<Date>::from_polymorphic_datum(datum, is_null, pg_sys::DATEOID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::Date(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<Date>::from_polymorphic_datum(datum, is_null, pg_sys::DATEOID) }
+                .as_ref()
+                .map(elements!(Date, DATEOID, Date))
         }
         PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPARRAYOID) => unsafe {
             Array::<Timestamp>::from_polymorphic_datum(datum, is_null, pg_sys::TIMESTAMPOID)
         }
-        .map(|arr| {
-            arr.iter()
-                .filter(|v| v.is_some())
-                .map(|v| Cell::Timestamp(v.expect("non-null array element")))
-                .collect::<Vec<_>>()
-        }),
+        .as_ref()
+        .map(elements!(Timestamp, TIMESTAMPOID, Timestamp)),
         PgOid::BuiltIn(PgBuiltInOids::JSONBARRAYOID) => {
-            unsafe { Array::<JsonB>::from_polymorphic_datum(datum, is_null, pg_sys::JSONBOID) }.map(
-                |arr| {
-                    arr.iter()
-                        .filter(|v| v.is_some())
-                        .map(|v| Cell::Json(v.expect("non-null array element")))
-                        .collect::<Vec<_>>()
-                },
-            )
+            unsafe { Array::<JsonB>::from_polymorphic_datum(datum, is_null, pg_sys::JSONBOID) }
+                .as_ref()
+                .map(elements!(JsonB, JSONBOID, Json))
         }
         _ => None,
     }
@@ -247,6 +218,7 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 value: Value::Cell(value),
                                 use_or: false,
                                 param,
+                                array_had_nulls: false,
                             };
                             return Some(qual);
                         }
@@ -287,6 +259,7 @@ pub(crate) unsafe fn extract_from_null_test(
             value: Value::Cell(Cell::String("null".to_string())),
             use_or: false,
             param: None,
+            array_had_nulls: false,
         };
 
         Some(qual)
@@ -326,18 +299,19 @@ pub(crate) unsafe fn extract_from_scalar_array_op_expr(
                     {
                         let field = pg_sys::get_attname(baserel_id, (*left).varattno, false);
 
-                        let value: Option<Vec<Cell>> = form_array_from_datum(
+                        let value = form_array_from_datum(
                             (*right).constvalue,
                             (*right).constisnull,
                             (*right).consttype,
                         );
-                        if let Some(value) = value {
+                        if let Some((cells, array_had_nulls)) = value {
                             let qual = Qual {
                                 field: CStr::from_ptr(field).to_str().unwrap().to_string(),
                                 operator: pgrx::name_data_to_str(&(*opr).oprname).to_string(),
-                                value: Value::Array(value),
+                                value: Value::Array(cells),
                                 use_or: (*expr).useOr,
                                 param: None,
+                                array_had_nulls,
                             };
                             return Some(qual);
                         }
@@ -376,6 +350,7 @@ pub(crate) unsafe fn extract_from_var(
             value: Value::Cell(Cell::Bool(true)),
             use_or: false,
             param: None,
+            array_had_nulls: false,
         };
 
         Some(qual)
@@ -411,6 +386,7 @@ pub(crate) unsafe fn extract_from_bool_expr(
                     value: Value::Cell(Cell::Bool(false)),
                     use_or: false,
                     param: None,
+                    array_had_nulls: false,
                 };
 
                 return Some(qual);
@@ -447,6 +423,7 @@ pub(crate) unsafe fn extract_from_boolean_test(
             value: Value::Cell(Cell::Bool(value)),
             use_or: false,
             param: None,
+            array_had_nulls: false,
         };
 
         Some(qual)
@@ -517,12 +494,31 @@ mod tests {
             .expect("int4 array datum should be created");
 
         let result = unsafe { form_array_from_datum(datum, false, pg_sys::INT4ARRAYOID) };
-        let result = result.expect("int4 array should be parsed");
+        let (result, had_nulls) = result.expect("int4 array should be parsed");
 
+        assert!(!had_nulls);
         assert_eq!(result.len(), 3);
         assert!(matches!(result[0], Cell::I32(1)));
         assert!(matches!(result[1], Cell::I32(2)));
         assert!(matches!(result[2], Cell::I32(3)));
+    }
+
+    #[cfg(all(feature = "pg_test", pgrx_embed))]
+    #[test]
+    fn test_form_array_from_datum_reports_null_elements() {
+        let values = vec![Some(1_i32), None, Some(3_i32)];
+        let datum = values
+            .into_datum()
+            .expect("int4 array datum should be created");
+
+        let result = unsafe { form_array_from_datum(datum, false, pg_sys::INT4ARRAYOID) };
+        let (result, had_nulls) = result.expect("int4 array should be parsed");
+
+        // NULLs are dropped from the cells but must be reported
+        assert!(had_nulls);
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], Cell::I32(1)));
+        assert!(matches!(result[1], Cell::I32(3)));
     }
 
     #[test]

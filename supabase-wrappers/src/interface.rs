@@ -707,6 +707,14 @@ pub struct Qual {
     pub value: Value,
     pub use_or: bool,
     pub param: Option<Param>,
+
+    /// True when the source array of a `Value::Array` contained NULL
+    /// elements. They cannot travel inside `Cell`s, but PostgreSQL and T-SQL
+    /// agree on the three-valued `IN`/`NOT IN` semantics, so FDWs should
+    /// re-add a literal NULL to the rendered list: `x <> ALL('{1,NULL}')`
+    /// matches no rows, while silently dropping the NULL would wrongly match
+    /// every `x <> 1` row.
+    pub array_had_nulls: bool,
 }
 
 impl Qual {
@@ -1083,6 +1091,19 @@ pub trait ForeignDataWrapper<E: Into<ErrorReport>> {
     /// the query into base scans, filters, joins, aggregates, and projections
     /// executed by Postgres.
     fn supports_full_query_pushdown(&self) -> bool {
+        false
+    }
+
+    /// Static counterpart of [`supports_full_query_pushdown`](Self::supports_full_query_pushdown):
+    /// whether this FDW *type* implements
+    /// [`begin_remote_query`](Self::begin_remote_query). Defaults to `false`.
+    ///
+    /// Planner callbacks (`GetForeignJoinPaths`, `GetForeignUpperPaths`) use
+    /// this to bail out before constructing an FDW instance, because
+    /// constructing one can have side effects (secret lookups, client setup,
+    /// statistics) and planning a join must not trigger them for FDWs that
+    /// never execute remote queries.
+    fn supports_remote_query_static() -> bool {
         false
     }
 

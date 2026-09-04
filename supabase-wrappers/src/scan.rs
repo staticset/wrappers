@@ -614,6 +614,33 @@ unsafe fn full_query_sql_from_planner(root: *mut pg_sys::PlannerInfo) -> Option<
     }
 }
 
+/// Rebuild a target list without resjunk entries. Entries are shared by
+/// pointer (no deep copy); the original list is left untouched. Returns the
+/// original list unchanged when it contains no resjunk entries.
+unsafe fn filter_resjunk_tlist(tlist: *mut pg_sys::List) -> *mut pg_sys::List {
+    unsafe {
+        if tlist.is_null() {
+            return tlist;
+        }
+        let n = (*tlist).length as usize;
+        if n == 0 {
+            return tlist;
+        }
+        let mut filtered: *mut pg_sys::List = ptr::null_mut();
+        let mut has_junk = false;
+        for i in 0..n {
+            let cell = (*tlist).elements.add(i);
+            let tle = (*cell).ptr_value as *mut pg_sys::TargetEntry;
+            if (*tle).resjunk {
+                has_junk = true;
+                continue;
+            }
+            filtered = pg_sys::lappend(filtered, tle as *mut std::ffi::c_void);
+        }
+        if has_junk { filtered } else { tlist }
+    }
+}
+
 unsafe fn current_statement_sql_from_debug_query_string(
     root: *mut pg_sys::PlannerInfo,
 ) -> Option<String> {
@@ -633,7 +660,7 @@ unsafe fn current_statement_sql_from_debug_query_string(
         };
         let bytes = raw.as_bytes();
         if start >= bytes.len() {
-            return normalize_current_statement_sql(&raw);
+            return None;
         }
 
         let len = if (*query).stmt_len > 0 {
@@ -641,7 +668,16 @@ unsafe fn current_statement_sql_from_debug_query_string(
         } else {
             bytes.len().saturating_sub(start)
         };
-        let end = start.saturating_add(len).min(bytes.len());
+        let end = start.saturating_add(len);
+        // stmt_location/len belong to the text the statement was parsed from.
+        // If they do not fit inside debug_query_string, the statement was
+        // planned from a different text (e.g. re-planning a prepared
+        // statement at EXECUTE time, where the location still points into
+        // the original PREPARE string) — slicing would return an unrelated
+        // fragment, so reject instead of executing the wrong statement.
+        if end > bytes.len() {
+            return None;
+        }
         let stmt = std::str::from_utf8(&bytes[start..end]).ok()?;
         normalize_current_statement_sql(stmt)
     }
@@ -1063,6 +1099,14 @@ pub(super) extern "C-unwind" fn get_foreign_join_paths<
 ) {
     debug2!("---> get_foreign_join_paths");
     unsafe {
+        // Constructing an FDW instance can have side effects (secret lookups,
+        // client setup, statistics). For FDW types that never execute remote
+        // queries the policy is Optional by definition, so bail out before
+        // building anything — planning a join must stay side-effect free.
+        if !W::supports_remote_query_static() {
+            return;
+        }
+
         // Build a remote join path only when this joinrel covers the complete set
         // of foreign base relations in the query. A partial join path would let
         // PostgreSQL perform some of the query locally, which breaks wrappers
@@ -1491,6 +1535,13 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
             if list_is_empty(final_tlist) && !root.is_null() && !(*root).parse.is_null() {
                 final_tlist = pg_sys::list_copy_deep((*(*root).parse).targetList);
             }
+            // resjunk entries (ORDER BY / DISTINCT keys that are not in the
+            // SELECT list) must not reach fdw_scan_tlist: the scan descriptor
+            // and state.tgts are sized from the non-junk output columns, and
+            // the deparsed remote SQL does not return junk columns either.
+            // Drop them from the plan target list too so positional INDEX_VAR
+            // references stay aligned with the slot.
+            final_tlist = filter_resjunk_tlist(final_tlist);
 
             // The remote query returns final output rows, not base-table rows.
             // Build the ForeignScan descriptor from the selected target list so
@@ -1582,18 +1633,23 @@ pub(super) extern "C-unwind" fn explain_foreign_scan<
 
         let ctx = PgMemoryContexts::For(state.tmp_ctx);
 
-        let label = ctx.pstrdup("Wrappers");
-
-        let value = ctx.pstrdup(&format!("quals = {:?}", state.quals));
+        // distinct property names: same-name properties overwrite each other
+        // in EXPLAIN's JSON/YAML output. Lowercase, node-name-free words so
+        // plan-text assertions (e.g. "no Sort node") don't trip over them.
+        let label = ctx.pstrdup("quals");
+        let value = ctx.pstrdup(&format!("{:?}", state.quals));
         pg_sys::ExplainPropertyText(label, value, es);
 
-        let value = ctx.pstrdup(&format!("tgts = {:?}", state.tgts));
+        let label = ctx.pstrdup("targets");
+        let value = ctx.pstrdup(&format!("{:?}", state.tgts));
         pg_sys::ExplainPropertyText(label, value, es);
 
-        let value = ctx.pstrdup(&format!("sorts = {:?}", state.sorts));
+        let label = ctx.pstrdup("sorts");
+        let value = ctx.pstrdup(&format!("{:?}", state.sorts));
         pg_sys::ExplainPropertyText(label, value, es);
 
-        let value = ctx.pstrdup(&format!("limit = {:?}", state.limit));
+        let label = ctx.pstrdup("limit");
+        let value = ctx.pstrdup(&format!("{:?}", state.limit));
         pg_sys::ExplainPropertyText(label, value, es);
 
         // postgres_fdw-style visibility: EXPLAIN VERBOSE should answer
@@ -1610,10 +1666,12 @@ pub(super) extern "C-unwind" fn explain_foreign_scan<
         }
 
         if !state.aggregates.is_empty() {
-            let value = ctx.pstrdup(&format!("aggregates = {:?}", state.aggregates));
+            let label = ctx.pstrdup("aggregates");
+            let value = ctx.pstrdup(&format!("{:?}", state.aggregates));
             pg_sys::ExplainPropertyText(label, value, es);
 
-            let value = ctx.pstrdup(&format!("group_by = {:?}", state.group_by));
+            let label = ctx.pstrdup("group_by");
+            let value = ctx.pstrdup(&format!("{:?}", state.group_by));
             pg_sys::ExplainPropertyText(label, value, es);
         }
     }
@@ -1926,9 +1984,10 @@ pub(super) extern "C-unwind" fn iterate_foreign_scan<
         }
         let mut state = PgBox::<FdwState<E, W>>::from_pg((*node).fdw_state as _);
 
-        // evaluate parameter values
+        // evaluate parameter values (plain-scan quals). Remote-query
+        // parameters are consumed once in begin_remote_query; re-evaluating
+        // them per row was O(rows×params) wasted work.
         assign_parameter_value(node, &mut state);
-        assign_remote_query_parameters(node, &mut state);
 
         // clear slot
         let slot = (*node).ss.ss_ScanTupleSlot;

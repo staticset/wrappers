@@ -9,14 +9,14 @@ on:
       - "supabase-wrappers/**"
       - "wrappers/src/fdw/mssql_fdw_rq/**"
       - "wrappers/Cargo.toml"
-      - "wrappers/.dev/mssql/**"
+      - ".dev/mssql/**"
       - ".github/workflows/mssql-fdw-rq.yml"
   pull_request:
     paths:
       - "supabase-wrappers/**"
       - "wrappers/src/fdw/mssql_fdw_rq/**"
       - "wrappers/Cargo.toml"
-      - "wrappers/.dev/mssql/**"
+      - ".dev/mssql/**"
       - ".github/workflows/mssql-fdw-rq.yml"
 
 permissions:

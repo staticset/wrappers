@@ -476,6 +476,92 @@ mod unit {
         );
     }
 
+    // -- regression round 2026-09-04 (after-blockers: #5, #6, #10, #12) ------
+
+    // #12: non-ASCII literals get the N'…' form (a legacy server collation
+    // code page would otherwise mangle them to '?'); ASCII stays plain to
+    // keep varchar comparison semantics
+    #[test]
+    fn non_ascii_literals_use_n_prefix() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE note = 'тест'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note = N'тест'",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE note = 'ascii'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note = 'ascii'",
+        );
+    }
+
+    // #6: bare table names resolve from any schema when unambiguous
+    #[test]
+    fn bare_table_name_resolves_from_non_public_schema() {
+        let ctx = TranslateContext {
+            relations: vec![RelationMapping {
+                local_schema: "ms".into(),
+                local_table: "statuses".into(),
+                remote_schema: "dbo".into(),
+                remote_table: "Statuses".into(),
+            }],
+            ..Default::default()
+        };
+        assert_tsql(
+            "SELECT id FROM statuses",
+            &ctx,
+            "SELECT id FROM [dbo].[Statuses]",
+        );
+    }
+
+    // #6: two relations sharing a bare name across schemas is ambiguous —
+    // reject instead of silently renaming to one of them
+    #[test]
+    fn ambiguous_bare_table_name_rejected() {
+        let ctx = TranslateContext {
+            relations: vec![
+                RelationMapping {
+                    local_schema: "ms".into(),
+                    local_table: "statuses".into(),
+                    remote_schema: "dbo".into(),
+                    remote_table: "Statuses".into(),
+                },
+                RelationMapping {
+                    local_schema: "other".into(),
+                    local_table: "statuses".into(),
+                    remote_schema: "ext".into(),
+                    remote_table: "Statuses".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_unsupported("SELECT id FROM statuses", &ctx, "statuses");
+        // qualified names are unaffected
+        assert_tsql(
+            "SELECT id FROM ms.statuses",
+            &ctx,
+            "SELECT id FROM [dbo].[Statuses]",
+        );
+    }
+
+    // #5: the remote-query safety net matches whole identifiers only
+    #[test]
+    fn mentions_relation_is_lexical() {
+        use super::super::translator::mentions_relation;
+
+        let rels = vec![RelationMapping {
+            local_schema: "public".into(),
+            local_table: "users".into(),
+            remote_schema: "dbo".into(),
+            remote_table: "Users".into(),
+        }];
+        assert!(mentions_relation("SELECT * FROM public.users", &rels));
+        assert!(mentions_relation("SELECT * FROM users WHERE x = 1", &rels));
+        assert!(!mentions_relation("SELECT * FROM appusers", &rels));
+        assert!(!mentions_relation("SELECT 'users in a literal'", &rels));
+        assert!(!mentions_relation("SELECT 1 WHERE users.a = 2", &rels));
+    }
+
     #[test]
     fn deparser_cast_limit_form() {
         assert_tsql(
@@ -565,18 +651,32 @@ mod unit {
     }
 
     #[test]
-    fn deparser_any_array_constant_drops_nulls() {
+    fn deparser_any_array_keeps_nulls() {
+        // T-SQL IN/NOT IN share PG's three-valued semantics: NULL elements
+        // must stay in the list (dropping them would flip <> ALL semantics)
         assert_tsql(
             "SELECT id FROM public.dbo_orders \
              WHERE statusid = ANY ('{5,NULL}'::integer[])",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (5))",
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (5, NULL))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid <> ALL ('{5,NULL}'::integer[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid NOT IN (5, NULL))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE statusid = ANY (ARRAY[5, NULL])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (5, NULL))",
         );
         assert_tsql(
             "SELECT id FROM public.dbo_orders \
              WHERE statusid = ANY ('{NULL}'::integer[])",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] WHERE (1 = 0)",
+            "SELECT id FROM [dbo].[Orders] WHERE (statusid IN (NULL))",
         );
     }
 
@@ -671,6 +771,7 @@ mod unit {
                 value,
                 use_or,
                 param: None,
+                array_had_nulls: false,
             }
         }
 
@@ -745,6 +846,52 @@ mod unit {
             assert_eq!(
                 sql_for(&[qual("id", "<>", Value::Array(vec![]), false)]),
                 "SELECT [id], [note] FROM [dbo].[Orders] WHERE 1 = 1"
+            );
+        }
+
+        // #10: NULL elements of the source array re-enter the rendered list
+        // (`x <> ALL('{1,NULL}')` matches no rows; dropping the NULL would
+        // wrongly match every x <> 1)
+        fn null_array_qual(use_or: bool, cells: Vec<Cell>) -> Qual {
+            Qual {
+                field: "id".to_string(),
+                operator: if use_or { "=" } else { "<>" }.to_string(),
+                value: Value::Array(cells),
+                use_or,
+                param: None,
+                array_had_nulls: true,
+            }
+        }
+
+        #[test]
+        fn array_qual_with_null_element_keeps_null() {
+            assert_eq!(
+                sql_for(&[null_array_qual(true, vec![Cell::I64(1)])]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] IN (@P1, NULL)"
+            );
+            assert_eq!(
+                sql_for(&[null_array_qual(false, vec![Cell::I64(1)])]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] NOT IN (@P1, NULL)"
+            );
+            // other-operator chains get the NULL element as an UNKNOWN cond
+            let mut q = null_array_qual(true, vec![Cell::I64(10)]);
+            q.operator = "<".to_string();
+            assert_eq!(
+                sql_for(&[q]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE ([id] < @P1 OR [id] < NULL)"
+            );
+        }
+
+        #[test]
+        fn all_null_array_never_matches() {
+            // `= ANY('{NULL}')` and `<> ALL('{NULL}')` both yield no rows
+            assert_eq!(
+                sql_for(&[null_array_qual(true, vec![])]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE 1 = 0"
+            );
+            assert_eq!(
+                sql_for(&[null_array_qual(false, vec![])]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE 1 = 0"
             );
         }
 
@@ -1204,6 +1351,44 @@ mod tests {
         assert_eq!(pg, mssql);
         // all 60 orders, one rank each partition position
         assert_eq!(pg.len(), 60);
+    }
+
+    // H: an ORDER BY key outside the SELECT list is a resjunk target entry.
+    // It must not leak into the full-query scan's tuple slot while the sort
+    // itself still happens remotely.
+    #[pg_test]
+    fn full_query_order_by_unselected_column() {
+        setup_committed();
+
+        let dblink_rows = |query: &str| -> Vec<String> {
+            Spi::connect(|c| {
+                let rows = c
+                    .select(
+                        &format!(
+                            "SELECT * FROM dblink(\
+                                 format('host=localhost port=%s dbname=rqjoin_test', \
+                                        current_setting('port')), \
+                                 $${query}$$) AS t(id text)"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap();
+                rows.filter_map(|r| r.get_by_name::<&str, _>("id").unwrap().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // resjunk shape: ORDER BY total_amount, SELECT id only
+        let junk = dblink_rows("SELECT id::text FROM rqj_orders ORDER BY total_amount LIMIT 3");
+        // reference shape: the sort key is in the select list (no junk)
+        let reference = dblink_rows(
+            "SELECT id::text FROM \
+             (SELECT id, total_amount FROM rqj_orders ORDER BY total_amount LIMIT 3) t",
+        );
+
+        assert_eq!(junk, reference);
+        assert_eq!(junk.len(), 3);
     }
 
     /// A second server of this FDW pointing at the same MSSQL instance.

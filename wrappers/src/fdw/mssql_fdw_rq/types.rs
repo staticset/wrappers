@@ -247,14 +247,22 @@ fn date_to_naive(v: &Date) -> MssqlFdwRqResult<NaiveDate> {
 
 fn time_to_naive(v: &Time) -> MssqlFdwRqResult<NaiveTime> {
     let sec = v.second();
-    let (sec, micro) = (sec.trunc() as u32, (sec.fract() * 1e6).round() as u32);
+    // rounding can yield 1_000_000 micro, which from_hms_micro_opt rejects
+    let (sec, micro) = (
+        sec.trunc() as u32,
+        ((sec.fract() * 1e6).round() as i64).clamp(0, 999_999) as u32,
+    );
     NaiveTime::from_hms_micro_opt(v.hour() as u32, v.minute() as u32, sec, micro)
         .ok_or_else(|| dt_err(format!("invalid time {}", v.hour())))
 }
 
 fn timestamp_to_naive(v: &Timestamp) -> MssqlFdwRqResult<NaiveDateTime> {
     let sec = v.second();
-    let (sec, micro) = (sec.trunc() as u32, (sec.fract() * 1e6).round() as u32);
+    // rounding can yield 1_000_000 micro, which and_hms_micro_opt rejects
+    let (sec, micro) = (
+        sec.trunc() as u32,
+        ((sec.fract() * 1e6).round() as i64).clamp(0, 999_999) as u32,
+    );
     let date =
         NaiveDate::from_ymd_opt(v.year(), v.month() as u32, v.day() as u32).ok_or_else(|| {
             dt_err(format!(

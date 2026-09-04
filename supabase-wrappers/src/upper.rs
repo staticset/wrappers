@@ -318,7 +318,12 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
     }
 
     unsafe {
-        if add_full_query_upper_path::<E, W>(root, stage, input_rel, output_rel) {
+        // same guard as GetForeignJoinPaths: building a remote-query path
+        // constructs an FDW instance, which must not happen at planning time
+        // for FDW types that never execute remote queries
+        if W::supports_remote_query_static()
+            && add_full_query_upper_path::<E, W>(root, stage, input_rel, output_rel)
+        {
             return;
         }
     }
