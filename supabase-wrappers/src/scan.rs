@@ -922,6 +922,10 @@ pub(crate) unsafe fn remote_query_context_from_planner(
             has_unpushed_quals,
             all_referenced_relations_are_foreign: foreign_relations.is_some(),
             foreign_relation_count: foreign_relations.as_ref().map_or(0, Vec::len),
+            foreign_server_oids: foreign_relations
+                .as_ref()
+                .map(|relations| relations.iter().map(|rel| rel.server_oid).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -1531,7 +1535,14 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
         // deletes the plan memory context.
         let fdw_private = serialize_plan_template(&state);
 
-        let scanrelid = if (*baserel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL {
+        // make_foreignscan() requires scanrelid == 0 whenever fdw_scan_tlist
+        // is given, and a valid RT index otherwise. Tie scanrelid to that
+        // invariant instead of reloptkind: partition children and inheritance
+        // members (RELOPT_OTHER_MEMBER_REL) reach the plain-scan branch with
+        // fdw_scan_tlist == NULL and carry a valid relid the executor needs
+        // to resolve their tuple descriptor. Join and upper relations always
+        // have relid == 0, so they are unaffected either way.
+        let scanrelid = if agg_fdw_scan_tlist.is_null() {
             (*baserel).relid
         } else {
             0
@@ -1584,6 +1595,19 @@ pub(super) extern "C-unwind" fn explain_foreign_scan<
 
         let value = ctx.pstrdup(&format!("limit = {:?}", state.limit));
         pg_sys::ExplainPropertyText(label, value, es);
+
+        // postgres_fdw-style visibility: EXPLAIN VERBOSE should answer
+        // "what was pushed down" without needing log_remote_query or the
+        // server log. This is the deparsed PostgreSQL statement; the FDW's
+        // begin_remote_query translates it to the remote dialect at
+        // execution time.
+        if let Some(full_query) = state.full_query.as_ref() {
+            if !full_query.sql.is_empty() {
+                let label = ctx.pstrdup("Remote query");
+                let value = ctx.pstrdup(&full_query.sql);
+                pg_sys::ExplainPropertyText(label, value, es);
+            }
+        }
 
         if !state.aggregates.is_empty() {
             let value = ctx.pstrdup(&format!("aggregates = {:?}", state.aggregates));

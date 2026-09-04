@@ -589,6 +589,12 @@ pub struct RemoteQueryContext {
 
     /// Number of foreign relations referenced by the query.
     pub foreign_relation_count: usize,
+
+    /// OIDs of the foreign servers owning each referenced foreign table (one
+    /// entry per relation, order matching the planner's range table). Empty
+    /// when the query has no foreign relations. A server always belongs to
+    /// exactly one FDW, so a single distinct OID implies a single FDW.
+    pub foreign_server_oids: Vec<pg_sys::Oid>,
 }
 
 impl RemoteQueryContext {
@@ -600,6 +606,18 @@ impl RemoteQueryContext {
             || self.has_non_relation_inputs
             || self.has_non_var_targets
             || self.has_unpushed_quals
+    }
+
+    /// Returns true when all referenced foreign tables belong to a single
+    /// foreign server (and therefore to a single FDW). This is the only shape
+    /// PostgreSQL can hand to `GetForeignJoinPaths`/`GetForeignUpperPaths` as
+    /// one unit; with heterogeneous servers the FDW cannot execute the whole
+    /// statement remotely and must not require a remote-query plan.
+    pub fn foreign_relations_share_server(&self) -> bool {
+        match self.foreign_server_oids.split_first() {
+            None => true,
+            Some((first, rest)) => rest.iter().all(|oid| oid == first),
+        }
     }
 }
 
