@@ -531,7 +531,17 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 Ok(())
             };
             if oid == FOREIGN_SERVER_RELATION_ID {
-                allowed(&["conn_string", "conn_string_id", "log_remote_query", "auth"])?;
+                // tds_version is accepted and ignored: Sber Navigator's
+                // connection flow unconditionally appends `tds_version '7.1'`
+                // to MS SQL server options; tiberius negotiates the protocol
+                // version itself
+                allowed(&[
+                    "conn_string",
+                    "conn_string_id",
+                    "log_remote_query",
+                    "auth",
+                    "tds_version",
+                ])?;
                 if !names.contains(&"conn_string") && !names.contains(&"conn_string_id") {
                     return Err(MssqlFdwRqError::InvalidOption(
                         "either 'conn_string' or 'conn_string_id' is required".to_string(),
