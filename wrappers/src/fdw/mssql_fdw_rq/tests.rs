@@ -544,6 +544,49 @@ mod unit {
         );
     }
 
+    // The deparser prints LIKE/ILIKE as operators (~~ / !~~ / ~~* / !~~*);
+    // until 2026-09-04 the lexer rejected '~' outright, so every LIKE query
+    // under full-query pushdown failed. Patterns are cast by the deparser
+    // ('…'::text) — the cast is dropped; non-ASCII keeps the N prefix.
+    #[test]
+    fn deparser_like_operators() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ 'a%'::text)",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note LIKE 'a%')",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note !~~ 'a%'::text)",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE NOT (note LIKE 'a%')",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~* 'a%'::text)",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (LOWER(note) LIKE LOWER('a%'))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note !~~* 'a%'::text)",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE NOT (LOWER(note) LIKE LOWER('a%'))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ 'От%'::text)",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note LIKE N'От%')",
+        );
+    }
+
+    #[test]
+    fn regex_operator_still_rejected() {
+        // a lone ~ (POSIX regex) stays rejected: only the LIKE family lexes
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE note ~ 'abc'",
+            &orders_ctx(),
+            "~",
+        );
+    }
+
     // #5: the remote-query safety net matches whole identifiers only
     #[test]
     fn mentions_relation_is_lexical() {
@@ -560,6 +603,20 @@ mod unit {
         assert!(!mentions_relation("SELECT * FROM appusers", &rels));
         assert!(!mentions_relation("SELECT 'users in a literal'", &rels));
         assert!(!mentions_relation("SELECT 1 WHERE users.a = 2", &rels));
+
+        // the real deparser shape: FROM ONLY, quoted "?column?" alias,
+        // non-ASCII literal (production regression 2026-09-04)
+        let ms_rels = vec![RelationMapping {
+            local_schema: "ms".into(),
+            local_table: "statuses".into(),
+            remote_schema: "dbo".into(),
+            remote_table: "Statuses".into(),
+        }];
+        assert!(mentions_relation(
+            "SELECT ('x:'::text || (count(*))::text) AS \"?column?\" \
+             FROM ONLY ms.statuses WHERE statusname LIKE 'От%'",
+            &ms_rels
+        ));
     }
 
     #[test]
@@ -1389,6 +1446,40 @@ mod tests {
 
         assert_eq!(junk, reference);
         assert_eq!(junk.len(), 3);
+    }
+
+    // The deparser prints LIKE as the ~~ operator; until 2026-09-04 every
+    // LIKE query under full-query pushdown failed to lex on '~'.
+    #[pg_test]
+    fn full_query_like_operator_pushes_down() {
+        setup_committed();
+
+        let dblink_count = |query: &str| -> i64 {
+            Spi::connect(|c| {
+                let mut rows = c
+                    .select(
+                        &format!(
+                            "SELECT * FROM dblink(\
+                                 format('host=localhost port=%s dbname=rqjoin_test', \
+                                        current_setting('port')), \
+                                 $${query}$$) AS t(cnt bigint)"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap();
+                rows.next()
+                    .and_then(|r| r.get_by_name::<i64, _>("cnt").unwrap())
+                    .unwrap()
+            })
+        };
+
+        let matched = dblink_count("SELECT count(*) AS cnt FROM rqj_orders WHERE status LIKE '%'");
+        let not_null =
+            dblink_count("SELECT count(*) AS cnt FROM rqj_orders WHERE status IS NOT NULL");
+
+        assert_eq!(matched, not_null, "LIKE '%' matches every non-NULL status");
+        assert!(matched > 0);
     }
 
     /// A second server of this FDW pointing at the same MSSQL instance.

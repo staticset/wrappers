@@ -245,6 +245,22 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
             continue;
         }
 
+        // the deparser prints LIKE/ILIKE as operators (`~~`, `!~~`, `~~*`,
+        // `!~~*`) — lex those before the single `~` (regex) is rejected
+        {
+            let like_op = ['~', '!'].contains(&c).then(|| {
+                let rest: String = chars[i..].iter().collect();
+                ["!~~*", "~~*", "!~~", "~~"]
+                    .into_iter()
+                    .find(|op| rest.starts_with(op))
+            });
+            if let Some(op) = like_op.flatten() {
+                out.push(Tok::Op(op.to_string()));
+                i += op.chars().count();
+                continue;
+            }
+        }
+
         if FORBIDDEN_CHARS.contains(&c) {
             let reason = match c {
                 '~' => "POSIX regex operators are not supported".to_string(),
@@ -737,6 +753,22 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "||" => {
                         out.push("+".to_string());
                         i += 1;
+                        continue;
+                    }
+                    // the deparser's operator spellings of LIKE / NOT LIKE /
+                    // ILIKE / NOT ILIKE
+                    "~~" | "!~~" | "~~*" | "!~~*" => {
+                        let case_insensitive = o.ends_with('*');
+                        let negated = o.starts_with('!');
+                        translate_like_operator(
+                            &toks,
+                            i,
+                            &mut out,
+                            &mut i,
+                            case_depth,
+                            case_insensitive,
+                            negated,
+                        )?;
                         continue;
                     }
                     "::" => {
@@ -1435,6 +1467,78 @@ fn translate_ilike(
         format!("({body})")
     });
     *next_i = i + 2;
+    Ok(())
+}
+
+/// `x ~~ 'p%'` / `x !~~* 'p%'` — the deparser's operator spellings of
+/// LIKE / NOT LIKE / ILIKE / NOT ILIKE. The subject expression is already in
+/// `out`; the pattern is a literal (optionally `::text`-cast by the
+/// deparser — the cast is irrelevant for T-SQL pattern comparison), a
+/// column, or a parameter.
+fn translate_like_operator(
+    toks: &[Tok],
+    i: usize,
+    out: &mut Vec<String>,
+    next_i: &mut usize,
+    case_depth: usize,
+    case_insensitive: bool,
+    negated: bool,
+) -> Result<(), TranslateError> {
+    let negated = negated || pop_if_word(out, "not");
+    let start = capture_subject(out, case_depth)?;
+    let lhs = out[start..].join(" ");
+
+    let (rhs, consumed) = match toks.get(i + 1) {
+        Some(Tok::Str(s)) => {
+            let mut used = 1;
+            if matches!(toks.get(i + 2), Some(Tok::Op(o)) if o == "::") {
+                let len = type_token_len(&toks[i + 3..]);
+                if len == 0 {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: "::".to_string(),
+                        reason: "missing type name after cast".to_string(),
+                    });
+                }
+                used += 1 + len;
+            }
+            (tsql_string_literal(s), used)
+        }
+        Some(Tok::Word(w)) => (w.clone(), 1),
+        Some(Tok::QIdent(q)) => (bracket_ident(q)?, 1),
+        Some(Tok::Param(p)) => (format!("@P{p}"), 1),
+        _ => {
+            return Err(TranslateError::UnsupportedConstruct {
+                sql_fragment: "~~ …".to_string(),
+                reason: "LIKE pattern must be a literal, column, or parameter".to_string(),
+            });
+        }
+    };
+
+    // the deparser wraps the operator expression in parens —
+    // `(x ~~ 'p')` — strip them so the rewrite does not double-nest
+    let mut used_total = 1 + consumed;
+    let wrapped_by_parens = start > 0
+        && out.get(start - 1).map(String::as_str) == Some("(")
+        && matches!(toks.get(i + used_total), Some(Tok::Op(o)) if o == ")");
+    let keep_from = if wrapped_by_parens {
+        used_total += 1; // consume the closing paren too
+        start - 1
+    } else {
+        start
+    };
+    out.truncate(keep_from);
+
+    let body = if case_insensitive {
+        format!("LOWER({lhs}) LIKE LOWER({rhs})")
+    } else {
+        format!("{lhs} LIKE {rhs}")
+    };
+    out.push(if negated {
+        format!("NOT ({body})")
+    } else {
+        format!("({body})")
+    });
+    *next_i = i + used_total;
     Ok(())
 }
 
