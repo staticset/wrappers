@@ -45,6 +45,67 @@ pub(super) fn pg_type_to_mssql(pg_name: &str) -> Option<&'static str> {
     })
 }
 
+/// Map an MSSQL type as reported by `INFORMATION_SCHEMA.COLUMNS` to a
+/// PostgreSQL column type for `IMPORT FOREIGN SCHEMA`. Returns `None` for
+/// types this FDW cannot read (xml, json, clr, spatial, hierarchyid…) — such
+/// columns are omitted from the created definition.
+pub(super) fn mssql_type_to_pg(
+    data_type: &str,
+    char_len: Option<i32>,
+    num_precision: Option<i32>,
+    num_scale: Option<i32>,
+    dt_precision: Option<i16>,
+) -> Option<String> {
+    let t = data_type.to_ascii_lowercase();
+    Some(match t.as_str() {
+        "tinyint" | "smallint" => "smallint".to_string(),
+        "int" => "integer".to_string(),
+        "bigint" => "bigint".to_string(),
+        "bit" => "boolean".to_string(),
+        "decimal" | "numeric" => match (num_precision, num_scale) {
+            (Some(p), Some(s)) => format!("numeric({p}, {s})"),
+            _ => "numeric".to_string(),
+        },
+        "money" => "numeric(19, 4)".to_string(),
+        "smallmoney" => "numeric(10, 4)".to_string(),
+        // MSSQL float(p): p ≤ 24 is a 4-byte real
+        "float" => match num_precision {
+            Some(p) if p <= 24 => "real".to_string(),
+            _ => "double precision".to_string(),
+        },
+        "real" => "real".to_string(),
+        "date" => "date".to_string(),
+        "datetime" => "timestamp(3) without time zone".to_string(),
+        "smalldatetime" => "timestamp(0) without time zone".to_string(),
+        "datetime2" => match dt_precision {
+            Some(p) if (0..=7).contains(&p) => {
+                format!("timestamp({}) without time zone", p.min(6))
+            }
+            _ => "timestamp without time zone".to_string(),
+        },
+        "datetimeoffset" => match dt_precision {
+            Some(p) if (0..=7).contains(&p) => {
+                format!("timestamp({}) with time zone", p.min(6))
+            }
+            _ => "timestamp with time zone".to_string(),
+        },
+        "time" => "time without time zone".to_string(),
+        "char" | "nchar" => match char_len {
+            Some(n) if n > 0 => format!("char({n})"),
+            _ => "char(1)".to_string(),
+        },
+        // -1 / NULL length means (MAX) or a text type → unlimited
+        "varchar" | "nvarchar" | "text" | "ntext" => match char_len {
+            Some(n) if n > 0 => format!("varchar({n})"),
+            _ => "text".to_string(),
+        },
+        "uniqueidentifier" => "uuid".to_string(),
+        // includes the deprecated `timestamp` alias of rowversion
+        "binary" | "varbinary" | "image" | "timestamp" | "rowversion" => "bytea".to_string(),
+        _ => return None,
+    })
+}
+
 /// Recognize a PostgreSQL type name (used for SQL typed literals like
 /// `DATE '2026-01-01'`). Includes types we cannot map so the translator can
 /// reject their literals explicitly.

@@ -587,6 +587,69 @@ mod unit {
         );
     }
 
+    // -- Navigator integration: IMPORT FOREIGN SCHEMA type mapping -----------
+
+    #[test]
+    fn mssql_type_map_for_import() {
+        use super::super::types::mssql_type_to_pg as map;
+
+        assert_eq!(
+            map("int", None, None, None, None).as_deref(),
+            Some("integer")
+        );
+        assert_eq!(
+            map("bigint", None, None, None, None).as_deref(),
+            Some("bigint")
+        );
+        assert_eq!(
+            map("bit", None, None, None, None).as_deref(),
+            Some("boolean")
+        );
+        assert_eq!(
+            map("numeric", None, Some(18), Some(2), None).as_deref(),
+            Some("numeric(18, 2)")
+        );
+        assert_eq!(
+            map("money", None, None, None, None).as_deref(),
+            Some("numeric(19, 4)")
+        );
+        assert_eq!(
+            map("float", None, Some(53), None, None).as_deref(),
+            Some("double precision")
+        );
+        assert_eq!(
+            map("float", None, Some(24), None, None).as_deref(),
+            Some("real")
+        );
+        assert_eq!(
+            map("datetime2", None, None, None, Some(7)).as_deref(),
+            Some("timestamp(6) without time zone")
+        );
+        assert_eq!(
+            map("datetimeoffset", None, None, None, Some(3)).as_deref(),
+            Some("timestamp(3) with time zone")
+        );
+        assert_eq!(
+            map("nvarchar", Some(-1), None, None, None).as_deref(),
+            Some("text")
+        );
+        assert_eq!(
+            map("nvarchar", Some(100), None, None, None).as_deref(),
+            Some("varchar(100)")
+        );
+        assert_eq!(
+            map("uniqueidentifier", None, None, None, None).as_deref(),
+            Some("uuid")
+        );
+        assert_eq!(
+            map("varbinary", Some(8000), None, None, None).as_deref(),
+            Some("bytea")
+        );
+        // unreadable types are omitted from imported definitions
+        assert_eq!(map("xml", None, None, None, None), None);
+        assert_eq!(map("hierarchyid", None, None, None, None), None);
+    }
+
     // #5: the remote-query safety net matches whole identifiers only
     #[test]
     fn mentions_relation_is_lexical() {
@@ -1480,6 +1543,87 @@ mod tests {
 
         assert_eq!(matched, not_null, "LIKE '%' matches every non-NULL status");
         assert!(matched > 0);
+    }
+
+    // Sber Navigator integration: it creates foreign tables with the
+    // tds_fdw-compatible option spellings (schema_name/table_name) and its
+    // templates build the server from host/port/database + a username/
+    // password user mapping.
+    #[pg_test]
+    fn navigator_compatible_table_options() {
+        setup();
+
+        // tds_fdw spelling of table options on the scan path
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_orders_nav (\
+               id bigint, status text, total_amount numeric(18,2) \
+             ) SERVER mssql_rq_srv OPTIONS (schema_name 'dbo', table_name 'orders')",
+        )
+        .unwrap();
+        let cnt: i64 = Spi::get_one("SELECT count(*) FROM rq_orders_nav WHERE total_amount > 0")
+            .unwrap()
+            .unwrap();
+        assert!(cnt > 0, "aliased options must drive a plain scan");
+        Spi::run("DROP FOREIGN TABLE rq_orders_nav").unwrap();
+    }
+
+    // IMPORT FOREIGN SCHEMA — how BI tools introspect a source. Runs through
+    // a dblink session: the FDW's stats collector calls SPI, and SPI from an
+    // FDW callback nested inside a utility statement trips a pgrx type-read
+    // race under #[pg_test]'s SPI nesting (same class as the PREPARE/EXECUTE
+    // workaround); a top-level session, which is what Navigator uses, is
+    // unaffected.
+    #[pg_test]
+    fn import_foreign_schema_via_top_level_session() {
+        setup_committed();
+
+        let conn = Spi::get_one::<String>(
+            "SELECT format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))",
+        )
+        .unwrap()
+        .unwrap();
+
+        Spi::run(&format!(
+            "SELECT dblink_exec('{conn}', $q$CREATE SCHEMA nav_import$q$)"
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "SELECT dblink_exec('{conn}', $q$\
+             IMPORT FOREIGN SCHEMA dbo LIMIT TO (orders, customers) \
+             FROM SERVER rqj_srv INTO nav_import$q$)"
+        ))
+        .unwrap();
+
+        let imported: String = Spi::get_one(&format!(
+            "SELECT (SELECT c FROM dblink('{conn}', \
+                     $$SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname), '<none>') \
+                       FROM pg_foreign_table ft \
+                       JOIN pg_class c ON c.oid = ft.ftrelid \
+                       JOIN pg_namespace n ON n.oid = c.relnamespace \
+                       WHERE n.nspname = 'nav_import'$$) AS t(c text))"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            imported.as_str(),
+            "customers,orders",
+            "LIMIT TO must import exactly the listed tables"
+        );
+
+        let orders: i64 = Spi::get_one(&format!(
+            "SELECT (SELECT count(*) FROM dblink('{conn}', \
+                     $$SELECT count(*) FROM nav_import.orders$$) AS t(c bigint))"
+        ))
+        .unwrap()
+        .unwrap();
+        let customers: i64 = Spi::get_one(&format!(
+            "SELECT (SELECT count(*) FROM dblink('{conn}', \
+                     $$SELECT count(*) FROM nav_import.customers$$) AS t(c bigint))"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(orders > 0, "imported orders table must be queryable");
+        assert!(customers > 0, "imported customers table must be queryable");
     }
 
     /// A second server of this FDW pointing at the same MSSQL instance.

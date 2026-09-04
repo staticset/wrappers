@@ -303,11 +303,13 @@ impl MssqlFdwRq {
     }
 
     /// SQL Server credentials from the user mapping, if provided there.
+    /// `username` is accepted alongside `user` — it is the spelling tools
+    /// generate for tds_fdw-compatible sources (Sber Navigator's templates).
     fn user_mapping_auth(
         server_oid: pg_sys::Oid,
     ) -> MssqlFdwRqResult<Option<tiberius::AuthMethod>> {
         let options = unsafe { Self::user_mapping_options(server_oid) };
-        let user = options.get("user");
+        let user = options.get("user").or_else(|| options.get("username"));
         let password = match options.get("password") {
             Some(p) => Some(p.clone()),
             None => options
@@ -329,11 +331,13 @@ impl MssqlFdwRq {
         }
     }
 
-    /// Resolve the remote name for a relation from its foreign table options.
+    /// Resolve the remote name for a relation from its foreign table options
+    /// (`table_name`/`schema_name` are the tds_fdw/Navigator spellings).
     fn relation_mapping(rel: &FullQueryRelation) -> MssqlFdwRqResult<RelationMapping> {
         let remote_table = rel
             .options
             .get("table")
+            .or_else(|| rel.options.get("table_name"))
             .ok_or_else(|| {
                 MssqlFdwRqError::InvalidOption(format!(
                     "foreign table {}.{} is missing the 'table' option",
@@ -344,6 +348,7 @@ impl MssqlFdwRq {
         let remote_schema = rel
             .options
             .get("schema")
+            .or_else(|| rel.options.get("schema_name"))
             .cloned()
             .unwrap_or_else(|| "dbo".to_string());
         Ok(RelationMapping {
@@ -533,10 +538,16 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                     ));
                 }
             } else if oid == FOREIGN_TABLE_RELATION_ID {
-                allowed(&["schema", "table", "updatable"])?;
-                check_options_contain(&options, "table")?;
+                // schema_name/table_name are the tds_fdw/Navigator spellings;
+                // schema/table are this FDW's native ones
+                allowed(&["schema", "schema_name", "table", "table_name", "updatable"])?;
+                if !names.contains(&"table") && !names.contains(&"table_name") {
+                    return Err(MssqlFdwRqError::InvalidOption(
+                        "option 'table' (or 'table_name') is required".to_string(),
+                    ));
+                }
             } else if oid == pg_sys::UserMappingRelationId {
-                allowed(&["user", "password", "password_id"])?;
+                allowed(&["user", "username", "password", "password_id"])?;
             }
         }
         Ok(())
@@ -645,9 +656,18 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
     ) -> MssqlFdwRqResult<()> {
         let remote_schema = options
             .get("schema")
+            .or_else(|| options.get("schema_name"))
             .cloned()
             .unwrap_or_else(|| "dbo".to_string());
-        let remote_table = require_option("table", options)?.to_string();
+        let remote_table = options
+            .get("table")
+            .or_else(|| options.get("table_name"))
+            .ok_or_else(|| {
+                MssqlFdwRqError::InvalidOption(
+                    "option 'table' (or 'table_name') is required".to_string(),
+                )
+            })?
+            .to_string();
 
         self.tgt_cols = columns.to_vec();
         self.rescan_plan = Some(ScanPlan::Plain {
@@ -723,6 +743,143 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         self.flush_row_stats();
         self.rx = None;
         Ok(())
+    }
+
+    // -- IMPORT FOREIGN SCHEMA (what BI tools use to introspect a source) --
+
+    fn import_foreign_schema(
+        &mut self,
+        stmt: ImportForeignSchemaStmt,
+    ) -> MssqlFdwRqResult<Vec<String>> {
+        // ImportSchemaType is re-exported through the prelude
+
+        // one row per column of every base table in the remote schema
+        let sql = "SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, \
+                   c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, \
+                   c.NUMERIC_SCALE, c.DATETIME_PRECISION, c.IS_NULLABLE \
+                   FROM INFORMATION_SCHEMA.COLUMNS c \
+                   JOIN INFORMATION_SCHEMA.TABLES t \
+                     ON t.TABLE_SCHEMA = c.TABLE_SCHEMA \
+                    AND t.TABLE_NAME = c.TABLE_NAME \
+                    AND t.TABLE_TYPE = 'BASE TABLE' \
+                   WHERE c.TABLE_SCHEMA = @P1 \
+                   ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION";
+        let params: Vec<Box<dyn tiberius::ToSql>> = vec![Box::new(stmt.remote_schema.clone())];
+        let mut rx = self.spawn_streaming_query(sql.to_string(), params)?;
+
+        // (table → ordered column definitions) preserving remote order
+        let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let catalog_null = || {
+            MssqlFdwRqError::InvalidOption(
+                "unexpected NULL in INFORMATION_SCHEMA result".to_string(),
+            )
+        };
+        while let Some(item) = self.rt.block_on(rx.recv()) {
+            let row = item?;
+            let table = row
+                .try_get::<&str, usize>(0)?
+                .ok_or_else(catalog_null)?
+                .to_string();
+            let column = row
+                .try_get::<&str, usize>(1)?
+                .ok_or_else(catalog_null)?
+                .to_string();
+            let data_type = row
+                .try_get::<&str, usize>(2)?
+                .ok_or_else(catalog_null)?
+                .to_string();
+            // INFORMATION_SCHEMA numeric columns come back in varying MSSQL
+            // integer widths (tinyint/smallint/int) — try each width
+            let as_i64 = |row: &tiberius::Row, idx: usize| -> Option<i64> {
+                if let Ok(v) = row.try_get::<i64, usize>(idx) {
+                    return v;
+                }
+                if let Ok(v) = row.try_get::<i32, usize>(idx) {
+                    return v.map(i64::from);
+                }
+                if let Ok(v) = row.try_get::<i16, usize>(idx) {
+                    return v.map(i64::from);
+                }
+                if let Ok(v) = row.try_get::<u8, usize>(idx) {
+                    return v.map(i64::from);
+                }
+                None
+            };
+            let as_i32 = |row: &tiberius::Row, idx: usize| -> Option<i32> {
+                as_i64(row, idx).and_then(|v| i32::try_from(v).ok())
+            };
+            let char_len = as_i32(&row, 3);
+            let num_precision = as_i32(&row, 4);
+            let num_scale = as_i32(&row, 5);
+            let dt_precision = as_i32(&row, 6).map(|v| v as i16);
+            let not_nullable = matches!(
+                row.try_get::<&str, usize>(7)?,
+                Some(v) if v.eq_ignore_ascii_case("NO")
+            );
+
+            // honor LIMIT TO / EXCEPT
+            let listed = stmt
+                .table_list
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&table));
+            let wanted = match stmt.list_type {
+                ImportSchemaType::FdwImportSchemaLimitTo => listed,
+                ImportSchemaType::FdwImportSchemaExcept => !listed,
+                ImportSchemaType::FdwImportSchemaAll => true,
+            };
+            if !wanted {
+                continue;
+            }
+
+            let Some(pg_type) = types::mssql_type_to_pg(
+                &data_type,
+                char_len,
+                num_precision,
+                num_scale,
+                dt_precision,
+            ) else {
+                // unreadable column: leave it out of the definition rather
+                // than out of the whole table
+                continue;
+            };
+
+            let i = *index.entry(table.clone()).or_insert_with(|| {
+                tables.push((table.clone(), Vec::new()));
+                tables.len() - 1
+            });
+            tables[i].1.push(format!(
+                "\"{}\" {}{}",
+                column.replace('"', "\"\""),
+                pg_type,
+                if not_nullable { " NOT NULL" } else { "" },
+            ));
+        }
+
+        // build CREATE FOREIGN TABLE statements; tables whose columns were
+        // all unreadable are skipped. Following postgres_fdw/mysql_fdw, the
+        // table name stays unqualified — the core server rewrites it into
+        // the target local schema.
+        let quote_ident = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let quote_literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let stmts: Vec<String> = tables
+            .into_iter()
+            .filter(|(_, cols)| !cols.is_empty())
+            .map(|(table, cols)| {
+                format!(
+                    "CREATE FOREIGN TABLE {} ({}) SERVER {} OPTIONS (schema_name {}, table_name {})",
+                    quote_ident(&table),
+                    cols.join(", "),
+                    quote_ident(&stmt.server_name),
+                    quote_literal(&stmt.remote_schema),
+                    quote_literal(&table),
+                )
+            })
+            .collect();
+        for s in &stmts {
+            pgrx::log!("mssql_fdw_rq: import: {s}");
+        }
+        Ok(stmts)
     }
 
     // -- read-only: modifications are rejected (TZ §5.2) ----------------------
