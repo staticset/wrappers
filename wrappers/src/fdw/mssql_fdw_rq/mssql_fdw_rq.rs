@@ -152,6 +152,46 @@ pub(super) fn plain_scan_sql(
     Ok((sql, params))
 }
 
+/// Cloneable blueprint of the running scan so a rescan can replay it:
+/// [`MssqlFdwRq::spawn_streaming_query`] opens a fresh connection and
+/// consumes its parameters by value, so the statement is rebuilt from
+/// these inputs each time it (re-)executes.
+enum ScanPlan {
+    /// plain single-table scan: rebuildable with [`plain_scan_sql`]
+    Plain {
+        remote_schema: String,
+        remote_table: String,
+        columns: Vec<Column>,
+        quals: Vec<Qual>,
+    },
+    /// full-query pushdown: the translated T-SQL plus the framework's
+    /// evaluated query parameters
+    Remote {
+        tsql: String,
+        parameters: Vec<RemoteQueryParameter>,
+    },
+}
+
+impl ScanPlan {
+    fn materialize(&self) -> MssqlFdwRqResult<(String, Vec<Box<dyn tiberius::ToSql>>)> {
+        match self {
+            Self::Plain {
+                remote_schema,
+                remote_table,
+                columns,
+                quals,
+            } => plain_scan_sql(remote_schema, remote_table, columns, quals),
+            Self::Remote { tsql, parameters } => {
+                let params = parameters
+                    .iter()
+                    .map(|p| types::value_to_sql(p.value.as_ref(), p.type_oid))
+                    .collect::<MssqlFdwRqResult<Vec<_>>>()?;
+                Ok((tsql.clone(), params))
+            }
+        }
+    }
+}
+
 #[wrappers_fdw(
     version = "0.1.0",
     author = "Rubicon",
@@ -167,6 +207,8 @@ pub(crate) struct MssqlFdwRq {
     rx: Option<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>,
     rows_out: i64,
     tgt_cols: Vec<Column>,
+    /// what to re-execute when PostgreSQL rescans this ForeignScan
+    rescan_plan: Option<ScanPlan>,
 }
 
 impl MssqlFdwRq {
@@ -396,6 +438,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             rx: None,
             rows_out: 0,
             tgt_cols: Vec::new(),
+            rescan_plan: None,
         })
     }
 
@@ -510,6 +553,10 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .collect::<MssqlFdwRqResult<_>>()?;
 
         self.tgt_cols = query.columns.clone();
+        self.rescan_plan = Some(ScanPlan::Remote {
+            tsql: tsql.clone(),
+            parameters: query.parameters.clone(),
+        });
         let started = Instant::now();
         self.rx = Some(self.spawn_streaming_query(tsql.clone(), params)?);
         self.rows_out = 0;
@@ -541,6 +588,12 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         let remote_table = require_option("table", options)?.to_string();
 
         self.tgt_cols = columns.to_vec();
+        self.rescan_plan = Some(ScanPlan::Plain {
+            remote_schema: remote_schema.clone(),
+            remote_table: remote_table.clone(),
+            columns: columns.to_vec(),
+            quals: quals.to_vec(),
+        });
 
         let (sql, params) = plain_scan_sql(&remote_schema, &remote_table, columns, quals)?;
 
@@ -583,14 +636,23 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
     }
 
     fn re_scan(&mut self) -> MssqlFdwRqResult<()> {
-        // a stream cannot be rewound, and re-running the query would double
-        // the round trips; reject rescan explicitly instead of misbehaving
-        Err(MssqlFdwRqError::UnsupportedConstruct(
-            translator::TranslateError::UnsupportedConstruct {
-                sql_fragment: "RESCAN".to_string(),
-                reason: "rescans are not supported by the streaming executor".to_string(),
-            },
-        ))
+        // PostgreSQL replays this scan from the beginning — typically the
+        // inner side of a nested-loop join. The framework already routed
+        // parameter changes through end_scan/begin_scan, so here the
+        // statement is unchanged: cancel the running stream (dropping the
+        // receiver aborts the background query) and execute it again on a
+        // fresh connection.
+        let (sql, params) = match self.rescan_plan.as_ref() {
+            Some(plan) => plan.materialize()?,
+            None => return Ok(()),
+        };
+        if self.log_remote_query {
+            pgrx::log!("mssql_fdw_rq: remote query rescan: {sql}");
+        }
+        self.rx = None;
+        self.rx = Some(self.spawn_streaming_query(sql, params)?);
+        self.rows_out = 0;
+        Ok(())
     }
 
     fn end_scan(&mut self) -> MssqlFdwRqResult<()> {

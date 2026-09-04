@@ -1206,14 +1206,10 @@ mod tests {
         assert_eq!(pg.len(), 60);
     }
 
-    // Regression: a join between foreign tables of two distinct servers of
-    // this FDW. PostgreSQL never hands such a join to GetForeignJoinPaths,
-    // so a Require policy can only dead-end into a hard error at plan time.
-    // The FDW must downgrade to Optional and let PostgreSQL join the two
-    // remote scans locally.
-    #[pg_test]
-    fn cross_server_join_falls_back_to_local_join() {
-        setup();
+    /// A second server of this FDW pointing at the same MSSQL instance.
+    /// Two distinct servers keep the remote-query policy at Optional, so
+    /// joins between the tables run as local joins over remote scans.
+    fn setup_second_server() {
         Spi::run(&format!(
             "CREATE SERVER mssql_rq_srv2 FOREIGN DATA WRAPPER mssql_fdw_rq_fwd \
              OPTIONS (conn_string '{}')",
@@ -1232,6 +1228,17 @@ mod tests {
              ) SERVER mssql_rq_srv2 OPTIONS (schema 'dbo', table 'orders')",
         )
         .unwrap();
+    }
+
+    // Regression: a join between foreign tables of two distinct servers of
+    // this FDW. PostgreSQL never hands such a join to GetForeignJoinPaths,
+    // so a Require policy can only dead-end into a hard error at plan time.
+    // The FDW must downgrade to Optional and let PostgreSQL join the two
+    // remote scans locally.
+    #[pg_test]
+    fn cross_server_join_falls_back_to_local_join() {
+        setup();
+        setup_second_server();
 
         // planning alone used to raise
         // "remote-query execution is required by this FDW ..."
@@ -1241,10 +1248,6 @@ mod tests {
         )
         .unwrap();
 
-        // hash/merge join keeps one scan per side; a nested loop would
-        // rescan the inner foreign table, which is the known streaming
-        // executor limitation (#9), not this fix
-        Spi::run("SET LOCAL enable_nestloop = off").unwrap();
         let joined: i64 =
             Spi::get_one("SELECT count(*) FROM rq_orders o JOIN rq_orders2 o2 ON o.id = o2.id")
                 .unwrap()
@@ -1253,6 +1256,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(joined, total, "cross-server join should return all rows");
+    }
+
+    // #9: the inner side of a nested-loop join is rescanned with unchanged
+    // parameters; the FDW replays the remote stream on a fresh connection
+    // instead of failing with "rescans are not supported by the streaming
+    // executor".
+    #[pg_test]
+    fn nested_loop_rescan_replays_the_remote_stream() {
+        setup();
+        setup_second_server();
+
+        let reference: i64 =
+            Spi::get_one("SELECT count(*) FROM rq_orders o JOIN rq_orders2 o2 ON o.id = o2.id")
+                .unwrap()
+                .unwrap();
+
+        // force a nested loop without a Materialize shield so the foreign
+        // scan itself is the rescanned inner side
+        Spi::run(
+            "SET LOCAL enable_hashjoin = off; \
+             SET LOCAL enable_mergejoin = off; \
+             SET LOCAL enable_material = off;",
+        )
+        .unwrap();
+        let nested: i64 =
+            Spi::get_one("SELECT count(*) FROM rq_orders o JOIN rq_orders2 o2 ON o.id = o2.id")
+                .unwrap()
+                .unwrap();
+
+        assert!(reference > 0);
+        assert_eq!(nested, reference, "rescanned inner scan must replay rows");
     }
 
     #[pg_test(error = "option 'rowid_column' is required")]

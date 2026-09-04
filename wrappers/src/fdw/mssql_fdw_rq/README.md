@@ -114,7 +114,11 @@ Manual checklist (not covered by CI):
   PL/pgSQL resolve to the enclosing statement and are rejected with an
   explicit error instead of sending unrelated SQL. Top-level statements
   (psql, drivers, BI tools) are unaffected.
-- Rescans (`RESCAN` plan nodes) are rejected by the streaming executor.
+- Rescans are replayed: the scan's statement is re-executed on a fresh
+  connection with the same parameters (a nested-loop inner side costs one
+  remote round trip per outer row — check the plan before forcing nested
+  loops). Parameter changes restart the scan through the framework with the
+  new values.
 - LOB(MAX) types (`nvarchar(max)` etc.), `xml`, JSON and spatial types are
   rejected explicitly; array-valued columns are not supported in v1
   (`IN` / `= ANY` / `<> ALL` filters over regular columns are).
