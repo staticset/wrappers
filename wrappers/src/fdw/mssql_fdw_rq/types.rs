@@ -4,7 +4,6 @@
 use std::str::FromStr;
 
 use chrono::{Datelike, Timelike};
-use num_traits::ToPrimitive;
 use pgrx::datum::{Date, Time, Timestamp, TimestampWithTimeZone};
 use pgrx::pg_sys;
 use pgrx::varlena::rust_byte_slice_to_bytea;
@@ -33,7 +32,9 @@ pub(super) fn pg_type_to_mssql(pg_name: &str) -> Option<&'static str> {
         "float8" | "double precision" => "float(53)",
         "numeric" | "decimal" => "numeric(38, 10)",
         "bool" | "boolean" => "bit",
-        "text" | "varchar" | "bpchar" | "char" | "name" => "nvarchar(4000)",
+        "text" | "varchar" | "character varying" | "bpchar" | "char" | "character" | "name" => {
+            "nvarchar(4000)"
+        }
         "uuid" => "uniqueidentifier",
         "bytea" => "varbinary(8000)",
         "date" => "date",
@@ -305,19 +306,17 @@ fn utc_to_pgrx(v: DateTime<Utc>) -> MssqlFdwRqResult<TimestampWithTimeZone> {
 /// Copy the payload of a PostgreSQL `bytea` datum into an owned buffer.
 ///
 /// # Safety
-/// `ptr` must be a valid `bytea` datum (4-byte varlena header, as produced by
-/// the server for on-disk/` toast-free` datums handed to FDWs).
+/// `ptr` must be a valid `bytea` datum. It may use a short (1-byte) varlena
+/// header or be TOASTed; detoasting through pgrx handles both instead of
+/// assuming the 4-byte header layout.
 unsafe fn bytea_to_vec(ptr: *mut pg_sys::bytea) -> Vec<u8> {
-    // SAFETY: caller guarantees a valid bytea datum with a 4-byte varlena
-    // header; we only read within its varsize() bounds.
+    // SAFETY: caller guarantees a valid bytea datum; varlena_to_byte_slice
+    // detoasts and reads only within the datum's own bounds.
     unsafe {
         if ptr.is_null() {
             return Vec::new();
         }
-        // varsize() includes the 4-byte varlena header
-        let total = pgrx::varlena::varsize(ptr as *const pg_sys::varlena);
-        let len = total.saturating_sub(4);
-        std::slice::from_raw_parts((ptr as *const u8).add(4), len).to_vec()
+        pgrx::varlena::varlena_to_byte_slice(ptr.cast()).to_vec()
     }
 }
 
@@ -453,8 +452,11 @@ pub(super) fn field_to_cell(
         PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => {
             // decimal, or an int/float aggregate result coerced to numeric
             if let Ok(v) = src_row.try_get::<Decimal, usize>(idx) {
-                v.and_then(|d| d.to_f64())
-                    .map(pgrx::AnyNumeric::try_from)
+                // Converting Decimal through f64 silently corrupts money
+                // values (999999999999999.99 == DECIMAL(18,2) max rounds to
+                // exactly 1000000000000000). AnyNumeric parses the decimal
+                // string representation exactly.
+                v.map(|d| pgrx::AnyNumeric::from_str(&d.to_string()))
                     .transpose()?
                     .map(Cell::Numeric)
             } else if let Ok(v) = src_row.try_get::<i64, usize>(idx) {
@@ -463,7 +465,8 @@ pub(super) fn field_to_cell(
                 v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
             } else {
                 let v = src_row.try_get::<f64, usize>(idx)?;
-                v.and_then(|x| pgrx::AnyNumeric::try_from(x).ok())
+                v.map(pgrx::AnyNumeric::try_from)
+                    .transpose()?
                     .map(Cell::Numeric)
             }
         }

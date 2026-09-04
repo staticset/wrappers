@@ -146,11 +146,23 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
         }
 
         if c == '\'' || (matches!(c, 'E' | 'e') && chars.get(i + 1) == Some(&'\'')) {
-            i += if c == '\'' { 1 } else { 2 };
+            let is_escape_string = c != '\'';
+            i += if is_escape_string { 2 } else { 1 };
             let mut s = String::new();
             loop {
                 match chars.get(i) {
                     None => return Err(TranslateError::Unterminated("string literal".into())),
+                    // E'' only: a backslash escapes the next character, so
+                    // `\'` does not close the literal. Keep the pair raw and
+                    // decode below so trailing-backslash forms match PG.
+                    Some('\\') if is_escape_string => {
+                        let Some(&next) = chars.get(i + 1) else {
+                            return Err(TranslateError::Unterminated("string literal".into()));
+                        };
+                        s.push('\\');
+                        s.push(next);
+                        i += 2;
+                    }
                     Some('\'') if chars.get(i + 1) == Some(&'\'') => {
                         s.push('\'');
                         i += 2;
@@ -165,7 +177,11 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
                     }
                 }
             }
-            // E'' escape sequences are not translated in v1
+            let s = if is_escape_string {
+                decode_escape_string(&s)?
+            } else {
+                s
+            };
             out.push(Tok::Str(s));
             continue;
         }
@@ -262,6 +278,34 @@ fn lex(src: &str) -> Result<Vec<Tok>, TranslateError> {
         });
     }
 
+    Ok(out)
+}
+
+/// Decode a PostgreSQL `E'…'` escape-string body (quote doubling and raw
+/// backslash pairs are already in `s`). Escape meanings follow PostgreSQL:
+/// `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, and any other `\x` yields `x`
+/// (this covers `\\`, `\'`, `\"`).
+fn decode_escape_string(s: &str) -> Result<String, TranslateError> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            None => {
+                return Err(TranslateError::Unterminated("escape sequence".into()));
+            }
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\u{000B}'),
+            Some(other) => out.push(other),
+        }
+    }
     Ok(out)
 }
 
@@ -895,6 +939,18 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     {
                         if let Ok(start) = capture_subject(&out, case_depth) {
                             let expr = out[start..].join(" ");
+                            // a composite key (`price + id`) would have its
+                            // nullability judged by the last operand only;
+                            // refuse it instead of trusting the wrong check
+                            if !is_whole_order_item(&out, start) {
+                                return Err(TranslateError::UnsupportedConstruct {
+                                    sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                    reason: format!(
+                                        "composite ORDER BY keys inside a window cannot \
+                                         be NULL-corrected in T-SQL (expr={expr:?})"
+                                    ),
+                                });
+                            }
                             let bare_not_null = out.len() - start == 1
                                 && !expr.contains(' ')
                                 && ctx.not_null_columns.contains(&expr.to_lowercase());
@@ -938,6 +994,19 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             // opposite of T-SQL default → prepend CASE tiebreaker
                             let start = capture_subject(&out, case_depth)?;
                             let expr = out[start..].join(" ");
+                            if !is_whole_order_item(&out, start) {
+                                return Err(TranslateError::UnsupportedConstruct {
+                                    sql_fragment: format!(
+                                        "ORDER BY {} NULLS …",
+                                        order_item_fragment(&out, start)
+                                    ),
+                                    reason: "composite ORDER BY keys cannot carry \
+                                             PostgreSQL NULL ordering in T-SQL; \
+                                             sort by a column or parenthesize the \
+                                             expression"
+                                        .to_string(),
+                                });
+                            }
                             out.truncate(start);
                             out.push(format!(
                                 "CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END{}",
@@ -1046,6 +1115,30 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     Ok(join_pieces(&out))
 }
 
+/// True when the subject captured at `start` spans a complete top-level or
+/// window ORDER BY item: the piece before it must open the item (`ORDER BY`)
+/// or separate items (`,`). Otherwise the item is a composite expression and
+/// only its last operand was captured — rewriting it into a NULL-tiebreaker
+/// pair would silently reorder rows, so callers reject it (fail-closed).
+fn is_whole_order_item(out: &[String], start: usize) -> bool {
+    start == 0
+        || matches!(
+            out.get(start - 1).map(String::as_str),
+            Some("ORDER BY" | ",")
+        )
+}
+
+/// Render the full ORDER BY item that `start` was captured from, walking back
+/// to the item's opening piece — used for error diagnostics so the reported
+/// fragment shows `amount + fee`, not just the captured `fee`.
+fn order_item_fragment(out: &[String], start: usize) -> String {
+    let mut item_start = start;
+    while item_start > 0 && !matches!(out[item_start - 1].as_str(), "ORDER BY" | ",") {
+        item_start -= 1;
+    }
+    out[item_start..].join(" ")
+}
+
 /// Finish one top-level ORDER BY item: re-emit it with a NULL tiebreaker
 /// that reproduces PostgreSQL's implicit NULL ordering (ASC → NULLS LAST,
 /// DESC → NULLS FIRST) unless the item is a plain NOT NULL column, which
@@ -1058,6 +1151,15 @@ fn close_order_item(
 ) -> Result<(), TranslateError> {
     let start = capture_subject(out, case_depth)?;
     let expr = out[start..].join(" ");
+    if !is_whole_order_item(out, start) {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("ORDER BY {}", order_item_fragment(out, start)),
+            reason: "composite ORDER BY keys cannot carry PostgreSQL NULL \
+                     ordering in T-SQL; sort by a column or parenthesize the \
+                     expression"
+                .to_string(),
+        });
+    }
     let bare_not_null = out.len() - start == 1
         && !expr.contains(' ')
         && ctx.not_null_columns.contains(&expr.to_lowercase());
@@ -1193,20 +1295,55 @@ fn capture_subject(out: &[String], case_depth: usize) -> Result<usize, Translate
 // Cast type parsing
 // ---------------------------------------------------------------------------
 
+/// Multi-word built-in type names a deparsed `::` cast can spell out. Matched
+/// greedily after the optional schema qualifier; longest names first.
+const MULTIWORD_PG_TYPES: [&str; 6] = [
+    "timestamp with time zone",
+    "timestamp without time zone",
+    "time with time zone",
+    "time without time zone",
+    "double precision",
+    "character varying",
+];
+
 /// Number of tokens (starting at `toks`) occupied by a type name, including an
-/// optional `pg_catalog.` qualifier and an optional `(n[,m])` modifier.
+/// optional `pg_catalog.` qualifier, multi-word built-in names (`timestamp
+/// with time zone`), and an optional `(n[,m])` modifier.
 fn type_token_len(toks: &[Tok]) -> usize {
-    let mut len = 0usize;
-    // optional qualifier: word . word
-    if let (Some(Tok::Word(_)), Some(Tok::Op(o)), Some(Tok::Word(_))) =
-        (toks.first(), toks.get(1), toks.get(2))
-        && o == "."
-    {
-        len += 3;
+    // optional qualifier `word . word`: the triple already includes the
+    // first word of the type name (pg_catalog.int8)
+    let qualified = matches!(
+        (toks.first(), toks.get(1), toks.get(2)),
+        (Some(Tok::Word(_)), Some(Tok::Op(o)), Some(Tok::Word(_))) if o == "."
+    );
+    // index of the first type-name word
+    let name_start = if qualified { 2 } else { 0 };
+
+    // multi-word names: `timestamp with time zone` truncated to `timestamp`
+    // used to emit `CAST(x AS datetime2)` and leave `with time zone` behind
+    // as stray tokens — a T-SQL syntax error on plain timestamp queries
+    let mut len = if qualified { 3 } else { 0 };
+    let mut matched_multi = false;
+    for multi in MULTIWORD_PG_TYPES {
+        let words: Vec<&str> = multi.split(' ').collect();
+        let end = name_start + words.len();
+        if toks.len() >= end
+            && toks[name_start..end]
+                .iter()
+                .enumerate()
+                .all(|(k, t)| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case(words[k])))
+        {
+            len = end;
+            matched_multi = true;
+            break;
+        }
     }
-    if len == 0 {
-        if toks.first().is_some_and(|t| matches!(t, Tok::Word(_))) {
-            len += 1;
+    if !matched_multi {
+        if toks
+            .get(name_start)
+            .is_some_and(|t| matches!(t, Tok::Word(_)))
+        {
+            len = name_start + 1;
         } else {
             return 0;
         }
@@ -1230,18 +1367,24 @@ fn type_token_len(toks: &[Tok]) -> usize {
 
 fn parse_cast_type(toks: &[Tok]) -> Result<&'static str, TranslateError> {
     let len = type_token_len(toks);
-    // keep only the last name component (pg_catalog.int8 → int8)
-    let mut name = String::new();
-    for t in &toks[..len] {
+    // reconstruct the name after the optional schema qualifier
+    // (pg_catalog.int8 → int8), joining multi-word names with spaces
+    // (timestamp with time zone)
+    let qualified = matches!(
+        (toks.first(), toks.get(1), toks.get(2)),
+        (Some(Tok::Word(_)), Some(Tok::Op(o)), Some(Tok::Word(_))) if o == "."
+    );
+    let start = if qualified { 2 } else { 0 };
+    let mut parts: Vec<String> = Vec::new();
+    for t in &toks[start..len] {
         match t {
-            Tok::Word(w) => {
-                name = w.clone();
-            }
-            Tok::QIdent(q) => name = q.clone(),
+            Tok::Word(w) => parts.push(w.clone()),
+            Tok::QIdent(q) => parts.push(q.clone()),
             Tok::Op(o) if o == "." => continue,
             _ => break,
         }
     }
+    let name = parts.join(" ");
     if name.is_empty() {
         return Err(TranslateError::UnsupportedConstruct {
             sql_fragment: "::".to_string(),
@@ -1660,8 +1803,16 @@ fn bracket_ident(name: &str) -> Result<String, TranslateError> {
     Ok(format!("[{name}]"))
 }
 
+/// Check whether the last meaningful piece is one of `words`. A dangling
+/// dotted-qualifier tail (`… ident .`) is skipped: while `o.active` is being
+/// emitted piecewise the tail `o .` is still in `out`, so the piece before it
+/// decides whether the column about to land is in predicate position.
 fn last_piece_is(out: &[String], words: &[&str]) -> bool {
-    out.last()
+    let mut end = out.len();
+    while end >= 2 && out[end - 1] == "." && is_plain_ident(&out[end - 2]) {
+        end -= 2;
+    }
+    out.get(end.wrapping_sub(1))
         .is_some_and(|p| words.iter().any(|w| p.eq_ignore_ascii_case(w)))
 }
 

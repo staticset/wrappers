@@ -445,9 +445,14 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
     }
 
     fn remote_query_policy(&self, context: &RemoteQueryContext) -> RemoteQueryPolicy {
-        // bridge-FDW semantics: when every relation is foreign the query must
-        // run remotely; mixed queries keep the planner free to decompose
-        if context.all_referenced_relations_are_foreign {
+        // bridge-FDW semantics: when every relation is a foreign table of this
+        // same server the query must run remotely; mixed queries, or queries
+        // spanning several foreign servers (PostgreSQL cannot hand those to
+        // GetForeignJoinPaths/GetForeignUpperPaths as one unit, so a remote
+        // plan would never be built and Require would turn into a hard error)
+        // keep the planner free to decompose.
+        if context.all_referenced_relations_are_foreign && context.foreign_relations_share_server()
+        {
             RemoteQueryPolicy::Require
         } else {
             RemoteQueryPolicy::Optional

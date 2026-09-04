@@ -375,6 +375,107 @@ mod unit {
         );
     }
 
+    // -- regression round 2026-09-04 (CODE_REVIEW blockers) ------------------
+
+    // E: a composite ORDER BY key used to be captured partially — only its
+    // last operand carried the NULL tiebreaker, silently reordering rows
+    #[test]
+    fn order_by_composite_key_rejected() {
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders ORDER BY amount + fee LIMIT 5",
+            &orders_ctx(),
+            "ORDER BY amount + fee",
+        );
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders ORDER BY amount + fee DESC LIMIT 5",
+            &orders_ctx(),
+            "ORDER BY amount + fee",
+        );
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders ORDER BY amount + fee NULLS LAST LIMIT 5",
+            &orders_ctx(),
+            "ORDER BY amount + fee NULLS",
+        );
+    }
+
+    #[test]
+    fn order_by_parenthesized_composite_gets_tiebreaker() {
+        // parenthesized composites are captured whole and stay translatable
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders ORDER BY (amount + fee) LIMIT 5",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN ( amount + fee ) IS NULL THEN 1 ELSE 0 END, ( amount + fee ) \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+    }
+
+    // C: multi-word cast types were truncated to their first word, leaving
+    // stray tokens in the T-SQL text (`::timestamptz` also maps wrongly)
+    #[test]
+    fn multiword_cast_types_not_truncated() {
+        assert_tsql(
+            "SELECT shipped_at::timestamp with time zone FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(shipped_at AS datetimeoffset) FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT amount::double precision FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(amount AS float(53)) FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT note::character varying FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(note AS nvarchar(4000)) FROM [dbo].[Orders]",
+        );
+    }
+
+    #[test]
+    fn multiword_cast_with_modifier() {
+        assert_tsql(
+            "SELECT note::character varying(10) FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(note AS nvarchar(4000)) FROM [dbo].[Orders]",
+        );
+    }
+
+    // D: `o . active` arrives piecewise, so the qualifier tail used to hide
+    // the predicate-start piece and the `= 1` rewrite never fired
+    #[test]
+    fn bare_bool_with_table_qualifier() {
+        assert_tsql(
+            "SELECT id FROM dbo_orders o WHERE o.active",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] o WHERE o.active = 1",
+        );
+        assert_tsql(
+            "SELECT id FROM dbo_orders o WHERE NOT o.active",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] o WHERE NOT o.active = 1",
+        );
+    }
+
+    // #2: E'' literals must decode escape sequences; PG deparses Windows
+    // paths as E'C:\\temp\\' and the raw body compared wrong on MSSQL
+    #[test]
+    fn escape_string_literal_decodes_backslashes() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE note = E'C:\\\\temp\\\\'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note = 'C:\\temp\\'",
+        );
+    }
+
+    #[test]
+    fn escape_string_literal_control_escapes() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE note = E'a\\tb\\n'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note = 'a\tb\n'",
+        );
+    }
+
     #[test]
     fn deparser_cast_limit_form() {
         assert_tsql(
@@ -1103,6 +1204,55 @@ mod tests {
         assert_eq!(pg, mssql);
         // all 60 orders, one rank each partition position
         assert_eq!(pg.len(), 60);
+    }
+
+    // Regression: a join between foreign tables of two distinct servers of
+    // this FDW. PostgreSQL never hands such a join to GetForeignJoinPaths,
+    // so a Require policy can only dead-end into a hard error at plan time.
+    // The FDW must downgrade to Optional and let PostgreSQL join the two
+    // remote scans locally.
+    #[pg_test]
+    fn cross_server_join_falls_back_to_local_join() {
+        setup();
+        Spi::run(&format!(
+            "CREATE SERVER mssql_rq_srv2 FOREIGN DATA WRAPPER mssql_fdw_rq_fwd \
+             OPTIONS (conn_string '{}')",
+            mssql_conn_string()
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER mssql_rq_srv2 \
+             OPTIONS (user 'sa', password '{}')",
+            mssql_password()
+        ))
+        .unwrap();
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_orders2 (\
+               id bigint, customer_id uuid, status text \
+             ) SERVER mssql_rq_srv2 OPTIONS (schema 'dbo', table 'orders')",
+        )
+        .unwrap();
+
+        // planning alone used to raise
+        // "remote-query execution is required by this FDW ..."
+        Spi::run(
+            "EXPLAIN (COSTS OFF) \
+             SELECT count(*) FROM rq_orders o JOIN rq_orders2 o2 ON o.id = o2.id",
+        )
+        .unwrap();
+
+        // hash/merge join keeps one scan per side; a nested loop would
+        // rescan the inner foreign table, which is the known streaming
+        // executor limitation (#9), not this fix
+        Spi::run("SET LOCAL enable_nestloop = off").unwrap();
+        let joined: i64 =
+            Spi::get_one("SELECT count(*) FROM rq_orders o JOIN rq_orders2 o2 ON o.id = o2.id")
+                .unwrap()
+                .unwrap();
+        let total: i64 = Spi::get_one("SELECT count(*) FROM rq_orders2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined, total, "cross-server join should return all rows");
     }
 
     #[pg_test(error = "option 'rowid_column' is required")]
