@@ -614,6 +614,26 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         }
     }
 
+    fn get_rel_size(
+        &mut self,
+        _quals: &[Qual],
+        _columns: &[Column],
+        _sorts: &[Sort],
+        _limit: &Option<Limit>,
+        _options: &HashMap<String, String>,
+    ) -> MssqlFdwRqResult<(i64, i32)> {
+        // The true row count lives on the MSSQL side; advertising the
+        // framework default (rows≈0/1, cost≈1) makes PostgreSQL treat every
+        // scan as free, and for queries that must execute locally
+        // (SPI / PL-pgSQL CALL context — Navigator widgets) it picks nested
+        // loops whose inner-side rescans each re-run the remote query. A
+        // conservative fixed estimate steers local joins toward hash/merge.
+        // The remote full-query path is unaffected: it prices itself
+        // independently (rows=1, small cost) and stays the winner whenever
+        // it exists.
+        Ok((50_000, 128))
+    }
+
     fn begin_remote_query(
         &mut self,
         query: &RemoteQuery,
