@@ -275,6 +275,21 @@ sudo chmod 755 /usr/lib/postgresql/15/lib/wrappers-0.6.2.so
 Рестарт кластера не нужен (новые подключения подхватят библиотеку при первом
 `CREATE EXTENSION`/обращении к FDW).
 
+Заодно перенесите лицензию портала, иначе wildfly каждую минуту пишет в лог
+`License is not valid` + `Файл лицензии не найден`, а часть функций
+отключена:
+
+```bash
+# ключ лежит в mssql-fdw-rq/Навигатор/*_license.key; целевой путь задан в
+# standalone.xml свойством LICENSE_FILE_PATH = ${jboss.server.config.dir}/license.key
+sudo install -o wildfly -g wildfly -m 640 license.key \
+  /opt/wildfly/standalone/configuration/license.key
+```
+
+Рестарт wildfly не нужен: планировщик перечитывает ключ в течение минуты
+(признак успеха — сообщения о лицензии исчезают из
+`navigator-portal-server-debug-current.log`).
+
 ### 7.2 Включение в БД navigator
 
 ```sql
