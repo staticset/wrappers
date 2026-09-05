@@ -1818,6 +1818,57 @@ mod tests {
         Spi::run("DROP FOREIGN TABLE \"rq_Customers\"").unwrap();
     }
 
+    // ORDER BY over quoted (mixed-case) columns: the ORDER BY item runs
+    // through capture_subject AFTER the identifier was bracket-quoted
+    // (`[Val]`), which is_plain_ident must accept — Navigator imports every
+    // MSSQL table with its remote mixed-case spelling (dbo.DimTest). ASC +
+    // NULLS LAST is the sharpest check: without the NULL tiebreaker T-SQL
+    // sorts NULLs first and the query returns NULL instead of 50.25.
+    // One scan per #[pg_test] — see the pgrx TupleDesc note above.
+    #[pg_test]
+    fn mixed_case_order_by() {
+        setup();
+
+        Spi::run(
+            "CREATE FOREIGN TABLE \"rq_DimTest\" (\
+               \"MonthId\" int, \"Val\" numeric(18,2) \
+             ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'DimTest')",
+        )
+        .unwrap();
+        let first: pgrx::AnyNumeric = Spi::get_one(
+            "SELECT \"Val\" FROM \"rq_DimTest\" \
+             ORDER BY \"Val\" ASC NULLS LAST LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first,
+            <pgrx::AnyNumeric as std::str::FromStr>::from_str("50.25").unwrap(),
+            "NULL tiebreaker must survive the bracketed ORDER BY subject"
+        );
+        Spi::run("DROP FOREIGN TABLE \"rq_DimTest\"").unwrap();
+    }
+
+    #[pg_test]
+    fn mixed_case_group_by() {
+        setup();
+
+        Spi::run(
+            "CREATE FOREIGN TABLE \"rq_DimTest\" (\
+               \"MonthId\" int, \"Val\" numeric(18,2) \
+             ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'DimTest')",
+        )
+        .unwrap();
+        let groups: i64 = Spi::get_one(
+            "SELECT count(*) FROM (SELECT \"MonthId\", count(*) \
+             FROM \"rq_DimTest\" GROUP BY 1) g",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(groups, 3, "GROUP BY over [MonthId] must push down");
+        Spi::run("DROP FOREIGN TABLE \"rq_DimTest\"").unwrap();
+    }
+
     #[pg_test]
     fn bare_boolean_predicates_not() {
         setup();

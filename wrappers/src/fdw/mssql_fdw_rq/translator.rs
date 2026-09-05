@@ -1242,10 +1242,14 @@ fn join_pieces(out: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 fn is_plain_ident(piece: &str) -> bool {
+    // `[` and `]` are part of T-SQL bracket quoting: `Tok::QIdent` columns
+    // (mixed-case names like "MonthId") are already rendered as `[MonthId]`
+    // when the subject is captured, so both brackets must count as ident
+    // characters here or ORDER BY / LIKE / CAST subjects reject them
     !piece.is_empty()
         && piece
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == ']' || c == '.')
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | ']' | '[' | '.'))
         && !NON_SUBJECT_WORDS.contains(&piece.to_lowercase().as_str())
 }
 

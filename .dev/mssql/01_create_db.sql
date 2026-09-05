@@ -149,3 +149,19 @@ SELECT (SELECT COUNT(*) FROM dbo.customers)     AS customers,
        (SELECT COUNT(*) FROM dbo.payments)      AS payments,
        (SELECT COUNT(*) FROM dbo.shipments)     AS shipments;
 GO
+
+-- Mixed-case identifiers: sources created through Sber Navigator keep the
+-- remote spelling ("DimCalendar"), so every pushdown path must survive
+-- quoted names end to end.
+DROP TABLE IF EXISTS dbo.[DimTest];
+GO
+CREATE TABLE dbo.[DimTest] (
+    [MonthId] int           NOT NULL,
+    [Val]     decimal(18,2) NULL
+);
+GO
+INSERT INTO dbo.[DimTest] ([MonthId], [Val]) VALUES
+    (202601, 100.50), (202601, NULL),
+    (202602, 200.75), (202602, 50.25),
+    (202603, NULL),   (202603, 300.00);
+GO
