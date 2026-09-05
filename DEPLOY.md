@@ -12,8 +12,9 @@
 | `wrappers.control` | `$(pg_config --sharedir)/extension` | манифест расширения |
 | `wrappers--<версия>.sql` | `$(pg_config --sharedir)/extension` | SQL-объекты (функции-обработчики) |
 
-Системного ничего не трогается; в БД создаётся схема `wrappers` и таблица
-статистики `wrappers_fdw_stats`.
+Системного ничего не трогается; в БД создаётся схема расширения (на Навигаторе
+— `ext`) с handler/validator-функциями и таблица `wrappers_fdw_stats`
+(статистику в неё наш FDW **не пишет** — вызовы удалены, см. §4 и §7).
 
 ## 2. Вариант A — сборка на сервере
 
@@ -131,6 +132,9 @@ Kerberos: сервер с опцией `auth 'kerberos'` (без user mapping), 
 собрано с `mssql_fdw_rq_kerberos`, бэкенд работает под доменной УЗ с TGT —
 чек-лист в `wrappers/src/fdw/mssql_fdw_rq/README.md`.
 
+> Для сервера Сбер Навигатора установка сводится к переносу готовых
+> артефактов и правке словаря — см. §7.
+
 ### Проверка после установки
 
 ```sql
@@ -139,8 +143,11 @@ SELECT * FROM mssql_fdw_rq_meta();
 SELECT id FROM erp_orders WHERE amount > 1000 LIMIT 5;
 EXPLAIN (VERBOSE) SELECT customer_id, count(*) FROM erp_orders
   GROUP BY customer_id;   -- Foreign Scan, без локальных Aggregate/Sort
-SELECT * FROM wrappers_fdw_stats WHERE fdw_name = 'MssqlFdwRq';
 ```
+
+`ext.wrappers_fdw_stats` остаётся пустой: с `c3d512c` FDW не пишет
+статистику (INSERT от имени вызывающей роли ломал сканы Навигатора под
+`as_admin` — пустой ACL таблицы; см. §7.5).
 
 ## 5. Обновление
 
@@ -204,9 +211,11 @@ ALTER EXTENSION wrappers UPDATE TO '0.6.2';
 3. Снят бэкап старых артефактов.
 4. Smoke-запросы и `EXPLAIN` из §4 — сначала staging, потом прод.
 5. В согласованное окно — обновление пользовательских сессий.
-6. Контрольное окно наблюдения: `wrappers_fdw_stats`; при диагностике —
+6. Контрольное окно наблюдения: лог PostgreSQL; при диагностике —
    `ALTER SERVER … OPTIONS (SET log_remote_query 'true')` и
-   `SET client_min_messages = LOG`.
+   `SET client_min_messages = LOG` (T-SQL печатается с префиксом
+   `mssql_fdw_rq:`); на стороне MSSQL — Extended Events по
+   `client_app_name='wrappers'`.
 
 ## 6. Эксплуатационные заметки
 
@@ -225,3 +234,159 @@ ALTER EXTENSION wrappers UPDATE TO '0.6.2';
 - **Мажорный апгрейд PostgreSQL** = пересборка расширения под новый мажор +
   установка в новый кластер (`pg_upgrade` подхватит файлы, если расширение
   стояло в старом).
+
+## 7. Установка на другой сервер Сбер Навигатора (перенос готовой .so)
+
+Сценарий: новый сервер Навигатора (Astra Linux, PostgreSQL, БД `navigator`),
+**без компиляции** — переносим готовые артефакты с рабочего сервера и правим
+словарь источников. Всё выполняется под `postgres` (psql) и root (файлы);
+стоковый wildfly/Навигатор не трогаем.
+
+### 7.0 Совместимость
+
+`.so` привязана к мажору PostgreSQL и glibc целевой ОС. Перенос с
+действующего прода (Astra, pg15) безопасен один-в-один. Если на новом
+сервере другой мажор PG или существенно другой дистрибутив — собрать
+артефакты в Docker по §3 (в контейнере `PG_MAJOR` = мажор целевого сервера)
+и забрать tar.
+
+### 7.1 Артефакты
+
+Три файла (на pg15 имена именно такие — control использует «versioned
+shared-object mode», без `module_pathname`):
+
+| Источник | Куда на новом сервере |
+|---|---|
+| `/usr/lib/postgresql/15/lib/wrappers-0.6.2.so` | `$(pg_config --pkglibdir)/` |
+| `/usr/share/postgresql/15/extension/wrappers.control` | `$(pg_config --sharedir)/extension/` |
+| `/usr/share/postgresql/15/extension/wrappers--0.6.2.sql` | `$(pg_config --sharedir)/extension/` |
+
+```bash
+# на источнике (действующий прод), забрать три файла:
+sudo tar -czf /tmp/wrappers-artifacts.tgz \
+  /usr/lib/postgresql/15/lib/wrappers-0.6.2.so \
+  /usr/share/postgresql/15/extension/wrappers.control \
+  /usr/share/postgresql/15/extension/wrappers--0.6.2.sql
+# scp на новый сервер, затем:
+sudo tar -xzf wrappers-artifacts.tgz -C / --keep-directory-symlink
+sudo chmod 755 /usr/lib/postgresql/15/lib/wrappers-0.6.2.so
+```
+
+Рестарт кластера не нужен (новые подключения подхватят библиотеку при первом
+`CREATE EXTENSION`/обращении к FDW).
+
+### 7.2 Включение в БД navigator
+
+```sql
+-- функции обработчиков лягут в схему ext (у Навигатора стандартная схема
+-- для расширений; DDL FDW ниже ссылается именно на неё)
+CREATE EXTENSION wrappers WITH SCHEMA ext;
+
+CREATE FOREIGN DATA WRAPPER mssql_wrapper
+  HANDLER ext.mssql_fdw_rq_handler
+  VALIDATOR ext.mssql_fdw_rq_validator;
+
+-- серверы создаются шаблоном словаря от имени as_admin
+GRANT USAGE ON FOREIGN DATA WRAPPER mssql_wrapper TO as_admin;
+
+SELECT * FROM ext.mssql_fdw_rq_meta();   -- самопроверка: версия/автор
+```
+
+Рядом должен стоять штатный `tds_fdw` (у Навигатора обычно уже есть — через
+него работает обычный пункт «MS SQL»): он нужен для видимости пункта меню
+(§7.3) и не используется сам.
+
+### 7.3 Привязка пункта меню к нашему расширению (словарь)
+
+Навигатор управляет типами подключений словарём `data.tdicdatawrapper`
+(nid, sname, sdatawrapper, joptions, screateserver, salterserver). Как это
+работает и почему правится именно строка `nid=3`:
+
+- фильтр меню (`arm.getdictionary_v40`): тип видим ⇔ `sdatawrapper` = имя
+  **установленного расширения** (`pg_extension.extname`) И у одноимённого FDW
+  в `fdwacl` есть `as_admin=U`. Наше расширение называется `wrappers`, а
+  листинг таблиц (`arm.getforeigntableoptionlist_v40`) ветвится по
+  `sdatawrapper` — ветки `wrappers`/`mssql_wrapper` там нет, отдельная строка
+  была бы невидима/неработоспособна;
+- имя сервера генерирует CASE по `nid` в `arm.setuserconnection_v40`
+  (`nid=3` → `navigator_mssql_<id>`), неизвестный nid → NULL;
+- ветка `tds_fdw` листинга создаёт временную foreign table с опциями
+  `schema_name`/`table_name` и varchar-колонками с `column_name` — наш FDW
+  всё это понимает (алиасы + varchar ⇒ нужны `2692f74`/`50d94d9`/`d3dfc52`,
+  т.е. любая сборка новее этих коммитов).
+
+⇒ `sdatawrapper` оставляем `tds_fdw`, а шаблоны `screateserver`/`salterserver`
+подменяем на наш FDW `mssql_wrapper` (сервер создаётся по нашим шаблонам,
+остальное работает штатно):
+
+```sql
+-- 0) бэкап строки
+CREATE TABLE data.tdicdatawrapper_nid3_backup_20260905 AS
+  SELECT * FROM data.tdicdatawrapper WHERE nid = 3;
+
+-- 1) подмена (dollar-quoting из-за кавычек в шаблонах)
+UPDATE data.tdicdatawrapper SET
+  sname = 'MS SQL (Rubicon)',
+  screateserver = $ddl$CREATE SERVER [**sDBForeignName**]
+  FOREIGN DATA WRAPPER mssql_wrapper
+  OPTIONS (conn_string 'Server=[**sHost**],[**sPort**];Database=[**sDBName**];IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true'[**sOptions**]);
+CREATE USER MAPPING FOR as_admin
+  SERVER [**sDBForeignName**]
+  OPTIONS (user '[**sLogin**]', password '[**sHash**]');$ddl$,
+  salterserver = $ddl$ALTER SERVER [**sDBForeignName**]
+  OPTIONS (SET conn_string 'Server=[**sHost**],[**sPort**];Database=[**sDBName**];IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true'[**sOptions**]);
+ALTER USER MAPPING FOR as_admin
+  SERVER [**sDBForeignName**]
+  OPTIONS (SET user '[**sLogin**]', SET password '[**sHash**]');$ddl$
+WHERE nid = 3;
+```
+
+- `joptions` не трогаем — это поля формы (хост/порт/БД/логин/пароль),
+  плейсхолдеры `[**sHost**]`… подставляются из них; `[**sDBForeignName**]` —
+  сгенерированное имя `navigator_mssql_<id>`;
+- `Encrypt=true` — TLS обязателен; `TrustServerCertificate=true` держим для
+  самоподписанных сертификатов MSSQL, с нормальным CA — убрать;
+- рестарт wildfly не нужен — словарь читается на каждый запрос;
+- при обновлении Навигатора строку словаря может перезалить вендорское
+  обновление — после каждого обновления проверять и повторять шаг 1
+  (бэкап-таблица из шага 0 хранит исходник).
+
+### 7.4 Проверка
+
+1. UI: в списке типов подключений есть «MS SQL (Rubicon)».
+2. Создать подключение к MSSQL → появился сервер
+   `navigator_mssql_<id>` с `conn_string` и `USER MAPPING FOR as_admin`:
+   ```sql
+   SELECT srvname, srvoptions FROM pg_foreign_server
+     WHERE srvname LIKE 'navigator_mssql_%';
+   ```
+3. Экран выбора таблиц — напрямую (то же, что делает UI):
+   ```sql
+   SET ROLE as_admin;
+   CALL arm.getforeigntableoptionlist_v40(
+     '{"params":{"param":[{"name":"nID","value":"<id подключения>"}]}}'::json,
+     NULL, <nuserid>);
+   -- ожидание: JSON root.ForeignTableOptions.option[] со схемами и таблицами
+   ```
+4. Досоздать источник до конца и выполнить тестовый запрос из отчёта.
+
+### 7.5 Диагностика
+
+- Ошибки UI портала пишутся в `comm.paramslog_v30`
+  (`nerrorstatus = true`, текст в `serrormsg`, `jparams` — параметры вызова;
+  ID записи UI и показывает). Сообщения PostgreSQL приходят локализованными:
+  «нет доступа к таблице X» = `permission denied for table X`.
+- Тип «MS SQL (Rubicon)» не виден в меню ⇔ `sdatawrapper` строки nid=3 не
+  совпадает с `pg_extension.extname` установленного расширения (`tds_fdw`)
+  или у FDW `tds_fdw` нет `as_admin=U` в `fdwacl`
+  (`SELECT fdwacl FROM pg_foreign_data_wrapper WHERE fdwname='tds_fdw';`).
+- Портал выполняет процедуры под `SET ROLE as_admin`; **user mapping по
+  членству роли не наследуется** (поэтому шаблон создаёт mapping именно для
+  `as_admin`), а вот гранты наследуются — прав будет достаточно.
+- `ext.wrappers_fdw_stats` не пишется с `c3d512c` намеренно: INSERT статистики
+  шёл от имени вызывающей роли и при пустом ACL таблицы ронял сканы под
+  `as_admin` («нет доступа к таблице», comm.paramslog nid=19598 от 05.09).
+  Гранты на неё выдавать не нужно.
+- T-SQL уходит/приходит: `ALTER SERVER … OPTIONS (SET log_remote_query 'true')`
+  + `SET client_min_messages = LOG` (префикс `mssql_fdw_rq:`); на MSSQL —
+  Extended Events по `client_app_name='wrappers'`.
