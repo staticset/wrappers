@@ -607,6 +607,12 @@ const KEYWORD_CALL_WORDS: [&str; 9] = [
     "in", "exists", "values", "any", "all", "cast", "isnull", "using", "over",
 ];
 
+/// keywords that can trail a top-level ORDER BY item (explicit NULLS
+/// ordering, OFFSET/FETCH clauses) — never bracketed as identifiers
+const ORDER_TAIL_KEYWORDS: [&str; 8] = [
+    "nulls", "first", "last", "rows", "row", "only", "fetch", "next",
+];
+
 pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateError> {
     let toks = lex(sql)?;
     let clauses = analyze(&toks)?;
@@ -717,7 +723,9 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                     let expr = out[start..].join(" ");
                                     let bare_not_null = out.len() - start == 1
                                         && !expr.contains(' ')
-                                        && ctx.not_null_columns.contains(&expr.to_lowercase());
+                                        && ctx
+                                            .not_null_columns
+                                            .contains(&unbracket(&expr).to_lowercase());
                                     if !bare_not_null {
                                         return Err(TranslateError::UnsupportedConstruct {
                                             sql_fragment: format!("ORDER BY {expr} inside OVER(…)"),
@@ -834,6 +842,21 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 // parentheses the AS introduces a type name, not an alias.
                 if out.last().is_some_and(|p| p.eq_ignore_ascii_case("as"))
                     && cast_paren_depth.is_none_or(|d| depth != d)
+                    && is_plain_ident(w)
+                {
+                    out.push(bracket_ident(w)?);
+                    i += 1;
+                    continue;
+                }
+
+                // --- top-level ORDER BY keys --------------------------------
+                // Bare sort keys may reference output aliases (`ORDER BY
+                // plan` for `AS plan`), and a reserved-word alias or column
+                // is not legal unbracketed there — bracket them all.
+                // Function names (`ORDER BY sum(x)`) keep their call form.
+                if in_order
+                    && !ORDER_TAIL_KEYWORDS.contains(&lw.as_str())
+                    && !matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(")
                     && is_plain_ident(w)
                 {
                     out.push(bracket_ident(w)?);
@@ -1004,7 +1027,9 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             }
                             let bare_not_null = out.len() - start == 1
                                 && !expr.contains(' ')
-                                && ctx.not_null_columns.contains(&expr.to_lowercase());
+                                && ctx
+                                    .not_null_columns
+                                    .contains(&unbracket(&expr).to_lowercase());
                             if !bare_not_null {
                                 return Err(TranslateError::UnsupportedConstruct {
                                     sql_fragment: "ORDER BY … NULLS … inside OVER(…)".to_string(),
@@ -1233,7 +1258,9 @@ fn close_order_item(
     }
     let bare_not_null = out.len() - start == 1
         && !expr.contains(' ')
-        && ctx.not_null_columns.contains(&expr.to_lowercase());
+        && ctx
+            .not_null_columns
+            .contains(&unbracket(&expr).to_lowercase());
 
     if bare_not_null {
         if desc == Some(true) {
@@ -1294,6 +1321,13 @@ fn join_pieces(out: &[String]) -> String {
 // ---------------------------------------------------------------------------
 // Subject capture (shared by casts, ILIKE, IS <bool>)
 // ---------------------------------------------------------------------------
+
+/// Strip T-SQL bracket quoting for catalog-name comparisons (`[id]` → `id`).
+fn unbracket(name: &str) -> &str {
+    name.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(name)
+}
 
 fn is_plain_ident(piece: &str) -> bool {
     // `[` and `]` are part of T-SQL bracket quoting: `Tok::QIdent` columns

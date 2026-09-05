@@ -158,7 +158,7 @@ mod unit {
         assert_tsql(
             "SELECT id FROM public.dbo_orders ORDER BY id LIMIT 10",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] ORDER BY id OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+            "SELECT id FROM [dbo].[Orders] ORDER BY [id] OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
         );
     }
 
@@ -167,7 +167,7 @@ mod unit {
         assert_tsql(
             "SELECT id FROM public.dbo_orders ORDER BY id LIMIT 5 OFFSET 10",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT id FROM [dbo].[Orders] ORDER BY [id] OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 
@@ -338,7 +338,7 @@ mod unit {
         assert_tsql(
             "SELECT id FROM public.dbo_orders ORDER BY id LIMIT 5",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] ORDER BY id OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT id FROM [dbo].[Orders] ORDER BY [id] OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 
@@ -348,13 +348,13 @@ mod unit {
             "SELECT id FROM public.dbo_orders ORDER BY amount LIMIT 5",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] ORDER BY \
-             CASE WHEN amount IS NULL THEN 1 ELSE 0 END, amount OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+             CASE WHEN [amount] IS NULL THEN 1 ELSE 0 END, [amount] OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
         assert_tsql(
             "SELECT id FROM public.dbo_orders ORDER BY amount DESC LIMIT 5",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] ORDER BY \
-             CASE WHEN amount IS NULL THEN 1 ELSE 0 END DESC, amount DESC \
+             CASE WHEN [amount] IS NULL THEN 1 ELSE 0 END DESC, [amount] DESC \
              OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
@@ -365,13 +365,13 @@ mod unit {
         assert_tsql(
             "SELECT id FROM public.dbo_orders ORDER BY amount ASC NULLS FIRST LIMIT 5",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] ORDER BY amount \
+            "SELECT id FROM [dbo].[Orders] ORDER BY [amount] \
              OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
         assert_tsql(
             "SELECT id FROM public.dbo_orders ORDER BY amount DESC NULLS LAST LIMIT 5",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] ORDER BY amount DESC \
+            "SELECT id FROM [dbo].[Orders] ORDER BY [amount] DESC \
              OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
@@ -385,17 +385,17 @@ mod unit {
         assert_unsupported(
             "SELECT id FROM public.dbo_orders ORDER BY amount + fee LIMIT 5",
             &orders_ctx(),
-            "ORDER BY amount + fee",
+            "ORDER BY [amount] + [fee]",
         );
         assert_unsupported(
             "SELECT id FROM public.dbo_orders ORDER BY amount + fee DESC LIMIT 5",
             &orders_ctx(),
-            "ORDER BY amount + fee",
+            "ORDER BY [amount] + [fee]",
         );
         assert_unsupported(
             "SELECT id FROM public.dbo_orders ORDER BY amount + fee NULLS LAST LIMIT 5",
             &orders_ctx(),
-            "ORDER BY amount + fee NULLS",
+            "ORDER BY [amount] + [fee] NULLS",
         );
     }
 
@@ -406,7 +406,7 @@ mod unit {
             "SELECT id FROM public.dbo_orders ORDER BY (amount + fee) LIMIT 5",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] ORDER BY \
-             CASE WHEN ( amount + fee ) IS NULL THEN 1 ELSE 0 END, ( amount + fee ) \
+             CASE WHEN ( [amount] + [fee] ) IS NULL THEN 1 ELSE 0 END, ( [amount] + [fee] ) \
              OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
@@ -773,7 +773,7 @@ mod unit {
             "SELECT id FROM public.dbo_orders ORDER BY id\
              \n FETCH FIRST '7'::bigint ROWS ONLY",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] ORDER BY id OFFSET 0 ROWS FETCH NEXT 7 ROWS ONLY",
+            "SELECT id FROM [dbo].[Orders] ORDER BY [id] OFFSET 0 ROWS FETCH NEXT 7 ROWS ONLY",
         );
     }
 
@@ -916,7 +916,7 @@ mod unit {
         assert_tsql(
             "SELECT c.name, SUM(o.amount) AS total FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC LIMIT 5",
             &two_tables_ctx(),
-            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY CASE WHEN total IS NULL THEN 1 ELSE 0 END DESC, total DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY CASE WHEN [total] IS NULL THEN 1 ELSE 0 END DESC, [total] DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 
