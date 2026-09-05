@@ -539,7 +539,9 @@ pub(super) fn field_to_cell(
                     .map(Cell::Numeric)
             }
         }
-        PgOid::BuiltIn(PgBuiltInOids::TEXTOID) => src_row
+        PgOid::BuiltIn(PgBuiltInOids::TEXTOID)
+        | PgOid::BuiltIn(PgBuiltInOids::VARCHAROID)
+        | PgOid::BuiltIn(PgBuiltInOids::BPCHAROID) => src_row
             .try_get::<&str, usize>(idx)?
             .map(|v| Cell::String(v.to_owned())),
         PgOid::BuiltIn(PgBuiltInOids::UUIDOID) => src_row

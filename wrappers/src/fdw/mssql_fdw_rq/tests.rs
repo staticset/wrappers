@@ -1564,6 +1564,23 @@ mod tests {
             .unwrap();
         assert!(cnt > 0, "aliased options must drive a plain scan");
         Spi::run("DROP FOREIGN TABLE rq_orders_nav").unwrap();
+
+        // the option-list probe (getForeignTableOptionList) builds varchar
+        // columns with per-column column_name aliases over INFORMATION_SCHEMA
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_is_tables_nav (\
+               table_catalog varchar OPTIONS(column_name 'TABLE_CATALOG'), \
+               table_schema varchar OPTIONS(column_name 'TABLE_SCHEMA'), \
+               table_name varchar OPTIONS(column_name 'TABLE_NAME'), \
+               table_type varchar OPTIONS(column_name 'TABLE_TYPE') \
+             ) SERVER mssql_rq_srv OPTIONS (schema_name 'information_schema', table_name 'tables')",
+        )
+        .unwrap();
+        let n: i64 = Spi::get_one("SELECT count(*) FROM rq_is_tables_nav")
+            .unwrap()
+            .unwrap();
+        assert!(n > 0, "varchar columns must scan INFORMATION_SCHEMA");
+        Spi::run("DROP FOREIGN TABLE rq_is_tables_nav").unwrap();
     }
 
     // IMPORT FOREIGN SCHEMA — how BI tools introspect a source. Runs through
