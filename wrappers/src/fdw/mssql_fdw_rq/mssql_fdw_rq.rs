@@ -225,14 +225,37 @@ impl ScanPlan {
                 quals,
             } => plain_scan_sql(remote_schema, remote_table, columns, quals),
             Self::Remote { tsql, parameters } => {
-                let params = parameters
-                    .iter()
-                    .map(|p| types::value_to_sql(p.value.as_ref(), p.type_oid))
-                    .collect::<MssqlFdwRqResult<Vec<_>>>()?;
-                Ok((tsql.clone(), params))
+                Ok((tsql.clone(), bind_remote_parameters(tsql, parameters)?))
             }
         }
     }
+}
+
+/// Convert the framework's evaluated query parameters into tiberius binds,
+/// indexed by the parameter id (`$n` ↔ `@P{n}` ↔ position n — tiberius binds
+/// positionally). Parameters captured from the enclosing statement's scope
+/// (SPI / PL-pgSQL CALL arguments — Navigator passes its json input this
+/// way) arrive even when the deparsed statement never references them; a
+/// placeholder absent from the T-SQL cannot affect the result, so its slot
+/// stays NULL regardless of type (a jsonb argument would otherwise be
+/// rejected with "parameter type 'oid 3802' is not supported").
+fn bind_remote_parameters(
+    tsql: &str,
+    parameters: &[RemoteQueryParameter],
+) -> MssqlFdwRqResult<Vec<Box<dyn tiberius::ToSql>>> {
+    let max_id = parameters.iter().map(|p| p.id).max().unwrap_or(0);
+    let mut binds: Vec<Box<dyn tiberius::ToSql>> = (0..max_id)
+        .map(|_| Box::new(None::<String>) as Box<dyn tiberius::ToSql>)
+        .collect();
+    for p in parameters {
+        if p.id == 0 || p.id > max_id {
+            continue;
+        }
+        if translator::param_placeholder_used(tsql, p.id) {
+            binds[p.id - 1] = types::value_to_sql(p.value.as_ref(), p.type_oid)?;
+        }
+    }
+    Ok(binds)
 }
 
 #[wrappers_fdw(
@@ -633,11 +656,8 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             text_columns,
         };
         let tsql = translator::translate(&query.sql, &ctx)?;
-        let params: Vec<Box<dyn tiberius::ToSql>> = query
-            .parameters
-            .iter()
-            .map(|p| types::value_to_sql(p.value.as_ref(), p.type_oid))
-            .collect::<MssqlFdwRqResult<_>>()?;
+        let params: Vec<Box<dyn tiberius::ToSql>> =
+            bind_remote_parameters(&tsql, &query.parameters)?;
 
         self.tgt_cols = query.columns.clone();
         self.rescan_plan = Some(ScanPlan::Remote {

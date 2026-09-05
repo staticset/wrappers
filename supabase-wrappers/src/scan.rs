@@ -641,6 +641,39 @@ unsafe fn filter_resjunk_tlist(tlist: *mut pg_sys::List) -> *mut pg_sys::List {
     }
 }
 
+/// Does the TOP-LEVEL statement text mention any of the query's relations?
+/// Join trees and trees with non-relation inputs (subqueries) cannot be
+/// deparsed mid-planning, so their remote SQL comes from the top-level
+/// statement text instead — which, under SPI or PL/pgSQL, is the enclosing
+/// CALL (Sber Navigator widget queries run through
+/// `call ui.portal_arm_main_command(...)`). That text never mentions the
+/// tables; a remote path built from it is unusable and would fail the whole
+/// query at scan time. Path-add callbacks must check this and skip the
+/// remote path, letting PostgreSQL execute locally over per-table scans.
+/// Returns `true` when the statement text is unavailable (keep the
+/// historical behavior — the scan-time relation check still guards).
+pub(crate) unsafe fn top_statement_mentions_relations(
+    root: *mut pg_sys::PlannerInfo,
+    relations: &[crate::interface::FullQueryRelation],
+) -> bool {
+    unsafe {
+        let Some(sql) = current_statement_sql_from_debug_query_string(root) else {
+            return true;
+        };
+        relations
+            .iter()
+            .any(|r| sql.contains(&r.local_table) || sql.contains(&r.local_schema))
+    }
+}
+
+/// Would the remote SQL have to come from the top-level statement text?
+/// Mirrors the fallback condition of `full_query_sql_from_planner`.
+pub(crate) unsafe fn remote_sql_requires_top_statement(
+    root: *mut pg_sys::PlannerInfo,
+) -> bool {
+    unsafe { query_has_multiple_base_relations(root) || query_has_non_relation_inputs(root) }
+}
+
 unsafe fn current_statement_sql_from_debug_query_string(
     root: *mut pg_sys::PlannerInfo,
 ) -> Option<String> {
@@ -1127,6 +1160,21 @@ pub(super) extern "C-unwind" fn get_foreign_join_paths<
             return;
         };
 
+        // A join tree's remote SQL always comes from the TOP-LEVEL statement
+        // text (pg_get_querydef cannot run on join trees mid-planning).
+        // Under SPI / PL-pgSQL that text is the enclosing CALL (Sber
+        // Navigator widget queries), which never mentions the tables; a
+        // remote path built from it is unusable and would fail the whole
+        // query at scan time. Skip the path — PostgreSQL executes locally
+        // over per-table plain scans (rescan is supported).
+        if !top_statement_mentions_relations(root, &relations) {
+            debug2!(
+                "get_foreign_join_paths: top-level statement does not mention \
+                 the relations (SPI/PL-pgSQL CALL context) — serving locally"
+            );
+            return;
+        }
+
         let ctx_name = format!("Wrappers_full_query_join_{}", first_relation.relid.to_u32());
         let ctx = memctx::create_wrappers_memctx(&ctx_name);
         let mut state = FdwState::<E, W>::new(first_relation.relid, ctx);
@@ -1281,9 +1329,21 @@ pub(super) extern "C-unwind" fn get_foreign_rel_size<
             .as_ref()
             .map(|instance| instance.remote_query_policy(&remote_query_context))
             .unwrap_or(RemoteQueryPolicy::Optional);
+        // When the statement's SQL would have to come from the top-level
+        // text (join trees, subquery inputs) and that text does not mention
+        // the relations — the enclosing CALL under SPI / PL-pgSQL (Sber
+        // Navigator widgets) — no usable remote path can exist for this
+        // query. Do not require one: PostgreSQL must stay free to execute
+        // locally over per-table plain scans instead of failing with
+        // "remote-query execution is required".
+        let remote_path_constructible = !remote_sql_requires_top_statement(root)
+            || query_foreign_relations(root).is_none_or(|(_, rels)| {
+                top_statement_mentions_relations(root, &rels)
+            });
         state.requires_full_query = state.remote_query_policy.wants_remote_query()
             && remote_query_context.requires_remote_query_shape()
-            && remote_query_context.all_referenced_relations_are_foreign;
+            && remote_query_context.all_referenced_relations_are_foreign
+            && remote_path_constructible;
 
         let (rows, width) = state.get_rel_size().report_unwrap();
         (*baserel).rows = rows as f64;

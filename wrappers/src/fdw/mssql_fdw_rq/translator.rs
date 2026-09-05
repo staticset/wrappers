@@ -1277,6 +1277,28 @@ fn is_plain_ident(piece: &str) -> bool {
         && !NON_SUBJECT_WORDS.contains(&piece.to_lowercase().as_str())
 }
 
+/// Does the translated T-SQL reference the `@P<id>` placeholder? Parameters
+/// captured from the enclosing statement's scope (SPI / PL-pgSQL CALL
+/// arguments — Navigator passes its json input this way) ride along in the
+/// parameter list even when the deparsed statement never uses them; those
+/// are bound as NULL by the executor, so only a placeholder that actually
+/// appears (as a whole token, not a prefix of `@P10`) forces type support.
+pub(super) fn param_placeholder_used(tsql: &str, id: usize) -> bool {
+    let needle = format!("@P{id}");
+    let bytes = tsql.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = tsql[from..].find(&needle) {
+        let at = from + rel;
+        let after = at + needle.len();
+        let next_is_digit = bytes.get(after).is_some_and(|b| b.is_ascii_digit());
+        if !next_is_digit {
+            return true;
+        }
+        from = after;
+    }
+    false
+}
+
 /// Match `col` or `t . col` — the deparser's spelling of a CountColumn Var —
 /// when the final segment names a remote-LOB column (local `text` twin) and
 /// the argument is directly closed by `)`. Returns the rendered T-SQL pieces

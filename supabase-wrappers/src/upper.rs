@@ -11,8 +11,9 @@ use crate::interface::{Aggregate, AggregateKind, Column};
 use crate::prelude::ForeignDataWrapper;
 use crate::scan::{
     FdwState, full_query_placeholder_from_planner, leak_state_in_current_context,
-    query_requires_full_query, remote_query_context_from_planner, remote_query_local_path_penalty,
-    target_columns_from_reltarget,
+    query_requires_full_query, remote_query_context_from_planner,
+    remote_query_local_path_penalty, remote_sql_requires_top_statement,
+    target_columns_from_reltarget, top_statement_mentions_relations,
 };
 
 /// Helper to iterate over a pg_sys::List using raw pointer access.
@@ -517,6 +518,21 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
             debug2!("add_full_query_upper_path: full query has no relation");
             return false;
         };
+
+        // When the SQL text must come from the top-level statement (join
+        // trees, subquery inputs), that statement under SPI / PL-pgSQL is
+        // the enclosing CALL, whose text never mentions the tables — the
+        // remote path would be rejected at scan time and kill the query.
+        // Skip it: PostgreSQL executes locally over per-table plain scans.
+        if remote_sql_requires_top_statement(root)
+            && !top_statement_mentions_relations(root, &full_query.relations)
+        {
+            debug2!(
+                "add_full_query_upper_path: top-level statement does not mention \
+                 the relations (SPI/PL-pgSQL CALL context) — serving locally"
+            );
+            return false;
+        }
 
         if !remote_query_policy.wants_remote_query() {
             let context = remote_query_context_from_planner(root, false);

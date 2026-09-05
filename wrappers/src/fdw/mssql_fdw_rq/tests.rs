@@ -496,6 +496,22 @@ mod unit {
         );
     }
 
+    // 2026-09-05 (Navigator widgets): the enclosing CALL's jsonb argument
+    // rides along in the parameter list; only a placeholder that actually
+    // appears in the T-SQL (as a whole token) requires type support
+    #[test]
+    fn param_placeholder_used_matches_whole_tokens() {
+        use super::super::translator::param_placeholder_used;
+        let tsql = "SELECT * FROM [dbo].[Orders] WHERE [id] = @P2 AND [note] LIKE @P10";
+        assert!(!param_placeholder_used(tsql, 1), "absent id");
+        assert!(param_placeholder_used(tsql, 2), "plain occurrence");
+        assert!(param_placeholder_used(tsql, 10), "longer id");
+        assert!(!param_placeholder_used(tsql, 3), "absent id");
+        // @P1 is a prefix of @P10 but not a whole token there
+        assert!(!param_placeholder_used("WHERE x = @P10", 1));
+        assert!(param_placeholder_used("WHERE x = @P1", 1));
+    }
+
     // 2026-09-05 (VGU dbo.FactIPP): count over a remote LOB column must be
     // CAST to nvarchar(max) — T-SQL rejects `Operand data type ntext is
     // invalid for count operator`; non-LOB columns keep the plain form
@@ -1929,6 +1945,65 @@ mod tests {
         Spi::run("DROP FOREIGN TABLE \"rq_DimTest\"").unwrap();
     }
 
+    // Sber Navigator executes widget SQL through `call
+    // ui.portal_arm_main_command($1,$2,$3,$4)`: for a join the top-level
+    // statement text is that CALL, which never mentions the tables. The
+    // remote join path built from it would fail the whole query at scan
+    // time ("statement text does not reference the foreign tables"); the
+    // planner-time guard must skip the path so PostgreSQL joins locally
+    // over per-table plain scans. A PL/pgSQL function reproduces the shape:
+    // its inner join is planned with debug_query_string = the outer SELECT.
+    #[pg_test]
+    fn spi_wrapped_join_executes_locally() {
+        setup();
+
+        Spi::run(
+            "CREATE FUNCTION rq_widget_join() RETURNS bigint LANGUAGE plpgsql AS $$ \
+               DECLARE n bigint; \
+               BEGIN \
+                 SELECT count(*) INTO n FROM rq_orders o \
+                   JOIN rq_customers c ON o.customer_id = c.id; \
+                 RETURN n; \
+               END $$",
+        )
+        .unwrap();
+        let n: i64 = Spi::get_one("SELECT rq_widget_join()").unwrap().unwrap();
+        assert!(n > 0, "SPI-wrapped join must execute locally, got {n}");
+        Spi::run("DROP FUNCTION rq_widget_join()").unwrap();
+    }
+
+    // An unused statement parameter of an unsupported type (Navigator's
+    // jsonb CALL argument) must bind as NULL instead of failing with
+    // "parameter type 'oid 3802' is not supported"; a used parameter in
+    // the same statement still binds by its id (@P2, not list position).
+    #[pg_test]
+    fn unused_jsonb_parameter_binds_null() {
+        setup_committed();
+
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqunused', {conn})")).unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqunused', \
+             $$PREPARE p(jsonb, bigint) AS SELECT count(*) FROM rqj_orders \
+               WHERE id > $2$$)",
+        )
+        .unwrap();
+        let cnt: i64 = Spi::connect(|c| {
+            c.select(
+                "SELECT * FROM dblink('rqunused', $$EXECUTE p('{\"w\":1}', 0)$$) AS t(cnt bigint)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<i64, _>("cnt").unwrap())
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("row")
+        });
+        assert!(cnt > 0, "unused jsonb param must not fail the query");
+        Spi::run("SELECT dblink_disconnect('rqunused')").unwrap();
+    }
+
     #[pg_test]
     fn bare_boolean_predicates_not() {
         setup();
@@ -2066,26 +2141,30 @@ mod tests {
 
     #[pg_test]
     fn plan_is_foreign_scan() {
-        setup();
+        setup_committed();
 
-        // §7.3: aggregates/joins run remotely, no local nodes above the scan
+        // §7.3: aggregates/joins run remotely, no local nodes above the scan.
+        // Asserted at top level (dblink session) — the only place a remote
+        // join plan can exist; under SPI / PL-pgSQL (Navigator's CALL
+        // wrapper) joins execute locally by design, see
+        // spi_wrapped_join_executes_locally.
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqplan', {conn})")).unwrap();
         let plan = Spi::connect(|c| {
             c.select(
-                "EXPLAIN (VERBOSE) SELECT c.name, SUM(o.total_amount) \
-                 FROM rq_orders o JOIN rq_customers c ON o.customer_id = c.id \
-                 GROUP BY c.name",
+                "SELECT * FROM dblink('rqplan', $$EXPLAIN (VERBOSE) \
+                 SELECT c.name, SUM(o.total_amount) FROM rqj_orders o \
+                 JOIN rqj_customers c ON o.customer_id = c.id \
+                 GROUP BY c.name$$) AS t(qp text)",
                 None,
                 &[],
             )
             .unwrap()
-            .filter_map(|r| {
-                r.get_by_name::<&str, _>("QUERY PLAN")
-                    .unwrap()
-                    .map(str::to_owned)
-            })
+            .filter_map(|r| r.get_by_name::<&str, _>("qp").unwrap().map(str::to_owned))
             .collect::<Vec<_>>()
             .join("\n")
         });
+        Spi::run("SELECT dblink_disconnect('rqplan')").unwrap();
         assert!(plan.contains("Foreign Scan"), "plan: {plan}");
         assert!(!plan.contains("Aggregate"), "plan: {plan}");
         assert!(!plan.contains("Sort"), "plan: {plan}");
