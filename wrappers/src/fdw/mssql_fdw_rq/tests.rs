@@ -1797,6 +1797,27 @@ mod tests {
         assert_eq!(active, 22);
     }
 
+    // mixed-case local names (how Navigator imports MSSQL tables):
+    // column_flags must quote them for to_regclass or the flags silently
+    // degrade and the bare boolean predicate is rejected. Own #[pg_test] —
+    // see the pgrx TupleDesc note on bare_boolean_predicates above.
+    #[pg_test]
+    fn bare_boolean_predicates_mixed_case() {
+        setup();
+
+        Spi::run(
+            "CREATE FOREIGN TABLE \"rq_Customers\" (\
+               id uuid, active boolean, \"CreditLimit\" numeric(18,2) \
+             ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'customers')",
+        )
+        .unwrap();
+        let mixed: i64 = Spi::get_one("SELECT count(*) FROM \"rq_Customers\" WHERE active")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mixed, 22, "mixed-case relation must resolve column flags");
+        Spi::run("DROP FOREIGN TABLE \"rq_Customers\"").unwrap();
+    }
+
     #[pg_test]
     fn bare_boolean_predicates_not() {
         setup();

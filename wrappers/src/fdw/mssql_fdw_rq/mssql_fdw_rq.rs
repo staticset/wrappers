@@ -354,20 +354,24 @@ impl MssqlFdwRq {
     /// (pg_test), and a catalog read failure degrades to empty sets with a
     /// visible notice anyway — bool predicates must not fail the query.
     fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>) {
+        let quote_ident = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
         let mut bools = Vec::new();
         let mut not_nulls = Vec::new();
         for rel in relations {
-            // names go through to_regclass, which parses the same
-            // possibly-quoted dotted syntax the regclass literal used before
-            let Ok(relation) = PgRelation::open_with_name_and_share_lock(&format!(
+            // to_regclass parses the regclass literal syntax, where an
+            // UNquoted identifier folds to lowercase — mixed-case names
+            // (Navigator imports MSSQL tables as "DimCalendar") must be
+            // quoted to resolve at all
+            let qualified = format!(
                 "{}.{}",
-                rel.local_schema, rel.local_table
-            )) else {
+                quote_ident(&rel.local_schema),
+                quote_ident(&rel.local_table)
+            );
+            let Ok(relation) = PgRelation::open_with_name_and_share_lock(&qualified) else {
                 pgrx::notice!(
-                    "mssql_fdw_rq: could not open {}.{} to read column flags; \
+                    "mssql_fdw_rq: could not open {} to read column flags; \
                      bare boolean predicates and NULL-safe sorting are unavailable for this query",
-                    rel.local_schema,
-                    rel.local_table
+                    qualified
                 );
                 continue;
             };
