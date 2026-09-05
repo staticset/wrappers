@@ -2050,6 +2050,40 @@ mod tests {
         Spi::run("SELECT dblink_disconnect('rqunused')").unwrap();
     }
 
+    // postgres_fdw (the bridge) batch-fetches remote results through
+    // `DECLARE <name> CURSOR FOR <query>`; the wrapper must be stripped
+    // before translation — T-SQL accepts the DECLARE syntax too, but
+    // executing it only declares a server cursor and returns ZERO rows.
+    #[pg_test]
+    fn cursor_wrapped_join_returns_rows() {
+        setup_committed();
+
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqcur', {conn})")).unwrap();
+        Spi::run("SELECT dblink_exec('rqcur', $$BEGIN$$)").unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqcur', \
+             $$DECLARE c CURSOR FOR SELECT count(*) FROM rqj_orders o \
+               JOIN rqj_customers c ON o.customer_id = c.id$$)",
+        )
+        .unwrap();
+        let cnt: i64 = Spi::connect(|c| {
+            c.select(
+                "SELECT * FROM dblink('rqcur', $$FETCH ALL FROM c$$) AS t(cnt bigint)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<i64, _>("cnt").unwrap())
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("row")
+        });
+        assert!(cnt > 0, "cursor-wrapped join must return rows, got {cnt}");
+        Spi::run("SELECT dblink_exec('rqcur', $$COMMIT$$)").unwrap();
+        Spi::run("SELECT dblink_disconnect('rqcur')").unwrap();
+    }
+
     #[pg_test]
     fn bare_boolean_predicates_not() {
         setup();

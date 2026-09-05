@@ -742,6 +742,21 @@ fn normalize_current_statement_sql(sql: &str) -> Option<String> {
         sql = sql[offset..].trim();
     }
 
+    // postgres_fdw fetches remote results through `DECLARE <name> CURSOR
+    // FOR <query>` when batched fetching kicks in (the bridge in front of
+    // this FDW). The cursor wrapper belongs to the PostgreSQL protocol and
+    // must not travel to the remote server: T-SQL accepts `DECLARE … CURSOR
+    // FOR …` too, but executing it merely DECLARES a server cursor and
+    // returns zero rows. Strip everything up to and including the ` FOR `.
+    if starts_with_ascii_keyword(sql, "declare") {
+        let lower = sql.to_ascii_lowercase();
+        if let Some(cursor_at) = lower.find(" cursor ") {
+            if let Some(for_rel) = lower[cursor_at..].find(" for ") {
+                sql = sql[cursor_at + for_rel + 5..].trim();
+            }
+        }
+    }
+
     let sql = sql.trim().trim_end_matches(';').trim();
     if sql.is_empty() {
         None
