@@ -647,6 +647,10 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     let mut over_paren_depth: Option<usize> = None;
     let mut next_opens_over = false;
     let mut over_order_seen = false;
+    // Some(depth) while inside the parentheses of `CAST ( ... AS type )`:
+    // the AS there introduces a type name, not an alias
+    let mut cast_paren_depth: Option<usize> = None;
+    let mut next_opens_cast = false;
 
     let mut i = 0usize;
     while i < toks.len() {
@@ -667,9 +671,16 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             over_paren_depth = Some(depth);
                             next_opens_over = false;
                         }
+                        if next_opens_cast {
+                            cast_paren_depth = Some(depth);
+                            next_opens_cast = false;
+                        }
                     }
                     ")" => {
                         depth = depth.saturating_sub(1);
+                        if cast_paren_depth == Some(depth + 1) {
+                            cast_paren_depth = None;
+                        }
                         if over_paren_depth == Some(depth + 1) {
                             over_paren_depth = None;
                             if over_order_seen {
@@ -810,6 +821,25 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 }
 
                 let lw = w.to_lowercase();
+                // `cast (` opens a parenthesized type position — its AS is
+                // not an alias (see the alias bracketing below)
+                if lw == "cast" && matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") {
+                    next_opens_cast = true;
+                }
+
+                // --- alias after AS ---------------------------------------
+                // Bracket-quote identifiers in alias position: T-SQL
+                // reserved words (PLAN, KEY, …) are ordinary PostgreSQL
+                // aliases but break MSSQL parsing. Inside CAST's
+                // parentheses the AS introduces a type name, not an alias.
+                if out.last().is_some_and(|p| p.eq_ignore_ascii_case("as"))
+                    && cast_paren_depth.is_none_or(|d| depth != d)
+                    && is_plain_ident(w)
+                {
+                    out.push(bracket_ident(w)?);
+                    i += 1;
+                    continue;
+                }
                 match lw.as_str() {
                     "limit" if depth == 0 => {
                         // value token already validated by analyze(); TOP was

@@ -265,7 +265,7 @@ mod unit {
         assert_tsql(
             " SELECT count(*) AS count\n   FROM ONLY dbo_orders\n  WHERE active, (id > 5)",
             &orders_ctx(),
-            "SELECT count(*) AS count FROM [dbo].[Orders] WHERE active = 1 AND (id > 5)",
+            "SELECT count(*) AS [count] FROM [dbo].[Orders] WHERE active = 1 AND (id > 5)",
         );
     }
 
@@ -275,7 +275,7 @@ mod unit {
         assert_tsql(
             "SELECT count(*) AS count FROM public.dbo_orders WHERE ((note IS NOT NULL))",
             &orders_ctx(),
-            "SELECT count(*) AS count FROM [dbo].[Orders] WHERE ((note IS NOT NULL))",
+            "SELECT count(*) AS [count] FROM [dbo].[Orders] WHERE ((note IS NOT NULL))",
         );
     }
 
@@ -309,7 +309,7 @@ mod unit {
              \n LIMIT '3'::bigint",
             &orders_ctx(),
             "SELECT TOP (3) id, row_number() OVER(PARTITION BY customer_id ORDER BY id DESC) \
-             AS rn FROM [dbo].[Orders]",
+             AS [rn] FROM [dbo].[Orders]",
         );
     }
 
@@ -318,7 +318,7 @@ mod unit {
         assert_tsql(
             "SELECT id, rank() OVER (ORDER BY id) AS r FROM public.dbo_orders",
             &orders_ctx(),
-            "SELECT id, rank() OVER(ORDER BY id) AS r FROM [dbo].[Orders]",
+            "SELECT id, rank() OVER(ORDER BY id) AS [r] FROM [dbo].[Orders]",
         );
     }
 
@@ -496,6 +496,29 @@ mod unit {
         );
     }
 
+    // 2026-09-05 (Navigator widget SQL, test error 1.txt): aliases after AS
+    // are bracket-quoted — T-SQL reserved words (PLAN, KEY…) are ordinary
+    // PostgreSQL aliases but `AS plan` breaks MSSQL parsing
+    #[test]
+    fn tsql_reserved_alias_gets_bracketed() {
+        assert_tsql(
+            "SELECT sum(amount) AS plan FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [plan] FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT o.id FROM public.dbo_orders AS o",
+            &orders_ctx(),
+            "SELECT o.id FROM [dbo].[Orders] AS [o]",
+        );
+        // the AS inside CAST introduces a type name — untouched
+        assert_tsql(
+            "SELECT CAST(id AS bigint) FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(id AS bigint) FROM [dbo].[Orders]",
+        );
+    }
+
     // 2026-09-05 (Navigator widgets): the enclosing CALL's jsonb argument
     // rides along in the parameter list; only a placeholder that actually
     // appears in the T-SQL (as a whole token) requires type support
@@ -522,18 +545,18 @@ mod unit {
         assert_tsql(
             "SELECT count(comment) AS count FROM dbo_orders",
             &ctx,
-            "SELECT COUNT(CAST(comment AS nvarchar(max))) AS count FROM [dbo].[Orders]",
+            "SELECT COUNT(CAST(comment AS nvarchar(max))) AS [count] FROM [dbo].[Orders]",
         );
         assert_tsql(
             "SELECT count(\"Comment\") AS c FROM dbo_orders",
             &ctx,
-            "SELECT COUNT(CAST([Comment] AS nvarchar(max))) AS c FROM [dbo].[Orders]",
+            "SELECT COUNT(CAST([Comment] AS nvarchar(max))) AS [c] FROM [dbo].[Orders]",
         );
         // not a text column — untouched
         assert_tsql(
             "SELECT count(id) AS count FROM dbo_orders",
             &ctx,
-            "SELECT count(id) AS count FROM [dbo].[Orders]",
+            "SELECT count(id) AS [count] FROM [dbo].[Orders]",
         );
     }
 
@@ -893,7 +916,7 @@ mod unit {
         assert_tsql(
             "SELECT c.name, SUM(o.amount) AS total FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC LIMIT 5",
             &two_tables_ctx(),
-            "SELECT c.name, SUM(o.amount) AS total FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY CASE WHEN total IS NULL THEN 1 ELSE 0 END DESC, total DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY CASE WHEN total IS NULL THEN 1 ELSE 0 END DESC, total DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 
