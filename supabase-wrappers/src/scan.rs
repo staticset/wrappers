@@ -747,12 +747,14 @@ fn normalize_current_statement_sql(sql: &str) -> Option<String> {
     // this FDW). The cursor wrapper belongs to the PostgreSQL protocol and
     // must not travel to the remote server: T-SQL accepts `DECLARE … CURSOR
     // FOR …` too, but executing it merely DECLARES a server cursor and
-    // returns zero rows. Strip everything up to and including the ` FOR `.
+    // returns zero rows. Strip everything up to and including the FOR —
+    // whole-word matching, because postgres_fdw sends the query on the
+    // next line (`CURSOR FOR\nSELECT …`).
     if starts_with_ascii_keyword(sql, "declare") {
         let lower = sql.to_ascii_lowercase();
-        if let Some(cursor_at) = lower.find(" cursor ") {
-            if let Some(for_rel) = lower[cursor_at..].find(" for ") {
-                sql = sql[cursor_at + for_rel + 5..].trim();
+        if let Some(cursor_at) = find_ascii_keyword(&lower, "cursor") {
+            if let Some(for_rel) = find_ascii_keyword(&lower[cursor_at..], "for") {
+                sql = sql[cursor_at + for_rel + 3..].trim();
             }
         }
     }
