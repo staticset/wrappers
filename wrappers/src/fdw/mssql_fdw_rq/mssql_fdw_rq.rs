@@ -346,17 +346,20 @@ impl MssqlFdwRq {
     }
 
     /// Local column flags the translator needs: boolean columns (bare bit
-    /// predicates become `= 1`) and NOT NULL columns (only those may be
-    /// sorted without a NULL tiebreaker). Read straight from the relcache
-    /// (`to_regclass` + tuple descriptor) rather than through SPI: a
-    /// prepared statement executed from an FDW callback trips a pgrx
-    /// type-cache race when the statement itself runs through pgrx' SPI
-    /// (pg_test), and a catalog read failure degrades to empty sets with a
-    /// visible notice anyway — bool predicates must not fail the query.
-    fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>) {
+    /// predicates become `= 1`), NOT NULL columns (only those may be sorted
+    /// without a NULL tiebreaker) and `text` columns (their remote twin is
+    /// text/ntext/(MAX), which T-SQL refuses to COUNT directly). Read
+    /// straight from the relcache (`to_regclass` + tuple descriptor) rather
+    /// than through SPI: a prepared statement executed from an FDW callback
+    /// trips a pgrx type-cache race when the statement itself runs through
+    /// pgrx' SPI (pg_test), and a catalog read failure degrades to empty
+    /// sets with a visible notice anyway — bool predicates must not fail
+    /// the query.
+    fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>, Vec<String>) {
         let quote_ident = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
         let mut bools = Vec::new();
         let mut not_nulls = Vec::new();
+        let mut texts = Vec::new();
         for rel in relations {
             // to_regclass parses the regclass literal syntax, where an
             // UNquoted identifier folds to lowercase — mixed-case names
@@ -389,11 +392,14 @@ impl MssqlFdwRq {
                     bools.push(name.clone());
                 }
                 if attr.attnotnull {
-                    not_nulls.push(name);
+                    not_nulls.push(name.clone());
+                }
+                if attr.atttypid == pg_sys::TEXTOID {
+                    texts.push(name);
                 }
             }
         }
-        (bools, not_nulls)
+        (bools, not_nulls, texts)
     }
 
     /// Execute the query on a background task that streams rows through a
@@ -619,11 +625,12 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             ));
         }
 
-        let (bool_columns, not_null_columns) = Self::column_flags(&query.relations);
+        let (bool_columns, not_null_columns, text_columns) = Self::column_flags(&query.relations);
         let ctx = TranslateContext {
             relations,
             bool_columns,
             not_null_columns,
+            text_columns,
         };
         let tsql = translator::translate(&query.sql, &ctx)?;
         let params: Vec<Box<dyn tiberius::ToSql>> = query

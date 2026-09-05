@@ -15,6 +15,7 @@ mod unit {
             }],
             bool_columns: vec!["active".into()],
             not_null_columns: vec!["id".into()],
+            text_columns: vec![],
         }
     }
 
@@ -492,6 +493,31 @@ mod unit {
             "SELECT id FROM public.dbo_orders WHERE note = 'ascii'",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] WHERE note = 'ascii'",
+        );
+    }
+
+    // 2026-09-05 (VGU dbo.FactIPP): count over a remote LOB column must be
+    // CAST to nvarchar(max) — T-SQL rejects `Operand data type ntext is
+    // invalid for count operator`; non-LOB columns keep the plain form
+    #[test]
+    fn count_over_lob_column_gets_cast() {
+        let mut ctx = orders_ctx();
+        ctx.text_columns.push("comment".into());
+        assert_tsql(
+            "SELECT count(comment) AS count FROM dbo_orders",
+            &ctx,
+            "SELECT COUNT(CAST(comment AS nvarchar(max))) AS count FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT count(\"Comment\") AS c FROM dbo_orders",
+            &ctx,
+            "SELECT COUNT(CAST([Comment] AS nvarchar(max))) AS c FROM [dbo].[Orders]",
+        );
+        // not a text column — untouched
+        assert_tsql(
+            "SELECT count(id) AS count FROM dbo_orders",
+            &ctx,
+            "SELECT count(id) AS count FROM [dbo].[Orders]",
         );
     }
 
@@ -1870,7 +1896,7 @@ mod tests {
 
         Spi::run(
             "CREATE FOREIGN TABLE \"rq_DimTest\" (\
-               \"MonthId\" int, \"Val\" numeric(18,2) \
+               \"MonthId\" int, \"Val\" numeric(18,2), \"Note\" text \
              ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'DimTest')",
         )
         .unwrap();
@@ -1881,6 +1907,25 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(groups, 3, "GROUP BY over [MonthId] must push down");
+        Spi::run("DROP FOREIGN TABLE \"rq_DimTest\"").unwrap();
+    }
+
+    // count(<text column>) maps to COUNT(CAST(... AS nvarchar(max))): T-SQL
+    // rejects counting text/ntext/(MAX) directly (VGU dbo.FactIPP.comment)
+    #[pg_test]
+    fn count_over_lob_column() {
+        setup();
+
+        Spi::run(
+            "CREATE FOREIGN TABLE \"rq_DimTest\" (\
+               \"MonthId\" int, \"Val\" numeric(18,2), \"Note\" text \
+             ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'DimTest')",
+        )
+        .unwrap();
+        let noted: i64 = Spi::get_one("SELECT count(\"Note\") FROM \"rq_DimTest\"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(noted, 4, "4 of 6 rows carry a (MAX) note");
         Spi::run("DROP FOREIGN TABLE \"rq_DimTest\"").unwrap();
     }
 

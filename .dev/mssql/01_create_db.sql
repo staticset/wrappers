@@ -157,11 +157,15 @@ DROP TABLE IF EXISTS dbo.[DimTest];
 GO
 CREATE TABLE dbo.[DimTest] (
     [MonthId] int           NOT NULL,
-    [Val]     decimal(18,2) NULL
+    [Val]     decimal(18,2) NULL,
+    [Note]    nvarchar(max) NULL
 );
 GO
-INSERT INTO dbo.[DimTest] ([MonthId], [Val]) VALUES
-    (202601, 100.50), (202601, NULL),
-    (202602, 200.75), (202602, 50.25),
-    (202603, NULL),   (202603, 300.00);
+INSERT INTO dbo.[DimTest] ([MonthId], [Val], [Note]) VALUES
+    (202601, 100.50, N'первая'),
+    (202601, NULL,   NULL),
+    (202602, 200.75, N'вторая'),
+    (202602, 50.25,  N'третья'),
+    (202603, NULL,   NULL),
+    (202603, 300.00, N'четвёртая');
 GO

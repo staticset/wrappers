@@ -36,6 +36,10 @@ pub struct TranslateContext {
     /// implicit NULL ordering: PG puts NULLs last for ASC / first for DESC,
     /// while T-SQL always treats NULL as the smallest value)
     pub not_null_columns: Vec<String>,
+    /// local column names (lowercase) whose PostgreSQL type is `text` — the
+    /// remote column is then text/ntext/(MAX), which T-SQL refuses to COUNT
+    /// directly (`Operand data type ntext is invalid for count operator`)
+    pub text_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1118,6 +1122,26 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     });
                 }
 
+                // --- COUNT over a remote LOB column ------------------------
+                // a local `text` column is the import image of a remote
+                // text/ntext/(MAX) column, and T-SQL rejects COUNT over
+                // those outright; CAST to nvarchar(max) is the standard
+                // workaround and does not change the count (non-NULL rows)
+                if lw == "count" && matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") {
+                    if let Some((pieces, arg_len)) = lob_count_arg(&toks[i + 2..], ctx) {
+                        out.push("COUNT".to_string());
+                        out.push("(".to_string());
+                        out.push("CAST".to_string());
+                        out.push("(".to_string());
+                        out.extend(pieces);
+                        out.push("AS".to_string());
+                        out.push("nvarchar(max))".to_string());
+                        out.push(")".to_string());
+                        i += 2 + arg_len + 1; // '(' arg ')'
+                        continue;
+                    }
+                }
+
                 out.push(w.clone());
             }
         }
@@ -1251,6 +1275,51 @@ fn is_plain_ident(piece: &str) -> bool {
             .chars()
             .all(|c| c.is_alphanumeric() || matches!(c, '_' | ']' | '[' | '.'))
         && !NON_SUBJECT_WORDS.contains(&piece.to_lowercase().as_str())
+}
+
+/// Match `col` or `t . col` — the deparser's spelling of a CountColumn Var —
+/// when the final segment names a remote-LOB column (local `text` twin) and
+/// the argument is directly closed by `)`. Returns the rendered T-SQL pieces
+/// plus the number of argument tokens consumed; `count(*)`, `count(DISTINCT
+/// x)` and expressions yield `None` and take the generic path.
+fn lob_count_arg(toks: &[Tok], ctx: &TranslateContext) -> Option<(Vec<String>, usize)> {
+    let mut pieces = Vec::new();
+    let mut last_name;
+    match toks.first()? {
+        Tok::Word(w) => {
+            last_name = w.to_lowercase();
+            pieces.push(w.clone());
+        }
+        Tok::QIdent(q) => {
+            last_name = q.to_lowercase();
+            pieces.push(bracket_ident(q).ok()?);
+        }
+        _ => return None,
+    }
+    let mut len = 1usize;
+    while matches!(toks.get(len), Some(Tok::Op(o)) if o == ".") {
+        match toks.get(len + 1) {
+            Some(Tok::Word(w)) => {
+                last_name = w.to_lowercase();
+                pieces.push(".".to_string());
+                pieces.push(w.clone());
+            }
+            Some(Tok::QIdent(q)) => {
+                last_name = q.to_lowercase();
+                pieces.push(".".to_string());
+                pieces.push(bracket_ident(q).ok()?);
+            }
+            _ => return None,
+        }
+        len += 2;
+    }
+    if !matches!(toks.get(len), Some(Tok::Op(o)) if o == ")") {
+        return None;
+    }
+    if !ctx.text_columns.contains(&last_name) {
+        return None;
+    }
+    Some((pieces, len))
 }
 
 /// Capture the start index of the "subject" expression that ends at the end of
