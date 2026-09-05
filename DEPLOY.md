@@ -315,18 +315,22 @@ SELECT * FROM ext.mssql_fdw_rq_meta();   -- самопроверка: верси
   всё это понимает (алиасы + varchar ⇒ нужны `2692f74`/`50d94d9`/`d3dfc52`,
   т.е. любая сборка новее этих коммитов).
 
-⇒ `sdatawrapper` оставляем `tds_fdw`, а шаблоны `screateserver`/`salterserver`
-подменяем на наш FDW `mssql_wrapper` (сервер создаётся по нашим шаблонам,
-остальное работает штатно):
+⇒ `sdatawrapper` оставляем `tds_fdw`, `sname` оставляем `MS SQL`, а шаблоны
+`screateserver`/`salterserver` подменяем на наш FDW `mssql_wrapper` (сервер
+создаётся по нашим шаблонам, остальное работает штатно):
 
 ```sql
 -- 0) бэкап строки
 CREATE TABLE data.tdicdatawrapper_nid3_backup_20260905 AS
   SELECT * FROM data.tdicdatawrapper WHERE nid = 3;
 
--- 1) подмена (dollar-quoting из-за кавычек в шаблонах)
+-- 1) подмена шаблонов (dollar-quoting из-за кавычек в шаблонах).
+--    ВАЖНО: sname НЕ трогаем — это функциональный ключ, по которому
+--    ветвится vendor-код (напр. arm.setusersource_v40:
+--    _sDB IN ('Clickhouse','PostgreSQL','MS SQL','MySQL','Oracle',...)).
+--    Переименование («MS SQL (Rubicon)») молча пропускает создание
+--    foreign-таблицы источника: каталог обновится, таблицы не будет.
 UPDATE data.tdicdatawrapper SET
-  sname = 'MS SQL (Rubicon)',
   screateserver = $ddl$CREATE SERVER [**sDBForeignName**]
   FOREIGN DATA WRAPPER mssql_wrapper
   OPTIONS (conn_string 'Server=[**sHost**],[**sPort**];Database=[**sDBName**];IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true'[**sOptions**]);
@@ -353,7 +357,7 @@ WHERE nid = 3;
 
 ### 7.4 Проверка
 
-1. UI: в списке типов подключений есть «MS SQL (Rubicon)».
+1. UI: в списке типов подключений есть «MS SQL» (ведёт к нашему FDW).
 2. Создать подключение к MSSQL → появился сервер
    `navigator_mssql_<id>` с `conn_string` и `USER MAPPING FOR as_admin`:
    ```sql
