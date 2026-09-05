@@ -811,7 +811,37 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 }
                 out.push(o.clone());
             }
-            Tok::Num(n) => out.push(n.clone()),
+            Tok::Num(n) => {
+                // PostgreSQL allows positional GROUP BY / ORDER BY
+                // (`GROUP BY 2` — postgres_fdw deparses output-column
+                // references this way); T-SQL has no ordinals there, so the
+                // referenced SELECT-list expression is substituted verbatim
+                if depth == 0
+                    && out.last().is_some_and(|p| {
+                        // `BY` alone or the composite `ORDER BY` / `GROUP BY`
+                        p.eq_ignore_ascii_case("by") || p.to_ascii_uppercase().ends_with(" BY")
+                    })
+                {
+                    let idx: usize =
+                        n.parse()
+                            .map_err(|_| TranslateError::UnsupportedConstruct {
+                                sql_fragment: format!("BY {n}"),
+                                reason: "unparseable positional reference".to_string(),
+                            })?;
+                    let Some(expr) = positional_select_item(&out, idx) else {
+                        return Err(TranslateError::UnsupportedConstruct {
+                            sql_fragment: format!("BY {n}"),
+                            reason: "positional reference does not point at a \
+                                     SELECT-list item"
+                                .to_string(),
+                        });
+                    };
+                    out.push(expr);
+                    i += 1;
+                    continue;
+                }
+                out.push(n.clone());
+            }
             Tok::Str(s) => out.push(tsql_string_literal(s)),
             Tok::Param(p) => out.push(format!("@P{p}")),
             Tok::QIdent(name) => {
@@ -1344,6 +1374,59 @@ fn unbracket(name: &str) -> &str {
     name.strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(name)
+}
+
+/// Resolve a positional reference (`GROUP BY 2`) to the n-th SELECT-list
+/// expression already rendered in `out`, without its output alias. Returns
+/// None when the list cannot be located (e.g. subqueries in the target
+/// list shifted the FROM boundary) — callers reject then.
+fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
+    if idx == 0 {
+        return None;
+    }
+    let select_at = out.iter().position(|p| p.eq_ignore_ascii_case("SELECT"))?;
+    // the first FROM after the SELECT closes the target list (target-list
+    // subqueries are rejected elsewhere; a stray inner FROM makes the span
+    // too short and the lookup miss — fail-closed)
+    let from_at = out
+        .iter()
+        .skip(select_at + 1)
+        .position(|p| p.eq_ignore_ascii_case("FROM"))?
+        + select_at
+        + 1;
+    // split the span on top-level commas
+    let mut items: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut paren = 0i32;
+    for piece in &out[select_at + 1..from_at] {
+        if piece == "(" {
+            paren += 1;
+        } else if piece == ")" {
+            paren -= 1;
+        }
+        if paren == 0 && piece == "," {
+            items.push(std::mem::take(&mut current));
+        } else {
+            current.push(piece.clone());
+        }
+    }
+    items.push(current);
+    let mut item = items.into_iter().nth(idx - 1)?;
+    // drop the output alias: `expr AS name` (positional refs point at the
+    // expression; T-SQL allows no alias in GROUP BY/ORDER BY position) —
+    // resolved on pieces so a literal ` AS ` inside a string cannot fool it
+    if let Some(as_pos) = item.iter().rposition(|p| p.eq_ignore_ascii_case("as")) {
+        // an `AS` that is not the last piece of the item is part of the
+        // expression (e.g. a trailing CAST type) — only strip a trailing one
+        let is_trailing = item[as_pos + 1..]
+            .iter()
+            .all(|p| p == "," || is_plain_ident(p) || p.starts_with('['));
+        if is_trailing {
+            item.truncate(as_pos);
+        }
+    }
+    let item = item.join(" ").trim().to_string();
+    if item.is_empty() { None } else { Some(item) }
 }
 
 fn is_plain_ident(piece: &str) -> bool {

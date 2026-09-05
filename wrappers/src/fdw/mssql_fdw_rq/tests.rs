@@ -496,6 +496,29 @@ mod unit {
         );
     }
 
+    // 2026-09-05 (bridge via postgres_fdw): positional GROUP BY / ORDER BY
+    // (`GROUP BY 2`) — postgres_fdw deparses output-column refs this way;
+    // T-SQL has no ordinals, the referenced SELECT expression is substituted
+    // without its output alias
+    #[test]
+    fn positional_group_by_resolved() {
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY 2",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        assert_tsql(
+            "SELECT CAST(id AS bigint) AS bid, name FROM public.dbo_orders GROUP BY 2",
+            &orders_ctx(),
+            "SELECT CAST(id AS bigint) AS [bid], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        assert_tsql(
+            "SELECT id, amount FROM public.dbo_orders ORDER BY 2 DESC",
+            &orders_ctx(),
+            "SELECT id, amount FROM [dbo].[Orders] ORDER BY CASE WHEN amount IS NULL THEN 1 ELSE 0 END DESC, amount DESC",
+        );
+    }
+
     // 2026-09-05 (Navigator widget SQL, test error 1.txt): aliases after AS
     // are bracket-quoted — T-SQL reserved words (PLAN, KEY…) are ordinary
     // PostgreSQL aliases but `AS plan` breaks MSSQL parsing
