@@ -101,8 +101,14 @@ Manual checklist (not covered by CI):
    account, Kerberos enabled in the network protocol settings.
 4. `CREATE SERVER … OPTIONS (conn_string 'Server=<fqdn>,1433;…',
    auth 'kerberos')` — no user mapping needed.
-5. `select count(*) from dbo_orders;` — check `wrappers_fdw_stats` and the
-   MSSQL `sys.dm_exec_sessions.auth_scheme` column shows `Kerberos`.
+5. `select count(*) from dbo_orders;` — check the MSSQL
+   `sys.dm_exec_sessions.auth_scheme` column shows `Kerberos`.
+
+Note: this FDW does not write to `ext.wrappers_fdw_stats`. The framework's
+stats collector does one SPI `INSERT … ON CONFLICT` per scan as the calling
+role, which fails (and aborts the scan) wherever that table's ACL does not
+cover the role — e.g. Navigator's `as_admin` — so the calls were removed
+entirely; nothing consumes the counters on this deployment.
 
 ## Sber Navigator integration
 

@@ -1221,8 +1221,7 @@ mod tests {
     /// The framework deparses the TOP-LEVEL statement for join queries, which
     /// inside a #[pg_test] is the test function call. The join acceptance
     /// query therefore runs through dblink (a real top-level statement) in a
-    /// dedicated database: committed catalog objects, and no contention with
-    /// the parallel test transactions (wrappers_fdw_stats lives per-database).
+    /// dedicated database with committed catalog objects.
     fn setup_committed() {
         let password = mssql_password();
         let admin_conn = Spi::get_one::<String>(
@@ -1568,11 +1567,10 @@ mod tests {
     }
 
     // IMPORT FOREIGN SCHEMA — how BI tools introspect a source. Runs through
-    // a dblink session: the FDW's stats collector calls SPI, and SPI from an
-    // FDW callback nested inside a utility statement trips a pgrx type-read
-    // race under #[pg_test]'s SPI nesting (same class as the PREPARE/EXECUTE
-    // workaround); a top-level session, which is what Navigator uses, is
-    // unaffected.
+    // a dblink session (a real top-level statement over committed catalog
+    // objects, mirroring how Navigator uses it). Historically this also
+    // sidestepped a pgrx SPI-nesting race triggered by the stats collector's
+    // writes, which the FDW no longer performs.
     #[pg_test]
     fn import_foreign_schema_via_top_level_session() {
         setup_committed();
@@ -1766,21 +1764,35 @@ mod tests {
         assert_eq!(cnt, 40);
     }
 
+    // Bare bit columns in predicate position become `= 1` / `= 0`. Split into
+    // one #[pg_test] per statement: several full-query scans in a single
+    // pg_test function trip a pgrx 0.16 result-TupleDesc staleness
+    // ("cache lookup failed for type 0") once the FDW no longer performs an
+    // SPI write during the scan — top-level sessions (production, dblink
+    // tests) are unaffected.
     #[pg_test]
     fn bare_boolean_predicates() {
         setup();
 
-        // bare bit columns in predicate position become `= 1` (25 customers,
-        // codes 7/14/21 inactive)
         let active = Spi::get_one::<i64>("SELECT count(*) FROM rq_customers WHERE active")
             .unwrap()
             .unwrap();
         assert_eq!(active, 22);
+    }
+
+    #[pg_test]
+    fn bare_boolean_predicates_not() {
+        setup();
 
         let inactive = Spi::get_one::<i64>("SELECT count(*) FROM rq_customers WHERE NOT active")
             .unwrap()
             .unwrap();
         assert_eq!(inactive, 3);
+    }
+
+    #[pg_test]
+    fn bare_boolean_predicates_and() {
+        setup();
 
         let delivered = Spi::get_one::<i64>(
             "SELECT count(*) FROM rq_shipments WHERE delivered AND order_id <= 20",

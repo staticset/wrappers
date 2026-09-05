@@ -1,7 +1,7 @@
-use crate::stats;
+use pgrx::PgRelation;
 use pgrx::pg_sys;
-use pgrx::spi::Spi;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::time::Instant;
 use tiberius::{Client, Config};
 use tokio::net::TcpStream;
@@ -248,26 +248,12 @@ pub(crate) struct MssqlFdwRq {
     /// rows arrive from a background task through a bounded channel, so
     /// large results never sit fully in memory (TZ §6.1 streaming)
     rx: Option<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>,
-    rows_out: i64,
     tgt_cols: Vec<Column>,
     /// what to re-execute when PostgreSQL rescans this ForeignScan
     rescan_plan: Option<ScanPlan>,
 }
 
 impl MssqlFdwRq {
-    const FDW_NAME: &'static str = "MssqlFdwRq";
-
-    /// Flush row counters into the statistics view. Rows of a stream that is
-    /// abandoned mid-flight (a LIMIT further up the plan stops pulling, a
-    /// rescan restarts the scan) would otherwise never be counted.
-    fn flush_row_stats(&mut self) {
-        if self.rows_out != 0 {
-            stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsIn, self.rows_out);
-            stats::inc_stats(Self::FDW_NAME, stats::Metric::RowsOut, self.rows_out);
-            self.rows_out = 0;
-        }
-    }
-
     /// Read the current user's user-mapping options for this server, if a
     /// mapping exists (the framework itself only exposes server options).
     unsafe fn user_mapping_options(server_oid: pg_sys::Oid) -> HashMap<String, String> {
@@ -361,50 +347,49 @@ impl MssqlFdwRq {
 
     /// Local column flags the translator needs: boolean columns (bare bit
     /// predicates become `= 1`) and NOT NULL columns (only those may be
-    /// sorted without a NULL tiebreaker). A catalog read failure degrades to
-    /// empty sets with a visible notice instead of failing the whole query —
-    /// otherwise bool predicates fail on the server with an opaque error.
+    /// sorted without a NULL tiebreaker). Read straight from the relcache
+    /// (`to_regclass` + tuple descriptor) rather than through SPI: a
+    /// prepared statement executed from an FDW callback trips a pgrx
+    /// type-cache race when the statement itself runs through pgrx' SPI
+    /// (pg_test), and a catalog read failure degrades to empty sets with a
+    /// visible notice anyway — bool predicates must not fail the query.
     fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>) {
-        Spi::connect(|client| {
-            let mut bools = Vec::new();
-            let mut not_nulls = Vec::new();
-            for rel in relations {
-                // names come from the local catalog; quotes are doubled so
-                // the regclass literal stays a literal
-                let sql = format!(
-                    "SELECT a.attname::text AS attname, (a.atttypid = 'bool'::pg_catalog.regtype) AS is_bool, a.attnotnull AS not_null FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = '{}.{}'::pg_catalog.regclass AND a.attnum > 0 AND NOT a.attisdropped",
-                    rel.local_schema.replace('\'', "''"),
-                    rel.local_table.replace('\'', "''"),
+        let mut bools = Vec::new();
+        let mut not_nulls = Vec::new();
+        for rel in relations {
+            // names go through to_regclass, which parses the same
+            // possibly-quoted dotted syntax the regclass literal used before
+            let Ok(relation) = PgRelation::open_with_name_and_share_lock(&format!(
+                "{}.{}",
+                rel.local_schema, rel.local_table
+            )) else {
+                pgrx::notice!(
+                    "mssql_fdw_rq: could not open {}.{} to read column flags; \
+                     bare boolean predicates and NULL-safe sorting are unavailable for this query",
+                    rel.local_schema,
+                    rel.local_table
                 );
-                let Ok(table) = client.select(&sql, None, &[]) else {
+                continue;
+            };
+            for attr in relation.tuple_desc().iter() {
+                if attr.attnum <= 0 || attr.attisdropped {
+                    continue;
+                }
+                // SAFETY: NameData is a fixed-length, NUL-terminated name
+                let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) };
+                let Ok(name) = name.to_str() else {
                     continue;
                 };
-                for row in table {
-                    let (Ok(Some(name)), Ok(Some(is_bool)), Ok(Some(not_null))) = (
-                        row.get_by_name::<&str, _>("attname"),
-                        row.get_by_name::<bool, _>("is_bool"),
-                        row.get_by_name::<bool, _>("not_null"),
-                    ) else {
-                        continue;
-                    };
-                    let name = name.to_lowercase();
-                    if is_bool {
-                        bools.push(name.clone());
-                    }
-                    if not_null {
-                        not_nulls.push(name);
-                    }
+                let name = name.to_lowercase();
+                if attr.atttypid == pg_sys::BOOLOID {
+                    bools.push(name.clone());
+                }
+                if attr.attnotnull {
+                    not_nulls.push(name);
                 }
             }
-            Ok::<_, pgrx::spi::SpiError>((bools, not_nulls))
-        })
-        .unwrap_or_else(|e| {
-            pgrx::notice!(
-                "mssql_fdw_rq: could not read column flags from the local catalog ({e}); \
-                 bare boolean predicates and NULL-safe sorting are unavailable for this query"
-            );
-            (Vec::new(), Vec::new())
-        })
+        }
+        (bools, not_nulls)
     }
 
     /// Execute the query on a background task that streams rows through a
@@ -495,14 +480,11 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .get("log_remote_query")
             .is_some_and(|v| v == "true");
 
-        stats::inc_stats(Self::FDW_NAME, stats::Metric::CreateTimes, 1);
-
         Ok(MssqlFdwRq {
             rt,
             config,
             log_remote_query,
             rx: None,
-            rows_out: 0,
             tgt_cols: Vec::new(),
             rescan_plan: None,
         })
@@ -653,7 +635,6 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         });
         let started = Instant::now();
         self.rx = Some(self.spawn_streaming_query(tsql.clone(), params)?);
-        self.rows_out = 0;
         if self.log_remote_query {
             pgrx::log!(
                 "mssql_fdw_rq: remote query dispatched ({} ms): {}",
@@ -704,7 +685,6 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             pgrx::log!("mssql_fdw_rq: remote query: {sql}");
         }
         self.rx = Some(self.spawn_streaming_query(sql, params)?);
-        self.rows_out = 0;
 
         Ok(())
     }
@@ -724,13 +704,11 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                     tgt_row.push(&tgt_col.name, cell);
                 }
                 row.replace_with(tgt_row);
-                self.rows_out += 1;
                 Ok(Some(()))
             }
             Some(Err(e)) => Err(e.into()),
             None => {
-                // stream exhausted: finalize the row counters
-                self.flush_row_stats();
+                // stream exhausted
                 self.rx = None;
                 Ok(None)
             }
@@ -753,15 +731,11 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         }
         self.rx = None;
         self.rx = Some(self.spawn_streaming_query(sql, params)?);
-        // rows of the abandoned stream still count toward the statistics
-        self.flush_row_stats();
         Ok(())
     }
 
     fn end_scan(&mut self) -> MssqlFdwRqResult<()> {
-        // dropping the receiver cancels the background query task; rows
-        // already pulled from it still count toward the statistics
-        self.flush_row_stats();
+        // dropping the receiver cancels the background query task
         self.rx = None;
         Ok(())
     }
