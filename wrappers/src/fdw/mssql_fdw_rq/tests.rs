@@ -916,7 +916,7 @@ mod unit {
         assert_tsql(
             "SELECT c.name, SUM(o.amount) AS total FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC LIMIT 5",
             &two_tables_ctx(),
-            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY CASE WHEN [total] IS NULL THEN 1 ELSE 0 END DESC, [total] DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY [total] DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 

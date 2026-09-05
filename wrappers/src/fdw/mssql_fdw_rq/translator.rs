@@ -657,6 +657,9 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     // the AS there introduces a type name, not an alias
     let mut cast_paren_depth: Option<usize> = None;
     let mut next_opens_cast = false;
+    // output aliases declared in this statement (`AS plan`) — ORDER BY keys
+    // matching one are bare items on MSSQL and take no NULL tiebreaker
+    let mut declared_aliases: HashSet<String> = HashSet::new();
 
     let mut i = 0usize;
     while i < toks.len() {
@@ -766,7 +769,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "," if in_order && depth == 0 => {
                         // close the previous ORDER BY item, start the next
                         if !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
                         }
                         out.push(",".to_string());
@@ -844,6 +847,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     && cast_paren_depth.is_none_or(|d| depth != d)
                     && is_plain_ident(w)
                 {
+                    declared_aliases.insert(lw.clone());
                     out.push(bracket_ident(w)?);
                     i += 1;
                     continue;
@@ -869,7 +873,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // injected at the SELECT, otherwise the OFFSET/FETCH
                         // clause belongs at this position (right after ORDER BY)
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -890,7 +894,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     // OFFSET): the canonical clause was emitted already
                     "fetch" if depth == 0 && clauses.limit_len > 0 && clauses.offset.is_none() => {
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -913,7 +917,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // in canonical form, so consume everything analyze
                         // measured for this clause
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -980,7 +984,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     {
                         in_condition_clause = false;
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None)?;
+                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -1001,7 +1005,13 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             // the NULLS branch below owns the item rewrite
                             out.push(if desc { "DESC" } else { "ASC" }.to_string());
                         } else {
-                            close_order_item(&mut out, ctx, case_depth, Some(desc))?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                Some(desc),
+                                &declared_aliases,
+                            )?;
                             order_item_closed = true;
                         }
                         i += 1;
@@ -1205,7 +1215,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
 
     // an ORDER BY list can end with the statement itself
     if in_order && !order_item_closed {
-        close_order_item(&mut out, ctx, case_depth, None)?;
+        close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
     }
 
     Ok(join_pieces(&out))
@@ -1244,6 +1254,7 @@ fn close_order_item(
     ctx: &TranslateContext,
     case_depth: usize,
     desc: Option<bool>,
+    declared_aliases: &HashSet<String>,
 ) -> Result<(), TranslateError> {
     let start = capture_subject(out, case_depth)?;
     let expr = out[start..].join(" ");
@@ -1261,8 +1272,14 @@ fn close_order_item(
         && ctx
             .not_null_columns
             .contains(&unbracket(&expr).to_lowercase());
+    // an output alias is only usable as a bare ORDER BY item on MSSQL —
+    // wrapping it in the NULL-tiebreaker CASE would resolve it as a column
+    // and fail; the tiebreaker is skipped (T-SQL NULL ordering applies)
+    let bare_alias = out.len() - start == 1
+        && !expr.contains(' ')
+        && declared_aliases.contains(&unbracket(&expr).to_lowercase());
 
-    if bare_not_null {
+    if bare_not_null || bare_alias {
         if desc == Some(true) {
             out.push("DESC".to_string());
         }
