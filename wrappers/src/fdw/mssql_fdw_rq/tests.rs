@@ -637,6 +637,21 @@ mod unit {
             map("nvarchar", Some(100), None, None, None).as_deref(),
             Some("varchar(100)")
         );
+        // (MAX) columns report 2^31-1 through INFORMATION_SCHEMA
+        // (VGU dbo.FactIPP."comment") — must become unlimited text, not
+        // varchar(2147483647) which PostgreSQL refuses to create
+        assert_eq!(
+            map("nvarchar", Some(2_147_483_647), None, None, None).as_deref(),
+            Some("text")
+        );
+        assert_eq!(
+            map("varchar", Some(10_485_761), None, None, None).as_deref(),
+            Some("text")
+        );
+        assert_eq!(
+            map("varchar", Some(10_485_760), None, None, None).as_deref(),
+            Some("varchar(10485760)")
+        );
         assert_eq!(
             map("uniqueidentifier", None, None, None, None).as_deref(),
             Some("uuid")

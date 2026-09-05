@@ -94,9 +94,12 @@ pub(super) fn mssql_type_to_pg(
             Some(n) if n > 0 => format!("char({n})"),
             _ => "char(1)".to_string(),
         },
-        // -1 / NULL length means (MAX) or a text type → unlimited
+        // -1 / NULL length means (MAX) or a text type → unlimited. (MAX)
+        // columns report CHARACTER_MAXIMUM_LENGTH = 2147483647 through
+        // INFORMATION_SCHEMA, and PostgreSQL refuses to create varchar
+        // longer than 10485760 — anything at or above that maps to text
         "varchar" | "nvarchar" | "text" | "ntext" => match char_len {
-            Some(n) if n > 0 => format!("varchar({n})"),
+            Some(n) if n > 0 && n <= 10_485_760 => format!("varchar({n})"),
             _ => "text".to_string(),
         },
         "uniqueidentifier" => "uuid".to_string(),
