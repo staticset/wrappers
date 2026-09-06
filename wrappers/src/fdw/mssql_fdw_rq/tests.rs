@@ -563,6 +563,26 @@ mod unit {
         );
     }
 
+    // 2026-09-06 review А7: a quoted boolean column passed through bare —
+    // `WHERE "IsActive"` became a naked bit expression, which T-SQL rejects
+    // (error 4145). Quoted spelling is the only way to reference IMPORTed
+    // mixed-case columns, so the rewrite must apply there too.
+    #[test]
+    fn quoted_bool_column_in_predicate() {
+        let mut ctx = orders_ctx();
+        ctx.bool_columns.push("isactive".into());
+        assert_tsql(
+            "SELECT id FROM dbo_orders WHERE \"IsActive\"",
+            &ctx,
+            "SELECT id FROM [dbo].[Orders] WHERE [IsActive] = 1",
+        );
+        assert_tsql(
+            "SELECT id FROM dbo_orders WHERE NOT \"IsActive\"",
+            &ctx,
+            "SELECT id FROM [dbo].[Orders] WHERE [IsActive] = 0",
+        );
+    }
+
     // #2: E'' literals must decode escape sequences; PG deparses Windows
     // paths as E'C:\\temp\\' and the raw body compared wrong on MSSQL
     #[test]
@@ -1449,6 +1469,13 @@ mod tests {
                    shipped_on timestamp, delivered boolean\
                  ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'shipments')"
                     .to_string(),
+                // order_items carries the only tinyint column of the schema
+                // (discount_pct) — IMPORT maps it to smallint
+                "CREATE FOREIGN TABLE rq_order_items (\
+                   id bigint, order_id bigint, product_id int, qty smallint, \
+                   unit_price numeric(18,2), discount_pct smallint\
+                 ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'order_items')"
+                    .to_string(),
             ];
             for sql in &ddl {
                 c.update(sql, None, &[]).unwrap();
@@ -1581,6 +1608,34 @@ mod tests {
         ))
         .unwrap();
         assert!(matched.is_some(), "parameter path shifted the instant");
+    }
+
+    // 2026-09-06 review Р3: IMPORT maps MSSQL tinyint to smallint, but the
+    // INT2 read path only tried i16 — tiberius decodes tinyint strictly as
+    // u8, so every read of a tinyint column failed. The only tinyint column
+    // of the schema was not part of the e2e setup; now it is.
+    #[pg_test]
+    fn tinyint_column_reads_through_smallint_mapping() {
+        setup();
+        let rows: Vec<(i64, i16)> = Spi::connect(|c| {
+            c.select(
+                "SELECT id, discount_pct FROM rq_order_items ORDER BY id LIMIT 5",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| {
+                Some((
+                    r.get_by_name::<i64, _>("id").unwrap()?,
+                    r.get_by_name::<i16, _>("discount_pct").unwrap()?,
+                ))
+            })
+            .collect()
+        });
+        assert_eq!(rows.len(), 5);
+        // seed: discount_pct = n % 15 for item id n
+        assert_eq!(rows[0], (1, 1));
+        assert_eq!(rows[4], (5, 5));
     }
 
     /// The framework deparses the TOP-LEVEL statement for join queries, which
@@ -1748,6 +1803,41 @@ mod tests {
         });
         Spi::run("SELECT dblink_disconnect('rqprep')").unwrap();
         assert_eq!(cnt, 3);
+    }
+
+    // 2026-09-06 review А6: re-planning a prepared JOIN at EXECUTE time,
+    // stmt_location points into the PREPARE text while debug_query_string
+    // is "EXECUTE pj" — the top-statement text is unavailable. The join gate
+    // used to treat that as "mentions everything", building a remote path
+    // whose SQL could not be reconstructed → hard "failed to deparse"
+    // error. Unavailable text now serves the query locally over plain
+    // scans (single-table PREPARE is unaffected: pg_get_querydef deparses
+    // it without needing the statement text).
+    #[pg_test]
+    fn prepared_join_executes_locally() {
+        setup_committed();
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqpj', {conn})")).unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqpj', \
+             $$PREPARE pj AS SELECT count(*)::text AS cnt FROM rqj_orders o \
+               JOIN rqj_customers c ON o.customer_id = c.id$$)",
+        )
+        .unwrap();
+        let cnt: String = Spi::connect(|c| {
+            c.select(
+                "SELECT * FROM dblink('rqpj', $$EXECUTE pj$$) AS t(cnt text)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<&str, _>("cnt").unwrap().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("count")
+        });
+        Spi::run("SELECT dblink_disconnect('rqpj')").unwrap();
+        assert_eq!(cnt, "60"); // every order joins exactly one customer
     }
 
     #[pg_test]
@@ -2278,6 +2368,35 @@ mod tests {
         let n: i64 = Spi::get_one("SELECT rq_widget_join()").unwrap().unwrap();
         assert!(n > 0, "SPI-wrapped join must execute locally, got {n}");
         Spi::run("DROP FUNCTION rq_widget_join()").unwrap();
+    }
+
+    // 2026-09-06 review А5: the top-statement gate used substring matching,
+    // so a string argument naming the source (`'public.rq_orders'`, the Sber
+    // Navigator CALL shape) counted as a mention: a remote path was built
+    // and the scan-time lexical check then failed the whole query. The gate
+    // now skips string literals, so this serves locally like the case above.
+    #[pg_test]
+    fn spi_call_with_table_name_literal_executes_locally() {
+        setup();
+
+        Spi::run(
+            "CREATE FUNCTION rq_widget_source(p text) RETURNS bigint LANGUAGE plpgsql AS $$ \
+               DECLARE n bigint; \
+               BEGIN \
+                 SELECT count(*) INTO n FROM rq_orders o \
+                   JOIN rq_customers c ON o.customer_id = c.id; \
+                 RETURN n; \
+               END $$",
+        )
+        .unwrap();
+        let n: i64 = Spi::get_one("SELECT rq_widget_source('public.rq_orders')")
+            .unwrap()
+            .unwrap();
+        assert!(
+            n > 0,
+            "join with a table-name literal in the CALL must execute locally, got {n}"
+        );
+        Spi::run("DROP FUNCTION rq_widget_source(text)").unwrap();
     }
 
     // An unused statement parameter of an unsupported type (Navigator's

@@ -501,7 +501,15 @@ pub(super) fn field_to_cell(
             src_row.try_get::<bool, usize>(idx)?.map(Cell::Bool)
         }
         PgOid::BuiltIn(PgBuiltInOids::INT2OID) => {
-            src_row.try_get::<i16, usize>(idx)?.map(Cell::I16)
+            // IMPORT maps MSSQL tinyint to smallint, and tiberius decodes a
+            // tinyint column strictly as u8 — widen when i16 misses
+            if let Ok(v) = src_row.try_get::<i16, usize>(idx) {
+                v.map(Cell::I16)
+            } else {
+                src_row
+                    .try_get::<u8, usize>(idx)?
+                    .map(|v| Cell::I16(i16::from(v)))
+            }
         }
         PgOid::BuiltIn(PgBuiltInOids::INT4OID) => {
             // MSSQL aggregate results are int32 even when Postgres expects

@@ -886,6 +886,20 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     i += consumed;
                     continue;
                 }
+                // quoted boolean column in predicate position gets the same
+                // `= 1` rewrite as bare words: IMPORT keeps the remote
+                // spelling and the deparser emits those columns quoted —
+                // `WHERE "IsActive"` — the only way to reference them
+                if ctx.bool_columns.contains(&name.to_lowercase())
+                    && last_piece_is(&out, &PREDICATE_START)
+                    && next_is_continuation(&toks, i + 1)
+                {
+                    let negated = pop_if_word(&mut out, "not");
+                    let rendered = bracket_ident(name)?;
+                    out.push(format!("{rendered} = {}", if negated { 0 } else { 1 }));
+                    i += 1;
+                    continue;
+                }
                 out.push(bracket_ident(name)?);
             }
             Tok::Word(w) => {

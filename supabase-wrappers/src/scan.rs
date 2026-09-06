@@ -646,24 +646,149 @@ unsafe fn filter_resjunk_tlist(tlist: *mut pg_sys::List) -> *mut pg_sys::List {
 /// deparsed mid-planning, so their remote SQL comes from the top-level
 /// statement text instead — which, under SPI or PL/pgSQL, is the enclosing
 /// CALL (Sber Navigator widget queries run through
-/// `call ui.portal_arm_main_command(...)`). That text never mentions the
-/// tables; a remote path built from it is unusable and would fail the whole
-/// query at scan time. Path-add callbacks must check this and skip the
-/// remote path, letting PostgreSQL execute locally over per-table scans.
-/// Returns `true` when the statement text is unavailable (keep the
-/// historical behavior — the scan-time relation check still guards).
+/// `call ui.portal_arm_main_command('public.report')`). That text never
+/// mentions the tables as identifiers; a remote path built from it is
+/// unusable and would fail the whole query at scan time. Path-add callbacks
+/// must check this and skip the remote path, letting PostgreSQL execute
+/// locally over per-table scans.
+///
+/// Matching is lexical: whole identifiers only, skipping string literals,
+/// comments and dollar-quoted blocks — a substring hit (`report` inside
+/// `'public.report'`, `users` inside `appusers`) must not green-light the
+/// wrong text. Only the table name is matched: every genuine reference to
+/// the relation carries it, while a bare schema-name match (e.g. `public`)
+/// is pure false-positive surface. Returns `false` when the statement text
+/// is unavailable: the historical `true` kept remote paths alive whose SQL
+/// could then not be reconstructed (re-planning a prepared statement at
+/// EXECUTE time — stmt_location points into the PREPARE text, not
+/// debug_query_string), ending in a hard "failed to deparse" error where
+/// local execution was possible.
 pub(crate) unsafe fn top_statement_mentions_relations(
     root: *mut pg_sys::PlannerInfo,
     relations: &[crate::interface::FullQueryRelation],
 ) -> bool {
     unsafe {
         let Some(sql) = current_statement_sql_from_debug_query_string(root) else {
-            return true;
+            return false;
         };
         relations
             .iter()
-            .any(|r| sql.contains(&r.local_table) || sql.contains(&r.local_schema))
+            .any(|r| sql_mentions_identifier(&sql, &r.local_table))
     }
+}
+
+/// Does `sql` contain `name` as a standalone identifier, ignoring the
+/// contents of string literals (`'…'`, `E'…'` with backslash escapes and
+/// `''` doubling), comments (`-- …`, `/* … */`), and dollar-quoted blocks
+/// (`$tag$ … $tag$`)? Quoted identifiers (`"…"`) count as their content.
+/// Comparison is ASCII-case-insensitive: client text may spell identifiers
+/// in any case while the catalog name is what PostgreSQL folded.
+fn sql_mentions_identifier(sql: &str, name: &str) -> bool {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        // string literal, optionally E-escaped
+        if c == '\'' || (matches!(c, 'E' | 'e') && chars.get(i + 1) == Some(&'\'')) {
+            let escaped = c != '\'';
+            i += if escaped { 2 } else { 1 };
+            while i < chars.len() {
+                match chars[i] {
+                    '\\' if escaped => i += 2, // skip the escaped character
+                    '\'' => {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            i += 2; // doubled quote stays inside the literal
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+        // comments
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        // dollar-quoted block: $tag$ … $tag$ (a `$` followed by a digit is a
+        // parameter marker, not a quote — those fall through to the word arm)
+        if c == '$'
+            && chars
+                .get(i + 1)
+                .is_some_and(|n| *n == '$' || n.is_alphabetic())
+        {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '$' {
+                j += 1;
+            }
+            if j < chars.len() {
+                let tag: Vec<char> = chars[i..=j].to_vec();
+                let tag_len = tag.len();
+                let mut k = j + 1;
+                while k + tag_len <= chars.len() {
+                    if chars[k..k + tag_len] == tag[..] {
+                        i = k + tag_len;
+                        break;
+                    }
+                    k += 1;
+                }
+                if i > j + 1 || k + tag_len <= chars.len() {
+                    continue;
+                }
+            }
+        }
+        // quoted identifier: its content is the identifier
+        if c == '"' {
+            i += 1;
+            let start = i;
+            while i < chars.len() {
+                if chars[i] == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            let inner: String = chars[start..i.min(chars.len())].iter().collect();
+            if inner.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        // bare word (identifier or keyword)
+        if c.is_alphanumeric() || c == '_' {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if word.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Would the remote SQL have to come from the top-level statement text?
@@ -2241,5 +2366,72 @@ pub(super) extern "C-unwind" fn end_foreign_scan<E: Into<ErrorReport>, W: Foreig
         (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
 
         result.report_unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sql_mentions_identifier;
+
+    // 2026-09-06 review A5: the top-statement gate used substring matching —
+    // `sql.contains("public")` fired on the string literal of
+    // `call ui.portal_arm_main_command('public.report')`, building a remote
+    // path that the scan-time lexical check then rejected, failing the whole
+    // query although local scans were available.
+    #[test]
+    fn literal_contents_do_not_count() {
+        let call = "CALL ui.portal_arm_main_command('public.report')";
+        assert!(!sql_mentions_identifier(call, "report"));
+        assert!(!sql_mentions_identifier(call, "public"));
+        assert!(sql_mentions_identifier(
+            "SELECT * FROM public.report",
+            "report"
+        ));
+    }
+
+    #[test]
+    fn word_boundaries_and_case() {
+        assert!(!sql_mentions_identifier("SELECT * FROM appusers", "users"));
+        // client text may spell identifiers in any case
+        assert!(sql_mentions_identifier(
+            "SELECT * FROM AppUsers",
+            "appusers"
+        ));
+        assert!(sql_mentions_identifier(
+            "SELECT * FROM \"DimCalendar\"",
+            "dimcalendar"
+        ));
+    }
+
+    #[test]
+    fn comments_and_quoting_skipped() {
+        assert!(!sql_mentions_identifier(
+            "SELECT 1 -- from report\n, 2",
+            "report"
+        ));
+        assert!(!sql_mentions_identifier(
+            "SELECT 1 /* report */ , 2",
+            "report"
+        ));
+        // quote doubling inside a literal
+        assert!(!sql_mentions_identifier("SELECT 'it''s report'", "report"));
+        // E-strings keep backslash-escaped quotes inside the literal
+        assert!(!sql_mentions_identifier("SELECT E'report\'s'", "report"));
+    }
+
+    #[test]
+    fn dollar_quoted_blocks_skipped() {
+        assert!(!sql_mentions_identifier("SELECT $$report$$", "report"));
+        assert!(!sql_mentions_identifier("SELECT $fn$report$fn$", "report"));
+        assert!(sql_mentions_identifier(
+            "SELECT $$x$$ FROM report",
+            "report"
+        ));
+        // `$1` is a parameter marker, not a dollar quote — must not eat the
+        // rest of the statement
+        assert!(sql_mentions_identifier(
+            "SELECT a FROM report WHERE x = $1",
+            "report"
+        ));
     }
 }
