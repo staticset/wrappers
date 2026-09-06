@@ -11,9 +11,9 @@ use crate::interface::{Aggregate, AggregateKind, Column};
 use crate::prelude::ForeignDataWrapper;
 use crate::scan::{
     FdwState, full_query_placeholder_from_planner, leak_state_in_current_context,
-    query_requires_full_query, remote_query_context_from_planner,
-    remote_query_local_path_penalty, remote_sql_requires_top_statement,
-    target_columns_from_reltarget, top_statement_mentions_relations,
+    query_requires_full_query, remote_query_context_from_planner, remote_query_local_path_penalty,
+    remote_sql_requires_top_statement, target_columns_from_reltarget,
+    top_statement_mentions_relations,
 };
 
 /// Helper to iterate over a pg_sys::List using raw pointer access.
@@ -576,7 +576,19 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
         state.full_query_executable = is_final;
         state.remote_query_policy = remote_query_policy;
 
-        let rows = 1.0;
+        // Advertise a plausible result size instead of rows=1: a postgres_fdw
+        // layer on top (the bridge deployment) prices its own local-vs-remote
+        // aggregation choice from our EXPLAIN output. With rows=1 every path
+        // it builds costs the same, the cost fuzz factor calls it a tie and
+        // the local plan wins on pathkeys — remote aggregation is never
+        // chosen. GROUP BY collapses the stream, so it advertises fewer rows
+        // than a plain fetch and prices strictly cheaper than fetching and
+        // aggregating locally.
+        let rows = if stage == pg_sys::UpperRelationKind::UPPERREL_GROUP_AGG {
+            1_000.0
+        } else {
+            10_000.0
+        };
         let startup_cost = state
             .opts
             .get("startup_cost")
