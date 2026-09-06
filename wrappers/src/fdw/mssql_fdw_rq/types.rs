@@ -274,6 +274,14 @@ pub(super) fn cell_to_sql(cell: &Cell) -> MssqlFdwRqResult<Box<dyn ToSql>> {
         Cell::Numeric(v) => numeric_to_decimal(v)?,
         Cell::String(v) => Box::new(v.clone()),
         Cell::Uuid(v) => Box::new(uuid::Uuid::from_bytes(*v.as_bytes())),
+        // date/time cells reach plain scans through quals; reuse the same
+        // conversions the full-query parameter path (value_to_sql) applies —
+        // notably timestamptz must go through the UTC instant, not wall time
+        Cell::Date(v) => Box::new(date_to_naive(v)?),
+        Cell::Time(v) => Box::new(time_to_naive(v)?),
+        Cell::Timestamp(v) => Box::new(timestamp_to_naive(v)?),
+        Cell::Timestamptz(v) => Box::new(timestamptz_to_utc(v)?),
+        Cell::Bytea(v) => Box::new(unsafe { bytea_to_vec(*v) }),
         other => {
             return Err(MssqlFdwRqError::UnsupportedParameterType(
                 cell_kind(other).to_string(),
@@ -340,8 +348,13 @@ fn timestamp_to_naive(v: &Timestamp) -> MssqlFdwRqResult<NaiveDateTime> {
         .ok_or_else(|| dt_err("invalid time of day".to_string()))
 }
 
+/// Convert a PostgreSQL `timestamptz` parameter into a UTC instant. `to_utc()`
+/// renders the stored instant at UTC; pgrx' `Timestamp::from(timestamptz)`
+/// would render it in the session's TimeZone GUC, and `.and_utc()` would then
+/// mislabel that local wall time as UTC — shifting the parameter by the
+/// session's offset (Europe/Moscow sends 15:00Z where 12:00Z was meant).
 fn timestamptz_to_utc(v: &TimestampWithTimeZone) -> MssqlFdwRqResult<DateTime<Utc>> {
-    Ok(timestamp_to_naive(&Timestamp::from(*v))?.and_utc())
+    Ok(timestamp_to_naive(&v.to_utc())?.and_utc())
 }
 
 fn naive_time_to_pgrx(v: NaiveTime) -> MssqlFdwRqResult<Time> {
@@ -364,13 +377,17 @@ fn naive_dt_to_pgrx(v: NaiveDateTime) -> MssqlFdwRqResult<Timestamp> {
 
 fn utc_to_pgrx(v: DateTime<Utc>) -> MssqlFdwRqResult<TimestampWithTimeZone> {
     let sec = f64::from(v.second()) + f64::from(v.timestamp_subsec_nanos()) / 1e9;
-    TimestampWithTimeZone::new(
+    // the civil parts are UTC wall time; `TimestampWithTimeZone::new` would
+    // interpret them in the session's TimeZone GUC and shift the instant —
+    // pin the timezone explicitly
+    TimestampWithTimeZone::with_timezone(
         v.year(),
         v.month() as u8,
         v.day() as u8,
         v.hour() as u8,
         v.minute() as u8,
         sec,
+        "UTC",
     )
     .map_err(dt_err)
 }

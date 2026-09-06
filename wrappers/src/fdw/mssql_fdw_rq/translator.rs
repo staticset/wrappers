@@ -727,24 +727,45 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 if !last_desc {
                                     pop_if_word(&mut out, "asc");
                                 }
-                                if let Ok(start) = capture_subject(&out, case_depth) {
-                                    let expr = out[start..].join(" ");
-                                    let bare_not_null = out.len() - start == 1
-                                        && !expr.contains(' ')
-                                        && ctx
-                                            .not_null_columns
-                                            .contains(&unbracket(&expr).to_lowercase());
-                                    if !bare_not_null {
-                                        return Err(TranslateError::UnsupportedConstruct {
-                                            sql_fragment: format!("ORDER BY {expr} inside OVER(…)"),
-                                            reason: "nullable NULL ordering inside a window \
-                                                     cannot be translated to T-SQL faithfully"
-                                                .to_string(),
-                                        });
+                                // the capture must succeed: swallowing the
+                                // error would skip the NULL-ordering check
+                                // entirely while the popped direction is
+                                // already gone — the key would silently sort
+                                // differently (and lose DESC) in T-SQL
+                                let start = capture_subject(&out, case_depth).map_err(|_| {
+                                    TranslateError::UnsupportedConstruct {
+                                        sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                        reason: "the window's sort key is not a simple column \
+                                                 reference; its NULL ordering cannot be \
+                                                 translated to T-SQL faithfully"
+                                            .to_string(),
                                     }
-                                    if last_desc {
-                                        out.push("DESC".to_string());
-                                    }
+                                })?;
+                                let expr = out[start..].join(" ");
+                                if !is_whole_order_item(&out, start) {
+                                    return Err(TranslateError::UnsupportedConstruct {
+                                        sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                        reason: format!(
+                                            "composite ORDER BY keys inside a window cannot \
+                                             be NULL-corrected in T-SQL (expr={expr:?})"
+                                        ),
+                                    });
+                                }
+                                let bare_not_null = out.len() - start == 1
+                                    && !expr.contains(' ')
+                                    && ctx
+                                        .not_null_columns
+                                        .contains(&unbracket(&expr).to_lowercase());
+                                if !bare_not_null {
+                                    return Err(TranslateError::UnsupportedConstruct {
+                                        sql_fragment: format!("ORDER BY {expr} inside OVER(…)"),
+                                        reason: "nullable NULL ordering inside a window \
+                                                 cannot be translated to T-SQL faithfully"
+                                            .to_string(),
+                                    });
+                                }
+                                if last_desc {
+                                    out.push("DESC".to_string());
                                 }
                                 // PG17's deparser materializes the default
                                 // frame (`ROWS/RANGE UNBOUNDED PRECEDING`),
@@ -1067,36 +1088,45 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         if over_paren_depth.is_some()
                             && depth >= over_paren_depth.unwrap_or(usize::MAX) =>
                     {
-                        if let Ok(start) = capture_subject(&out, case_depth) {
-                            let expr = out[start..].join(" ");
-                            // a composite key (`price + id`) would have its
-                            // nullability judged by the last operand only;
-                            // refuse it instead of trusting the wrong check
-                            if !is_whole_order_item(&out, start) {
-                                return Err(TranslateError::UnsupportedConstruct {
-                                    sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
-                                    reason: format!(
-                                        "composite ORDER BY keys inside a window cannot \
-                                         be NULL-corrected in T-SQL (expr={expr:?})"
-                                    ),
-                                });
+                        // the capture must succeed — a swallowed error would
+                        // skip the NULL-ordering check for this key entirely
+                        let start = capture_subject(&out, case_depth).map_err(|_| {
+                            TranslateError::UnsupportedConstruct {
+                                sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                reason: "the window's sort key is not a simple column \
+                                         reference; its NULL ordering cannot be translated \
+                                         to T-SQL faithfully"
+                                    .to_string(),
                             }
-                            let bare_not_null = out.len() - start == 1
-                                && !expr.contains(' ')
-                                && ctx
-                                    .not_null_columns
-                                    .contains(&unbracket(&expr).to_lowercase());
-                            if !bare_not_null {
-                                return Err(TranslateError::UnsupportedConstruct {
-                                    sql_fragment: "ORDER BY … NULLS … inside OVER(…)".to_string(),
-                                    reason: format!(
-                                        "nullable NULL ordering inside a window cannot be \
-                                         translated to T-SQL faithfully (expr={expr:?}, \
-                                         not_null_columns={:?})",
-                                        ctx.not_null_columns
-                                    ),
-                                });
-                            }
+                        })?;
+                        let expr = out[start..].join(" ");
+                        // a composite key (`price + id`) would have its
+                        // nullability judged by the last operand only;
+                        // refuse it instead of trusting the wrong check
+                        if !is_whole_order_item(&out, start) {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
+                                reason: format!(
+                                    "composite ORDER BY keys inside a window cannot \
+                                     be NULL-corrected in T-SQL (expr={expr:?})"
+                                ),
+                            });
+                        }
+                        let bare_not_null = out.len() - start == 1
+                            && !expr.contains(' ')
+                            && ctx
+                                .not_null_columns
+                                .contains(&unbracket(&expr).to_lowercase());
+                        if !bare_not_null {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: "ORDER BY … NULLS … inside OVER(…)".to_string(),
+                                reason: format!(
+                                    "nullable NULL ordering inside a window cannot be \
+                                     translated to T-SQL faithfully (expr={expr:?}, \
+                                     not_null_columns={:?})",
+                                    ctx.not_null_columns
+                                ),
+                            });
                         }
                         out.push(lw.to_uppercase());
                         i += 1;
@@ -1139,16 +1169,30 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                         .to_string(),
                                 });
                             }
-                            out.truncate(start);
-                            out.push(format!(
-                                "CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END{}",
-                                if dir_desc { " DESC" } else { "" }
-                            ));
-                            out.push(",".to_string());
-                            out.push(expr);
-                            if dir_desc {
-                                out.push("DESC".to_string());
-                            }
+                            // a bare output alias cannot carry the CASE (it
+                            // would resolve as a column on MSSQL) — sort by
+                            // the aliased expression instead. Unlike the
+                            // implicit-ordering path there is no safe
+                            // fallback: the alias form is a guaranteed MSSQL
+                            // error, so an unresolvable alias is rejected.
+                            let expr = if out.len() - start == 1
+                                && !expr.contains(' ')
+                                && declared_aliases.contains(&unbracket(&expr).to_lowercase())
+                            {
+                                let alias = unbracket(&expr).to_lowercase();
+                                alias_select_item(&out, &alias).ok_or_else(|| {
+                                    TranslateError::UnsupportedConstruct {
+                                        sql_fragment: format!("ORDER BY {alias} NULLS …"),
+                                        reason: "output alias could not be resolved to its \
+                                                 SELECT-list expression; its NULL ordering \
+                                                 cannot be translated"
+                                            .to_string(),
+                                    }
+                                })?
+                            } else {
+                                expr
+                            };
+                            push_null_tiebreaker(&mut out, start, &expr, dir_desc);
                         } else {
                             // matches the T-SQL default: keep the plain term
                             if dir_desc {
@@ -1312,6 +1356,23 @@ fn order_item_fragment(out: &[String], start: usize) -> String {
     out[item_start..].join(" ")
 }
 
+/// Replace the ORDER BY item starting at `start` with a NULL-tiebreaker pair
+/// that reproduces PostgreSQL's implicit NULL ordering (ASC → NULLS LAST,
+/// DESC → NULLS FIRST) around `expr`: the CASE orders NULLs, the expression
+/// orders the values.
+fn push_null_tiebreaker(out: &mut Vec<String>, start: usize, expr: &str, desc: bool) {
+    out.truncate(start);
+    out.push(format!(
+        "CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END{}",
+        if desc { " DESC" } else { "" }
+    ));
+    out.push(",".to_string());
+    out.push(expr.to_string());
+    if desc {
+        out.push("DESC".to_string());
+    }
+}
+
 /// Finish one top-level ORDER BY item: re-emit it with a NULL tiebreaker
 /// that reproduces PostgreSQL's implicit NULL ordering (ASC → NULLS LAST,
 /// DESC → NULLS FIRST) unless the item is a plain NOT NULL column, which
@@ -1334,36 +1395,53 @@ fn close_order_item(
                 .to_string(),
         });
     }
+    // PostgreSQL resolves a bare ORDER BY name as an output alias first (the
+    // alias shadows a same-named column). The bare alias itself cannot carry
+    // the NULL-tiebreaker CASE — T-SQL would resolve it as a column — so sort
+    // by the aliased SELECT expression instead. If that expression cannot be
+    // located, keep the bare alias (T-SQL NULL ordering applies — the old
+    // behavior, better than failing the query).
+    if out.len() - start == 1
+        && !expr.contains(' ')
+        && declared_aliases.contains(&unbracket(&expr).to_lowercase())
+    {
+        let alias = unbracket(&expr).to_lowercase();
+        if let Some(resolved) = alias_select_item(out, &alias) {
+            // a NOT NULL aliased column needs no tiebreaker either
+            if !resolved.contains(' ')
+                && ctx
+                    .not_null_columns
+                    .contains(&unbracket(&resolved).to_lowercase())
+            {
+                out.truncate(start);
+                out.push(resolved);
+                if desc == Some(true) {
+                    out.push("DESC".to_string());
+                }
+                return Ok(());
+            }
+            push_null_tiebreaker(out, start, &resolved, desc.unwrap_or(false));
+            return Ok(());
+        }
+        if desc == Some(true) {
+            out.push("DESC".to_string());
+        }
+        return Ok(());
+    }
     let bare_not_null = out.len() - start == 1
         && !expr.contains(' ')
         && ctx
             .not_null_columns
             .contains(&unbracket(&expr).to_lowercase());
-    // an output alias is only usable as a bare ORDER BY item on MSSQL —
-    // wrapping it in the NULL-tiebreaker CASE would resolve it as a column
-    // and fail; the tiebreaker is skipped (T-SQL NULL ordering applies)
-    let bare_alias = out.len() - start == 1
-        && !expr.contains(' ')
-        && declared_aliases.contains(&unbracket(&expr).to_lowercase());
 
-    if bare_not_null || bare_alias {
+    if bare_not_null {
         if desc == Some(true) {
             out.push("DESC".to_string());
         }
         return Ok(());
     }
 
-    out.truncate(start);
-    let d = desc.unwrap_or(false);
-    out.push(format!(
-        "CASE WHEN {expr} IS NULL THEN 1 ELSE 0 END{}",
-        if d { " DESC" } else { "" }
-    ));
-    out.push(",".to_string());
-    out.push(expr);
-    if d {
-        out.push("DESC".to_string());
-    }
+    push_null_tiebreaker(out, start, &expr, desc.unwrap_or(false));
     Ok(())
 }
 
@@ -1413,14 +1491,11 @@ fn unbracket(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-/// Resolve a positional reference (`GROUP BY 2`) to the n-th SELECT-list
-/// expression already rendered in `out`, without its output alias. Returns
-/// None when the list cannot be located (e.g. subqueries in the target
-/// list shifted the FROM boundary) — callers reject then.
-fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
-    if idx == 0 {
-        return None;
-    }
+/// Locate the top-level SELECT list in the rendered output and split it into
+/// its items on top-level commas. Returns None when the list cannot be
+/// located (e.g. subqueries in the target list shifted the FROM boundary) —
+/// callers reject or fall back then (fail-closed).
+fn split_select_list(out: &[String]) -> Option<Vec<Vec<String>>> {
     let select_at = out.iter().position(|p| p.eq_ignore_ascii_case("SELECT"))?;
     // the first FROM after the SELECT closes the target list (target-list
     // subqueries are rejected elsewhere; a stray inner FROM makes the span
@@ -1431,7 +1506,6 @@ fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
         .position(|p| p.eq_ignore_ascii_case("FROM"))?
         + select_at
         + 1;
-    // split the span on top-level commas
     let mut items: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut paren = 0i32;
@@ -1448,7 +1522,18 @@ fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
         }
     }
     items.push(current);
-    let mut item = items.into_iter().nth(idx - 1)?;
+    Some(items)
+}
+
+/// Resolve a positional reference (`GROUP BY 2`) to the n-th SELECT-list
+/// expression already rendered in `out`, without its output alias. Returns
+/// None when the list cannot be located (e.g. subqueries in the target
+/// list shifted the FROM boundary) — callers reject then.
+fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
+    if idx == 0 {
+        return None;
+    }
+    let mut item = split_select_list(out)?.into_iter().nth(idx - 1)?;
     // drop the output alias: `expr AS name` (positional refs point at the
     // expression; T-SQL allows no alias in GROUP BY/ORDER BY position) —
     // resolved on pieces so a literal ` AS ` inside a string cannot fool it
@@ -1464,6 +1549,28 @@ fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
     }
     let item = item.join(" ").trim().to_string();
     if item.is_empty() { None } else { Some(item) }
+}
+
+/// Resolve a declared output alias to the SELECT-list expression it names
+/// (rendered pieces joined, alias stripped). PostgreSQL resolves a bare
+/// ORDER BY name as an output alias first, so the NULL-ordering tiebreaker
+/// must be applied to the aliased expression — a CASE wrapped around the
+/// bare alias itself would not resolve on MSSQL. Returns None when the list
+/// or the aliased item cannot be located.
+fn alias_select_item(out: &[String], alias: &str) -> Option<String> {
+    for item in split_select_list(out)? {
+        // a declared alias is always emitted as `… AS [alias]`
+        if item.len() >= 2 && item[item.len() - 2].eq_ignore_ascii_case("as") {
+            let last = &item[item.len() - 1];
+            if unbracket(last).to_lowercase() == alias {
+                let expr = item[..item.len() - 2].join(" ").trim().to_string();
+                if !expr.is_empty() {
+                    return Some(expr);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_plain_ident(piece: &str) -> bool {
@@ -2126,9 +2233,12 @@ fn translate_is(
 
     let rendered = match (what, negated) {
         ("true", false) => format!("{lhs} = 1"),
-        ("true", true) => format!("{lhs} <> 1"),
         ("false", false) => format!("{lhs} = 0"),
-        ("false", true) => format!("{lhs} <> 0"),
+        // `IS NOT TRUE` / `IS NOT FALSE` also accept NULL inputs, but a bare
+        // `<> n` is UNKNOWN for NULL under T-SQL's three-valued logic and
+        // would silently drop those rows — add the NULL disjunct
+        ("true", true) => format!("({lhs} IS NULL OR {lhs} <> 1)"),
+        ("false", true) => format!("({lhs} IS NULL OR {lhs} <> 0)"),
         ("unknown", false) => format!("{lhs} IS NULL"),
         ("unknown", true) => format!("{lhs} IS NOT NULL"),
         _ => unreachable!(),

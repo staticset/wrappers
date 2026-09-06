@@ -240,12 +240,24 @@ mod unit {
         );
     }
 
+    // 2026-09-06 review А2: `IS NOT TRUE`/`IS NOT FALSE` also match NULL
+    // inputs in PostgreSQL; a bare `<> n` is UNKNOWN for NULL in T-SQL and
+    // silently dropped those rows — the NULL disjunct keeps them
     #[test]
-    fn is_not_false_becomes_ne_zero() {
+    fn is_not_false_keeps_null_rows() {
         assert_tsql(
             "SELECT id FROM public.dbo_orders WHERE active IS NOT FALSE",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] WHERE active <> 0",
+            "SELECT id FROM [dbo].[Orders] WHERE (active IS NULL OR active <> 0)",
+        );
+    }
+
+    #[test]
+    fn is_not_true_keeps_null_rows() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE active IS NOT TRUE",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (active IS NULL OR active <> 1)",
         );
     }
 
@@ -331,6 +343,36 @@ mod unit {
         );
     }
 
+    // 2026-09-06 review А4: a `CASE … END` key is not a capturable subject —
+    // the capture error used to be swallowed, skipping the NULL-ordering
+    // validation and dropping the DESC direction inside OVER(…)
+    #[test]
+    fn window_case_order_key_rejected() {
+        assert_unsupported(
+            "SELECT id, row_number() OVER (ORDER BY CASE WHEN active THEN id END DESC) AS rn \
+             FROM public.dbo_orders",
+            &orders_ctx(),
+            "OVER",
+        );
+        assert_unsupported(
+            "SELECT id, rank() OVER (ORDER BY CASE WHEN active THEN id END) AS r \
+             FROM public.dbo_orders",
+            &orders_ctx(),
+            "OVER",
+        );
+    }
+
+    #[test]
+    fn window_composite_order_key_without_direction_rejected() {
+        // `note + id` used to be judged by its last operand (id, NOT NULL)
+        // and passed validation silently misordering NULL notes in T-SQL
+        assert_unsupported(
+            "SELECT id, rank() OVER (ORDER BY note + id) AS r FROM public.dbo_orders",
+            &orders_ctx(),
+            "OVER",
+        );
+    }
+
     // -- NULL ordering (top-level ORDER BY) -------------------------------
 
     #[test]
@@ -372,6 +414,70 @@ mod unit {
             "SELECT id FROM public.dbo_orders ORDER BY amount DESC NULLS LAST LIMIT 5",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] ORDER BY [amount] DESC \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+    }
+
+    // 2026-09-06 review Р1: a bare ORDER BY item that names an output alias
+    // used to skip the NULL tiebreaker entirely (T-SQL ASC puts NULLs first,
+    // PostgreSQL last — LIMIT returned a different row set). PostgreSQL
+    // resolves bare names as output aliases first, so the tiebreaker is
+    // applied to the aliased SELECT expression.
+    #[test]
+    fn order_by_alias_gets_tiebreaker_over_expression() {
+        assert_tsql(
+            "SELECT amount AS plan FROM public.dbo_orders ORDER BY plan LIMIT 5",
+            &orders_ctx(),
+            "SELECT amount AS [plan] FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END, amount \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+        assert_tsql(
+            "SELECT amount AS plan FROM public.dbo_orders ORDER BY plan DESC LIMIT 5",
+            &orders_ctx(),
+            "SELECT amount AS [plan] FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END DESC, amount DESC \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+        // an alias whose expression is a NOT NULL column needs no tiebreaker
+        assert_tsql(
+            "SELECT id AS k FROM public.dbo_orders ORDER BY k",
+            &orders_ctx(),
+            "SELECT id AS [k] FROM [dbo].[Orders] ORDER BY id",
+        );
+    }
+
+    #[test]
+    fn order_by_alias_shadows_not_null_column() {
+        // PostgreSQL resolves a bare ORDER BY name as an output alias first:
+        // the alias `id` shadows the NOT NULL column id, and sorting by the
+        // aliased nullable `amount` needs the tiebreaker the old flat
+        // not_null check used to skip
+        assert_tsql(
+            "SELECT amount AS id FROM public.dbo_orders ORDER BY id",
+            &orders_ctx(),
+            "SELECT amount AS [id] FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END, amount",
+        );
+    }
+
+    #[test]
+    fn order_by_alias_explicit_nulls() {
+        // NULLS LAST opposes T-SQL's ASC default → tiebreaker over the
+        // aliased expression (a CASE wrapped around the bare alias would
+        // not resolve on MSSQL)
+        assert_tsql(
+            "SELECT amount AS plan FROM public.dbo_orders ORDER BY plan NULLS LAST LIMIT 5",
+            &orders_ctx(),
+            "SELECT amount AS [plan] FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END, amount \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+        // NULLS FIRST matches T-SQL's ASC default → the bare alias stays
+        assert_tsql(
+            "SELECT amount AS plan FROM public.dbo_orders ORDER BY plan NULLS FIRST LIMIT 5",
+            &orders_ctx(),
+            "SELECT amount AS [plan] FROM [dbo].[Orders] ORDER BY [plan] \
              OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
@@ -997,10 +1103,16 @@ mod unit {
 
     #[test]
     fn aggregate_group_having_order() {
+        // 2026-09-06 review Р1: the bare `ORDER BY total` alias used to skip
+        // the NULL tiebreaker (T-SQL DESC puts NULLs last, PostgreSQL first —
+        // LIMIT returned a different row set); the tiebreaker now applies to
+        // the aliased aggregate expression
         assert_tsql(
             "SELECT c.name, SUM(o.amount) AS total FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC LIMIT 5",
             &two_tables_ctx(),
-            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY [total] DESC OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 \
+             ORDER BY CASE WHEN SUM ( o . amount ) IS NULL THEN 1 ELSE 0 END DESC, SUM ( o . amount ) DESC \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
 
@@ -1202,6 +1314,38 @@ mod unit {
             );
         }
 
+        // 2026-09-06 review А3: IS NOT TRUE/FALSE (plain-scan path) must keep
+        // the NULL rows PostgreSQL returns — bare `<> n` is UNKNOWN for NULL
+        // in T-SQL and silently dropped them
+        #[test]
+        fn boolean_test_is_not_keeps_null_rows() {
+            assert_eq!(
+                sql_for(&[qual(
+                    "active",
+                    "is not",
+                    Value::Cell(Cell::Bool(true)),
+                    false
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] \
+                 WHERE ([active] IS NULL OR [active] <> 1)"
+            );
+            assert_eq!(
+                sql_for(&[qual(
+                    "active",
+                    "is not",
+                    Value::Cell(Cell::Bool(false)),
+                    false
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] \
+                 WHERE ([active] IS NULL OR [active] <> 0)"
+            );
+            // IS TRUE / IS FALSE are unchanged
+            assert_eq!(
+                sql_for(&[qual("active", "is", Value::Cell(Cell::Bool(true)), false)]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [active] = 1"
+            );
+        }
+
         #[test]
         fn ilike_wraps_both_sides_in_lower() {
             assert_eq!(
@@ -1380,6 +1524,63 @@ mod tests {
         );
         assert_eq!(pg, mssql);
         assert_eq!(pg.len(), 10); // ids 51..60
+    }
+
+    // 2026-09-06 review А1: timestamptz used to be converted through the
+    // session's TimeZone (pgrx' `Timestamp::from` renders wall time,
+    // `TimestampWithTimeZone::new` interprets wall time in the session zone).
+    // With TimeZone='Europe/Moscow' every read came back 3 hours off and
+    // every timestamptz parameter was sent 3 hours off. Both directions must
+    // be instant-exact against MSSQL's own view of the stored values.
+    //
+    // The read path is exercised through a plain scan (a bare timestamptz
+    // column: computed targets would push the whole statement down and the
+    // conversion would happen inside MSSQL), the datum PG receives is then
+    // rendered at UTC on this side.
+    #[pg_test]
+    fn timestamptz_round_trip_in_non_utc_session() {
+        use pgrx::datum::TimestampWithTimeZone;
+
+        setup();
+        Spi::run("SET TIME ZONE 'Europe/Moscow'").unwrap();
+
+        // MSSQL's own view of the stored instant (order 1 has shipped_at)
+        let mssql = mssql_direct(
+            "SELECT CAST(id AS nvarchar(20)) AS name, \
+             CONVERT(nvarchar(30), CAST(shipped_at AT TIME ZONE 'UTC' AS datetime2), 120) AS total \
+             FROM dbo.orders WHERE id = 1",
+        );
+        let (id, instant) = mssql[0].clone();
+
+        // read path: the timestamptz datum through the plain scan is the
+        // same instant — the old conversion was 3 hours off
+        let read: TimestampWithTimeZone =
+            Spi::get_one("SELECT shipped_at FROM rq_orders WHERE id = 1")
+                .unwrap()
+                .unwrap();
+        let read_utc = read.to_utc();
+        let read_text = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            read_utc.year(),
+            read_utc.month(),
+            read_utc.day(),
+            read_utc.hour(),
+            read_utc.minute(),
+            read_utc.second() as u8
+        );
+        assert_eq!(read_text, instant, "read path shifted the instant");
+
+        // parameter path: the equality qual binds the literal's instant as a
+        // tiberius parameter (plain scan, no aggregate — an aggregate would
+        // push the whole statement down and inline the literal). With the
+        // old conversion the bound value was 3 hours off and this returned
+        // no row.
+        let matched: Option<TimestampWithTimeZone> = Spi::get_one(&format!(
+            "SELECT shipped_at FROM rq_orders \
+             WHERE id = {id} AND shipped_at = '{instant}+00'::timestamptz"
+        ))
+        .unwrap();
+        assert!(matched.is_some(), "parameter path shifted the instant");
     }
 
     /// The framework deparses the TOP-LEVEL statement for join queries, which

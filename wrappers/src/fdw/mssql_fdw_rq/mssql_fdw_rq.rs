@@ -1,6 +1,6 @@
 use pgrx::PgRelation;
 use pgrx::pg_sys;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::time::Instant;
 use tiberius::{Client, Config};
@@ -69,7 +69,12 @@ fn render_qual(
 
     match &qual.value {
         Value::Cell(Cell::Bool(b)) if oper == "is" => Ok(format!("{field} = {}", *b as u8)),
-        Value::Cell(Cell::Bool(b)) if oper == "is not" => Ok(format!("{field} <> {}", *b as u8)),
+        // IS NOT TRUE / IS NOT FALSE also match NULL inputs in PostgreSQL;
+        // bare `<> n` is UNKNOWN for NULL in T-SQL and would silently drop
+        // those rows — add the NULL disjunct
+        Value::Cell(Cell::Bool(b)) if oper == "is not" => {
+            Ok(format!("({field} IS NULL OR {field} <> {})", *b as u8))
+        }
         // NullTest quals arrive as is/is not with the literal cell "null"
         Value::Cell(Cell::String(s)) if oper == "is" && s == "null" => {
             Ok(format!("{field} IS NULL"))
@@ -380,9 +385,28 @@ impl MssqlFdwRq {
     /// the query.
     fn column_flags(relations: &[FullQueryRelation]) -> (Vec<String>, Vec<String>, Vec<String>) {
         let quote_ident = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-        let mut bools = Vec::new();
-        let mut not_nulls = Vec::new();
-        let mut texts = Vec::new();
+
+        // One flag set per relation, merged by name afterwards: bare
+        // (unqualified) column references are decided by these lists, so a
+        // name that different relations disagree on — boolean in one table
+        // and not in another, NOT NULL here and nullable there — must not be
+        // trusted. Disagreement drops the name: sorting then gets the safe
+        // NULL tiebreaker, and a bare boolean predicate fails loudly on
+        // MSSQL instead of silently using the wrong table's flag.
+        // PostgreSQL itself rejects bare references that are ambiguous
+        // between tables, so for deparse-driven queries this only guards
+        // client-supplied statement text.
+        #[derive(Default)]
+        struct RelFlags {
+            names: HashSet<String>,
+            bools: HashSet<String>,
+            not_nulls: HashSet<String>,
+            texts: HashSet<String>,
+        }
+        let mut per_rel: Vec<RelFlags> = Vec::new();
+        let mut ordered_names: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
         for rel in relations {
             // to_regclass parses the regclass literal syntax, where an
             // UNquoted identifier folds to lowercase — mixed-case names
@@ -401,6 +425,7 @@ impl MssqlFdwRq {
                 );
                 continue;
             };
+            let mut flags = RelFlags::default();
             for attr in relation.tuple_desc().iter() {
                 if attr.attnum <= 0 || attr.attisdropped {
                     continue;
@@ -411,15 +436,43 @@ impl MssqlFdwRq {
                     continue;
                 };
                 let name = name.to_lowercase();
+                flags.names.insert(name.clone());
                 if attr.atttypid == pg_sys::BOOLOID {
-                    bools.push(name.clone());
+                    flags.bools.insert(name.clone());
                 }
                 if attr.attnotnull {
-                    not_nulls.push(name.clone());
+                    flags.not_nulls.insert(name.clone());
                 }
                 if attr.atttypid == pg_sys::TEXTOID {
-                    texts.push(name);
+                    flags.texts.insert(name.clone());
                 }
+                if seen.insert(name.clone()) {
+                    ordered_names.push(name);
+                }
+            }
+            per_rel.push(flags);
+        }
+
+        let mut bools = Vec::new();
+        let mut not_nulls = Vec::new();
+        let mut texts = Vec::new();
+        for name in &ordered_names {
+            // only relations that carry such a column have a say
+            let carriers: Vec<&RelFlags> = per_rel
+                .iter()
+                .filter(|flags| flags.names.contains(name))
+                .collect();
+            if carriers.is_empty() {
+                continue;
+            }
+            if carriers.iter().all(|flags| flags.bools.contains(name)) {
+                bools.push(name.clone());
+            }
+            if carriers.iter().all(|flags| flags.not_nulls.contains(name)) {
+                not_nulls.push(name.clone());
+            }
+            if carriers.iter().all(|flags| flags.texts.contains(name)) {
+                texts.push(name.clone());
             }
         }
         (bools, not_nulls, texts)
