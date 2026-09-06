@@ -668,9 +668,7 @@ pub(crate) unsafe fn top_statement_mentions_relations(
 
 /// Would the remote SQL have to come from the top-level statement text?
 /// Mirrors the fallback condition of `full_query_sql_from_planner`.
-pub(crate) unsafe fn remote_sql_requires_top_statement(
-    root: *mut pg_sys::PlannerInfo,
-) -> bool {
+pub(crate) unsafe fn remote_sql_requires_top_statement(root: *mut pg_sys::PlannerInfo) -> bool {
     unsafe { query_has_multiple_base_relations(root) || query_has_non_relation_inputs(root) }
 }
 
@@ -1245,7 +1243,14 @@ pub(super) extern "C-unwind" fn get_foreign_join_paths<
             state.full_query_executable
         );
 
-        let rows = 1.0;
+        // Advertise a plausible result size instead of rows=1: a postgres_fdw
+        // layer on top (the bridge deployment) prices its paths from our
+        // EXPLAIN output, and a fetch that claims to return one row makes
+        // local aggregation over it look free — remote aggregation then
+        // never wins (the ~1% cost fuzz turns the tie to the local plan's
+        // favor). Keep this larger than the GROUP BY upper path's estimate
+        // so aggregation prices strictly cheaper than a plain fetch.
+        let rows = 10_000.0;
         let startup_cost = 0.0;
         let total_cost = if upper_only {
             remote_query_local_path_penalty(remote_query_policy)
@@ -1354,9 +1359,8 @@ pub(super) extern "C-unwind" fn get_foreign_rel_size<
         // locally over per-table plain scans instead of failing with
         // "remote-query execution is required".
         let remote_path_constructible = !remote_sql_requires_top_statement(root)
-            || query_foreign_relations(root).is_none_or(|(_, rels)| {
-                top_statement_mentions_relations(root, &rels)
-            });
+            || query_foreign_relations(root)
+                .is_none_or(|(_, rels)| top_statement_mentions_relations(root, &rels));
         state.requires_full_query = state.remote_query_policy.wants_remote_query()
             && remote_query_context.requires_remote_query_shape()
             && remote_query_context.all_referenced_relations_are_foreign
