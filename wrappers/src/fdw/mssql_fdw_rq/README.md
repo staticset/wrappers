@@ -112,11 +112,17 @@ entirely; nothing consumes the counters on this deployment.
 
 ## Sber Navigator integration
 
-Navigator manages source types through its `data.tdicdatawrapper` dictionary
-(nid, sname, sdatawrapper, joptions, screateserver, salterserver) and
-generates DDL in the tds_fdw dialect. This FDW speaks that dialect, so a
-single-hop source (Navigator → wrappers → MSSQL) can be registered instead
-of the postgres_fdw bridge:
+**Supported topology: the postgres_fdw bridge.** Navigator widget queries
+run through `call ui.portal_arm_main_command(...)` (SPI), where the
+framework cannot deparse join trees — a direct Navigator → wrappers → MSSQL
+source executes joins locally over per-table scans. With the bridge
+(Navigator → postgres_fdw → a bridge database running this FDW → MSSQL),
+postgres_fdw deparses from the planner tree regardless of the execution
+context and ships one top-level SELECT, which this FDW translates into a
+single T-SQL statement. Setup and tuning are documented in `DEPLOY.md` §7.
+
+The FDW also speaks Navigator's tds_fdw option dialect, so a single-hop
+source remains *possible* for setups without widget/CALL traffic:
 
 - foreign tables accept the `schema_name` / `table_name` option spellings
   (alongside the native `schema` / `table`), and user mappings accept
@@ -127,23 +133,6 @@ of the postgres_fdw bridge:
   the list entry's spelling — PostgreSQL re-filters returned statements
   case-sensitively against the (downcased) LIMIT TO list.
 
-Registering the source type in Navigator's UI is one dictionary row (run
-by the Navigator administrator; adjust the FDW name to the database where
-the extension lives — `mssql_wrapper`):
-
-```sql
-INSERT INTO data.tdicdatawrapper
-  (nid, sname, sdatawrapper, joptions, screateserver, salterserver)
-VALUES (21, 'MS SQL (Rubicon)', 'mssql_wrapper', /* host/port/dbname/
-  options/sLogin/sHash params, mirror the MS SQL row */ …,
-  'CREATE SERVER [**sDBForeignName**] FOREIGN DATA WRAPPER mssql_wrapper
-     OPTIONS (conn_string ''Server=[**sHost**],[**sPort**];Database=[**sDBName**];
-              IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true[**sOptions**]'');
-   CREATE USER MAPPING FOR as_admin SERVER [**sDBForeignName**]
-     OPTIONS (user ''[**sLogin**]'', password ''[**sHash**]'');',
-  /* ALTER variants with SET conn_string / SET user / SET password */ …);
-```
-
 ## Limitations
 
 - **Set operations** (`UNION [ALL]` / `INTERSECT` / `EXCEPT`): PostgreSQL's
@@ -151,9 +140,11 @@ VALUES (21, 'MS SQL (Rubicon)', 'mssql_wrapper', /* host/port/dbname/
   become one remote statement (this matches postgres_fdw). Each arm is pushed
   down with its filters; the merge happens locally.
 - **JOIN pushdown** uses the statement text; queries executed through SPI or
-  PL/pgSQL resolve to the enclosing statement and are rejected with an
-  explicit error instead of sending unrelated SQL. Top-level statements
-  (psql, drivers, BI tools) are unaffected.
+  PL/pgSQL resolve to the enclosing statement (e.g. Navigator's widget
+  `CALL`), planner guards skip the remote path, and the query runs locally
+  over per-table scans — no error, but no join pushdown either. Top-level
+  statements (psql, drivers, BI tools) push down fully; under Sber Navigator
+  use the postgres_fdw bridge (see the integration section above).
 - Rescans are replayed: the scan's statement is re-executed on a fresh
   connection with the same parameters (a nested-loop inner side costs one
   remote round trip per outer row — check the plan before forcing nested

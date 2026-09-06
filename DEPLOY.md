@@ -228,19 +228,44 @@ ALTER EXTENSION wrappers UPDATE TO '0.6.2';
 - **Соединения**: одно TCP-соединение на запрос (как в upstream `mssql_fdw`) —
   закладывайте в лимиты MSSQL: сессии PG-бэкендов × число серверов. Пул
   per-server — плановая доработка.
-- **Поведение**: FDW только на чтение; JOIN-pushdown — для top-level запросов
-  (SPI/PL-pgSQL-обёртки дают явную ошибку); set-операции исполняются по одному
-  оператору на arm; `RESCAN`-планы отвергаются.
+- **Поведение**: FDW только на чтение; JOIN-pushdown — для top-level запросов.
+  Под SPI/PL-pgSQL (виджеты Навигатора исполняются через CALL) remote-путь для
+  join не строится — запрос исполняется локально по по-табличным сканам,
+  без ошибок; полный пушдаун в Навигаторе достигается мостом (§7). RESCAN
+  поддерживается: `re_scan` перезапускает запрос на новом соединении с теми же
+  параметрами. Set-операции исполняются по одному оператору на arm.
 - **Мажорный апгрейд PostgreSQL** = пересборка расширения под новый мажор +
   установка в новый кластер (`pg_upgrade` подхватит файлы, если расширение
   стояло в старом).
 
-## 7. Установка на другой сервер Сбер Навигатора (перенос готовой .so)
+## 7. Сервер Сбер Навигатора: работа через мост (поддерживаемая топология)
 
-Сценарий: новый сервер Навигатора (Astra Linux, PostgreSQL, БД `navigator`),
-**без компиляции** — переносим готовые артефакты с рабочего сервера и правим
-словарь источников. Всё выполняется под `postgres` (psql) и root (файлы);
-стоковый wildfly/Навигатор не трогаем.
+Сценарий: сервер Навигатора (Astra Linux, PostgreSQL, БД `navigator`).
+**Поддерживаемая топология — мост**: расширение работает в отдельной БД
+(«мост», на проде — `test`), Навигатор подключается к ней штатным
+источником типа «PostgreSQL». Словарь источников остаётся вендорским:
+пункт «MS SQL» работает через штатный `tds_fdw`, наше расширение в БД
+`navigator` не нужно.
+
+```
+Навигатор (wildfly) ──CALL──► БД navigator (postgres_fdw, srcext.*_ms)
+                                 │ remote query: депарс из planner-дерева,
+                                 │ работает под SPI/CALL
+                                 ▼
+                            БД test «мост» (wrappers, сервер mssql_vgu)
+                                 │ один T-SQL: JOIN + фильтры + агрегация
+                                 ▼
+                            MS SQL (VGU)
+```
+
+Почему мост, а не прямой источник: виджет-запросы Навигатора исполняются
+через `call ui.portal_arm_main_command(...)` (SPI), где наш фреймворк не
+может депарсить join-дерево (собственный депарсер — план M3 — отклонён:
+риски/сопровождение против дублирования того, что postgres_fdw уже делает).
+postgres_fdw же депарсит запрос из planner-дерева независимо от контекста
+вызова и пересылает на мост готовый top-level SELECT — там наш FDW
+переводит его в один T-SQL. Проверено на проде 06.09: 5-табличный агрегат с
+константными фильтрами уезжает целиком (sum + GROUP BY + ORDER BY).
 
 ### 7.0 Совместимость
 
@@ -250,7 +275,7 @@ ALTER EXTENSION wrappers UPDATE TO '0.6.2';
 артефакты в Docker по §3 (в контейнере `PG_MAJOR` = мажор целевого сервера)
 и забрать tar.
 
-### 7.1 Артефакты
+### 7.1 Артефакты и лицензия
 
 Три файла (на pg15 имена именно такие — control использует «versioned
 shared-object mode», без `module_pathname`):
@@ -290,122 +315,107 @@ sudo install -o wildfly -g wildfly -m 640 license.key \
 (признак успеха — сообщения о лицензии исчезают из
 `navigator-portal-server-debug-current.log`).
 
-### 7.2 Включение в БД navigator
+### 7.2 Настройка моста (БД test)
 
 ```sql
--- функции обработчиков лягут в схему ext (у Навигатора стандартная схема
--- для расширений; DDL FDW ниже ссылается именно на неё)
-CREATE EXTENSION wrappers WITH SCHEMA ext;
+-- в БД-мосте (на проде — test; на чистой установке лучше отдельная БД)
+CREATE EXTENSION wrappers;
 
-CREATE FOREIGN DATA WRAPPER mssql_wrapper
-  HANDLER ext.mssql_fdw_rq_handler
-  VALIDATOR ext.mssql_fdw_rq_validator;
+CREATE FOREIGN DATA WRAPPER mssql_fdw_rq
+  HANDLER mssql_fdw_rq_handler
+  VALIDATOR mssql_fdw_rq_validator;
 
--- серверы создаются шаблоном словаря от имени as_admin
-GRANT USAGE ON FOREIGN DATA WRAPPER mssql_wrapper TO as_admin;
+CREATE SERVER mssql_vgu FOREIGN DATA WRAPPER mssql_fdw_rq OPTIONS (
+  conn_string 'Server=devsrv,1433;Database=VGU;Encrypt=true;TrustServerCertificate=true',
+  log_remote_query 'true');            -- отладка; в бою выставить 'false'
 
-SELECT * FROM ext.mssql_fdw_rq_meta();   -- самопроверка: версия/автор
+CREATE USER MAPPING FOR postgres SERVER mssql_vgu
+  OPTIONS (user '<mssql_login>', password '<mssql_password>');
+
+-- таблицы моста: опции schema/table указывают на удалённые имена MSSQL
+CREATE FOREIGN TABLE dbo.factipp (… ) SERVER mssql_vgu
+  OPTIONS (schema 'dbo', table 'FactIPP');
+CREATE FOREIGN TABLE dbo.dimcalendar (…) SERVER mssql_vgu
+  OPTIONS (schema 'dbo', table 'DimCalendar');
+-- … dimsotr / dimnorm / dimpodr / dimprojects
 ```
 
-Рядом должен стоять штатный `tds_fdw` (у Навигатора обычно уже есть — через
-него работает обычный пункт «MS SQL»): он нужен для видимости пункта меню
-(§7.3) и не используется сам.
+`Encrypt=true` — TLS обязателен; `TrustServerCertificate=true` — только при
+самоподписанном сертификате MSSQL. Учётные данные — в user mapping, не в
+conn_string.
 
-### 7.3 Привязка пункта меню к нашему расширению (словарь)
+### 7.3 Источник в Навигаторе
 
-Навигатор управляет типами подключений словарём `data.tdicdatawrapper`
-(nid, sname, sdatawrapper, joptions, screateserver, salterserver). Как это
-работает и почему правится именно строка `nid=3`:
-
-- фильтр меню (`arm.getdictionary_v40`): тип видим ⇔ `sdatawrapper` = имя
-  **установленного расширения** (`pg_extension.extname`) И у одноимённого FDW
-  в `fdwacl` есть `as_admin=U`. Наше расширение называется `wrappers`, а
-  листинг таблиц (`arm.getforeigntableoptionlist_v40`) ветвится по
-  `sdatawrapper` — ветки `wrappers`/`mssql_wrapper` там нет, отдельная строка
-  была бы невидима/неработоспособна;
-- имя сервера генерирует CASE по `nid` в `arm.setuserconnection_v40`
-  (`nid=3` → `navigator_mssql_<id>`), неизвестный nid → NULL;
-- ветка `tds_fdw` листинга создаёт временную foreign table с опциями
-  `schema_name`/`table_name` и varchar-колонками с `column_name` — наш FDW
-  всё это понимает (алиасы + varchar ⇒ нужны `2692f74`/`50d94d9`/`d3dfc52`,
-  т.е. любая сборка новее этих коммитов).
-
-⇒ `sdatawrapper` оставляем `tds_fdw`, `sname` оставляем `MS SQL`, а шаблоны
-`screateserver`/`salterserver` подменяем на наш FDW `mssql_wrapper` (сервер
-создаётся по нашим шаблонам, остальное работает штатно):
+В UI Навигатора создайте источник типа **«PostgreSQL»**: хост/порт сервера
+PG с мостом, БД моста. Навигатор создаст сервер `navigator_postgresql_<id>`
+(postgres_fdw) и srcext-таблицки поверх схем моста (стандартный поток
+вендора, ничего править не нужно). После создания — обязательный тюнинг:
 
 ```sql
--- 0) бэкап строки
-CREATE TABLE data.tdicdatawrapper_nid3_backup_20260905 AS
-  SELECT * FROM data.tdicdatawrapper WHERE nid = 3;
-
--- 1) подмена шаблонов (dollar-quoting из-за кавычек в шаблонах).
---    ВАЖНО: sname НЕ трогаем — это функциональный ключ, по которому
---    ветвится vendor-код (напр. arm.setusersource_v40:
---    _sDB IN ('Clickhouse','PostgreSQL','MS SQL','MySQL','Oracle',...)).
---    Переименование («MS SQL (Rubicon)») молча пропускает создание
---    foreign-таблицы источника: каталог обновится, таблицы не будет.
-UPDATE data.tdicdatawrapper SET
-  screateserver = $ddl$CREATE SERVER [**sDBForeignName**]
-  FOREIGN DATA WRAPPER mssql_wrapper
-  OPTIONS (conn_string 'Server=[**sHost**],[**sPort**];Database=[**sDBName**];IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true'[**sOptions**]);
-CREATE USER MAPPING FOR as_admin
-  SERVER [**sDBForeignName**]
-  OPTIONS (user '[**sLogin**]', password '[**sHash**]');$ddl$,
-  salterserver = $ddl$ALTER SERVER [**sDBForeignName**]
-  OPTIONS (SET conn_string 'Server=[**sHost**],[**sPort**];Database=[**sDBName**];IntegratedSecurity=false;Encrypt=true;TrustServerCertificate=true'[**sOptions**]);
-ALTER USER MAPPING FOR as_admin
-  SERVER [**sDBForeignName**]
-  OPTIONS (SET user '[**sLogin**]', SET password '[**sHash**]');$ddl$
-WHERE nid = 3;
+-- в БД navigator, под postgres:
+-- 1) remote-оценки + честные цены (мост — loopback; дефолт fdw_startup_cost=100
+--    душит remote-агрегацию: все пути стоят одинаково и tie отдается локальному плану)
+ALTER SERVER navigator_postgresql_<id>
+  OPTIONS (ADD use_remote_estimate 'true',
+           ADD fdw_startup_cost '10', ADD fdw_tuple_cost '0.005');
+-- 2) статистика: без ANALYZE reltuples=-1 и планировщик слеп
+ANALYZE srcext.ipp_ms_<id>;   -- все таблицы источника
 ```
 
-- `joptions` не трогаем — это поля формы (хост/порт/БД/логин/пароль),
-  плейсхолдеры `[**sHost**]`… подставляются из них; `[**sDBForeignName**]` —
-  сгенерированное имя `navigator_mssql_<id>`;
-- `Encrypt=true` — TLS обязателен; `TrustServerCertificate=true` держим для
-  самоподписанных сертификатов MSSQL, с нормальным CA — убрать;
-- рестарт wildfly не нужен — словарь читается на каждый запрос;
-- при обновлении Навигатора строку словаря может перезалить вендорское
-  обновление — после каждого обновления проверять и повторять шаг 1
-  (бэкап-таблица из шага 0 хранит исходник).
+### 7.4 Ограничения моста — важно для SQL виджетов
 
-### 7.4 Проверка
-
-1. UI: в списке типов подключений есть «MS SQL» (ведёт к нашему FDW).
-2. Создать подключение к MSSQL → появился сервер
-   `navigator_mssql_<id>` с `conn_string` и `USER MAPPING FOR as_admin`:
-   ```sql
-   SELECT srvname, srvoptions FROM pg_foreign_server
-     WHERE srvname LIKE 'navigator_mssql_%';
-   ```
-3. Экран выбора таблиц — напрямую (то же, что делает UI):
-   ```sql
-   SET ROLE as_admin;
-   CALL arm.getforeigntableoptionlist_v40(
-     '{"params":{"param":[{"name":"nID","value":"<id подключения>"}]}}'::json,
-     NULL, <nuserid>);
-   -- ожидание: JSON root.ForeignTableOptions.option[] со схемами и таблицами
-   ```
-4. Досоздать источник до конца и выполнить тестовый запрос из отчёта.
+- **Локальные функции в фильтрах нешипуемы** (`tool.split([**param])` —
+  SRF из БД navigator): postgres_fdw тянет join сырыми строками, фильтрует и
+  группирует локально (корректно, но не оптимально). Рецепт полного пушдауна:
+  в NavSQL подставлять параметры **константными списками**
+  (`WHERE c.monthofyearid IN [**month]`) — такой запрос уезжает в MSSQL
+  целиком одним T-SQL (проверено 06.09). Скалярные параметры
+  (`yearid = [**year]`) шипуются всегда.
+- Target-list выражения простых сканов (CASE/EXTRACT/NOW — например, «поле
+  текущего года» в контролах) считаются локально у Навигатора — это норм.
+- Контролы со строковыми литералами (кириллица «Не задано» и т.п.) шипуются
+  (фиксы `555572e`); IN-списки по колонкам с алиасами — тоже.
 
 ### 7.5 Диагностика
 
 - Ошибки UI портала пишутся в `comm.paramslog_v30`
   (`nerrorstatus = true`, текст в `serrormsg`, `jparams` — параметры вызова;
   ID записи UI и показывает). Сообщения PostgreSQL приходят локализованными:
-  «нет доступа к таблице X» = `permission denied for table X`.
-- Тип «MS SQL (Rubicon)» не виден в меню ⇔ `sdatawrapper` строки nid=3 не
-  совпадает с `pg_extension.extname` установленного расширения (`tds_fdw`)
-  или у FDW `tds_fdw` нет `as_admin=U` в `fdwacl`
-  (`SELECT fdwacl FROM pg_foreign_data_wrapper WHERE fdwname='tds_fdw';`).
-- Портал выполняет процедуры под `SET ROLE as_admin`; **user mapping по
-  членству роли не наследуется** (поэтому шаблон создаёт mapping именно для
-  `as_admin`), а вот гранты наследуются — прав будет достаточно.
-- `ext.wrappers_fdw_stats` не пишется с `c3d512c` намеренно: INSERT статистики
-  шёл от имени вызывающей роли и при пустом ACL таблицы ронял сканы под
-  `as_admin` («нет доступа к таблице», comm.paramslog nid=19598 от 05.09).
+  «нет доступа к таблице X» = `permission denied for table X`. Ошибки,
+  перехваченные внутри vendor-процедур (`EXCEPTION WHEN OTHERS`), в paramslog
+  **не попадают** — смотреть wildfly-лог
+  (`/opt/wildfly/standalone/log/navigator-portal-server-debug-current.log`,
+  там полный JSON запроса + текст ошибки).
+- **T-SQL, реально ушедший в MSSQL**: на мосту `log_remote_query='true'` у
+  сервера mssql_*; строки в `pg_log/postgresql-<День>.log`:
+  `mssql_fdw_rq: remote query dispatched (N ms): <T-SQL>` (full-query) и
+  `mssql_fdw_rq: remote query: <T-SQL>` (plain-скан). Читать дельту лога по
+  офсету:
+  ```sql
+  SELECT (pg_stat_file('pg_log/postgresql-Sun.log')).size;         -- до
+  -- …выполнить запрос (например, виджет в UI)…
+  SELECT pg_read_file('pg_log/postgresql-Sun.log', <offset>, <new-offset - <offset>);
+  ```
+- `EXPLAIN (VERBOSE)` в БД navigator показывает `Remote SQL` (что postgres_fdw
+  шлёт на мост); на мосту — `Remote query` нашего FDW (итоговый T-SQL ещё до
+  исполнения).
+- Портал выполняет процедуры под `SET ROLE as_admin`; user mapping по
+  членству роли не наследуется — mapping должен существовать для роли,
+  от которой работает подключение к мосту.
+- `ext.wrappers_fdw_stats` не пишется с `c3d512c` намеренно (INSERT статистики
+  от имени вызывающей роли ронял сканы под `as_admin` — пустой ACL таблицы).
   Гранты на неё выдавать не нужно.
-- T-SQL уходит/приходит: `ALTER SERVER … OPTIONS (SET log_remote_query 'true')`
-  + `SET client_min_messages = LOG` (префикс `mssql_fdw_rq:`); на MSSQL —
-  Extended Events по `client_app_name='wrappers'`.
+- Словарь `data.tdicdatawrapper` — **вендорский, не подменять**: строка
+  nid=3 (MS SQL/tds_fdw) должна остаться штатной. История: 04–05.09
+  экспериментировали с подменой шаблонов на наш FDW (прямой путь), 06.09
+  откачено из бэкапа `/tmp/tdicdatawrapper_backup_20260904.csv` (копия:
+  `/home/administrator/tdic_orig.csv` на проде). Откат повторно:
+  ```sql
+  CREATE TEMP TABLE r (nid bigint, sname text, sdatawrapper text,
+                       joptions text, screateserver text, salterserver text);
+  \copy r FROM '/tmp/tdicdatawrapper_backup_20260904.csv' CSV
+  UPDATE data.tdicdatawrapper t
+  SET sname=r.sname, sdatawrapper=r.sdatawrapper, joptions=r.joptions::json,
+      screateserver=r.screateserver, salterserver=r.salterserver
+  FROM r WHERE t.nid=3 AND r.nid=3;
+  ```
