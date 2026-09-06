@@ -519,6 +519,37 @@ mod unit {
         );
     }
 
+    // 2026-09-06 (bridge aggregate pushdown): postgres_fdw deparses
+    // `GROUP BY a, b` as `GROUP BY 3, 4` — only the first ordinal sat right
+    // after BY, the second leaked into T-SQL as a literal and MSSQL
+    // rejected the whole statement ("Each GROUP BY expression must contain
+    // at least one column that is not an outer reference")
+    #[test]
+    fn positional_group_by_multiple_refs() {
+        assert_tsql(
+            "SELECT sum(amount) AS total, name, status FROM public.dbo_orders GROUP BY 2, 3",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name, status FROM [dbo].[Orders] GROUP BY name, status",
+        );
+        // ordinal lists in ORDER BY resolve the same way, tiebreakers apply
+        assert_tsql(
+            "SELECT sum(amount) AS total, name, status FROM public.dbo_orders \
+             GROUP BY 2, 3 ORDER BY 2, 3",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name, status FROM [dbo].[Orders] \
+             GROUP BY name, status \
+             ORDER BY CASE WHEN name IS NULL THEN 1 ELSE 0 END, name, \
+             CASE WHEN status IS NULL THEN 1 ELSE 0 END, status",
+        );
+        // a constant inside a GROUP BY expression must NOT be mistaken for
+        // an ordinal (only a number right after BY or a list comma is one)
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY 2, name",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name, name",
+        );
+    }
+
     // 2026-09-05 (Navigator widget SQL, test error 1.txt): aliases after AS
     // are bracket-quoted — T-SQL reserved words (PLAN, KEY…) are ordinary
     // PostgreSQL aliases but `AS plan` breaks MSSQL parsing

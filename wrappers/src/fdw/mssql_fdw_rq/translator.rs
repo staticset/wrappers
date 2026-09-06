@@ -643,6 +643,11 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     // current top-level clause: the deparser prints top-level AND-chains in
     // WHERE/HAVING/ON as comma-separated lists, which must become AND
     let mut in_condition_clause = false;
+    // a positional GROUP BY/ORDER BY list is being consumed: after the first
+    // ordinal was substituted, the following ones no longer sit right after
+    // BY (the previous piece is the substituted expression), so an active
+    // list plus a preceding comma also opens a positional item
+    let mut positional_list_active = false;
 
     // top-level ORDER BY tracking: PostgreSQL's implicit NULL ordering
     // (ASC → NULLS LAST, DESC → NULLS FIRST) differs from T-SQL's (NULL is
@@ -818,8 +823,13 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 // referenced SELECT-list expression is substituted verbatim
                 if depth == 0
                     && out.last().is_some_and(|p| {
-                        // `BY` alone or the composite `ORDER BY` / `GROUP BY`
-                        p.eq_ignore_ascii_case("by") || p.to_ascii_uppercase().ends_with(" BY")
+                        // `BY` alone or the composite `ORDER BY` / `GROUP BY`,
+                        // or the comma separating items of an active
+                        // positional list (postgres_fdw deparses `GROUP BY
+                        // a, b` as `GROUP BY 3, 4`)
+                        p.eq_ignore_ascii_case("by")
+                            || p.to_ascii_uppercase().ends_with(" BY")
+                            || (positional_list_active && p == ",")
                     })
                 {
                     let idx: usize =
@@ -837,6 +847,10 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         });
                     };
                     out.push(expr);
+                    positional_list_active = true;
+                    // a substituted ordinal opens a fresh ORDER BY item (the
+                    // closing tiebreaker must still be applied to it)
+                    order_item_closed = false;
                     i += 1;
                     continue;
                 }
@@ -996,6 +1010,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             in_condition_clause = false;
                             in_order = true;
                             order_item_closed = false;
+                            positional_list_active = false;
                         } else if over_paren_depth.is_some()
                             && depth >= over_paren_depth.unwrap_or(usize::MAX)
                         {
@@ -1013,6 +1028,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         if depth == 0 =>
                     {
                         in_condition_clause = false;
+                        positional_list_active = false;
                         if in_order && !order_item_closed {
                             close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
