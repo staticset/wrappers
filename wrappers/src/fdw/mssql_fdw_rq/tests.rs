@@ -189,6 +189,19 @@ mod unit {
         );
     }
 
+    // 2026-09-06 review Р4: `fetch` is a legal non-reserved PostgreSQL
+    // column name; when the query also had a LIMIT, the clause rewrite used
+    // to consume the column and the tokens after it, shifting every result
+    // column silently
+    #[test]
+    fn column_named_fetch_not_eaten_by_limit_clause() {
+        assert_tsql(
+            "SELECT fetch, id FROM dbo_orders LIMIT 3",
+            &orders_ctx(),
+            "SELECT TOP (3) fetch, id FROM [dbo].[Orders]",
+        );
+    }
+
     // -- DISTINCT ------------------------------------------------------------------
 
     #[test]
@@ -547,6 +560,76 @@ mod unit {
         );
     }
 
+    // 2026-09-06 review Р6: the cast modifier used to be dropped —
+    // `::numeric(10,2)` became the default numeric(38, 10) and silently kept
+    // more decimals than PostgreSQL would have rounded to
+    #[test]
+    fn cast_modifier_preserved_where_it_changes_values() {
+        assert_tsql(
+            "SELECT total::numeric(10,2) FROM dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(total AS numeric(10, 2)) FROM [dbo].[Orders]",
+        );
+        // single-argument numeric(p) means scale 0
+        assert_tsql(
+            "SELECT total::numeric(10) FROM dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(total AS numeric(10, 0)) FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT placed_at::timestamp(3) FROM dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(placed_at AS datetime2(3)) FROM [dbo].[Orders]",
+        );
+        assert_tsql(
+            "SELECT shipped_at::timestamptz(0) FROM dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(shipped_at AS datetimeoffset(0)) FROM [dbo].[Orders]",
+        );
+        // multiword name + modifier
+        assert_tsql(
+            "SELECT placed_at::timestamp with time zone(0) FROM dbo_orders",
+            &orders_ctx(),
+            "SELECT CAST(placed_at AS datetimeoffset(0)) FROM [dbo].[Orders]",
+        );
+    }
+
+    // stage-3 H1 (found by the А1 e2e test): PostgreSQL prints whole-hour
+    // timestamptz offsets short (`+00`), but T-SQL's datetimeoffset requires
+    // minutes — the cast used to fail at conversion with error 241
+    #[test]
+    fn timestamptz_literal_offset_gets_minutes() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE shipped_at = '2026-05-01 12:00:00+00'::timestamptz",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] \
+             WHERE shipped_at = CAST('2026-05-01 12:00:00+00:00' AS datetimeoffset)",
+        );
+        // typed literal form, negative whole-hour offset
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE shipped_at = TIMESTAMPTZ '2026-05-01 09:00:00-03'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] \
+             WHERE shipped_at = CAST('2026-05-01 09:00:00-03:00' AS datetimeoffset)",
+        );
+        // minutes-exact offsets pass through untouched
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE shipped_at = '2026-05-01 12:00:00+05:30'::timestamptz",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] \
+             WHERE shipped_at = CAST('2026-05-01 12:00:00+05:30' AS datetimeoffset)",
+        );
+        // non-timestamptz casts never touch the literal (a bare date is
+        // indistinguishable from a negative offset by suffix alone)
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE order_date = DATE '2026-05-01'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE order_date = CAST('2026-05-01' AS date)",
+        );
+    }
+
     // D: `o . active` arrives piecewise, so the qualifier tail used to hide
     // the predicate-start piece and the `= 1` rewrite never fired
     #[test]
@@ -819,6 +902,65 @@ mod unit {
             "SELECT id FROM public.dbo_orders WHERE (note ~~ 'От%'::text)",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] WHERE (note LIKE N'От%')",
+        );
+    }
+
+    // 2026-09-06 review Р5: PostgreSQL treats `\` as the default LIKE escape
+    // and `[` as a literal; T-SQL has no default escape and reads `[…]` as a
+    // character class. Patterns are translated so the matched set stays
+    // identical; patterns arriving as data (column/parameter) cannot be
+    // rewritten and are refused.
+    #[test]
+    fn like_pattern_escapes_translated() {
+        // `\%` is a literal percent in PG — T-SQL needs [%]
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ '50\\%')",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note LIKE '50[%]')",
+        );
+        // `\\` is a literal backslash in a PG pattern; the trailing `%` is
+        // an unescaped wildcard and stays one
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ 'C:\\\\temp\\\\%')",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note LIKE 'C:\\temp\\%')",
+        );
+        // a bare `[` is a literal in PG, a class opener in T-SQL
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ 'a[b%')",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note LIKE 'a[[]b%')",
+        );
+        // `_` and `%` are wildcards in both dialects — untouched
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ 'a_c%')",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note LIKE 'a_c%')",
+        );
+        // the keyword spelling a client can send gets the same translation
+        assert_tsql(
+            "SELECT id FROM dbo_orders WHERE note LIKE 'a[b%'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note LIKE 'a[[]b%'",
+        );
+    }
+
+    #[test]
+    fn like_non_literal_pattern_rejected() {
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ $1)",
+            &orders_ctx(),
+            "non-literal",
+        );
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE (note ~~ pattern)",
+            &orders_ctx(),
+            "non-literal",
+        );
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE note ILIKE pattern",
+            &orders_ctx(),
+            "non-literal",
         );
     }
 
@@ -1363,6 +1505,36 @@ mod unit {
             assert_eq!(
                 sql_for(&[qual("active", "is", Value::Cell(Cell::Bool(true)), false)]),
                 "SELECT [id], [note] FROM [dbo].[Orders] WHERE [active] = 1"
+            );
+        }
+
+        // 2026-09-06 review Р5 (plain-scan side): a LIKE pattern with
+        // PostgreSQL escape semantics (`\x`, literal `[`) reads differently
+        // under T-SQL rules — the qual is left to PostgreSQL's local recheck
+        // instead of being pushed down
+        #[test]
+        fn like_qual_with_pg_escapes_stays_local() {
+            assert_eq!(
+                sql_for(&[
+                    qual("id", "=", Value::Cell(Cell::I64(7)), false),
+                    qual(
+                        "note",
+                        "~~",
+                        Value::Cell(Cell::String("50\\%".to_string())),
+                        false
+                    ),
+                ]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [id] = @P1"
+            );
+            // patterns without `\` or `[` still push down
+            assert_eq!(
+                sql_for(&[qual(
+                    "note",
+                    "~~",
+                    Value::Cell(Cell::String("a%".to_string())),
+                    false
+                )]),
+                "SELECT [id], [note] FROM [dbo].[Orders] WHERE [note] LIKE @P1"
             );
         }
 

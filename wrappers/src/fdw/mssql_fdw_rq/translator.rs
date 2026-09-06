@@ -827,7 +827,12 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         let mssql_type = parse_cast_type(&toks[i + 1..])?;
                         let end = type_token_len(&toks[i + 1..]);
                         let start = capture_subject(&out, case_depth)?;
-                        let expr = out[start..].join(" ");
+                        let mut expr = out[start..].join(" ");
+                        if mssql_type == "datetimeoffset" {
+                            // a timestamptz literal's whole-hour offset needs
+                            // minutes for T-SQL (error 241 otherwise)
+                            expr = normalize_datetimeoffset_expr(&expr);
+                        }
                         out.truncate(start);
                         out.push(format!("CAST({expr} AS {mssql_type})"));
                         i += 1 + end;
@@ -970,8 +975,19 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         continue;
                     }
                     // deparser's `FETCH FIRST n ROWS ONLY` LIMIT form (no
-                    // OFFSET): the canonical clause was emitted already
-                    "fetch" if depth == 0 && clauses.limit_len > 0 && clauses.offset.is_none() => {
+                    // OFFSET): the canonical clause was emitted already.
+                    // `fetch` is also a legal (non-reserved) PostgreSQL
+                    // column name — only treat it as the clause when the
+                    // FIRST/NEXT + value tokens actually follow, mirroring
+                    // analyze(); otherwise the column and the tokens after
+                    // it used to be silently eaten
+                    "fetch"
+                        if depth == 0
+                            && clauses.limit_len > 0
+                            && clauses.offset.is_none()
+                            && matches!(toks.get(i + 1), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("next"))
+                            && limit_value_at(&toks, i + 2).is_some() =>
+                    {
                         if in_order && !order_item_closed {
                             close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
@@ -1227,9 +1243,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 let Tok::Str(s) = &toks[i + 1] else {
                                     unreachable!();
                                 };
+                                let body = if mssql_type == "datetimeoffset" {
+                                    normalize_tz_literal(s)
+                                } else {
+                                    s.clone()
+                                };
                                 out.push(format!(
                                     "CAST({} AS {mssql_type})",
-                                    tsql_string_literal(s)
+                                    tsql_string_literal(&body)
                                 ));
                                 i += 2;
                                 continue;
@@ -1249,6 +1270,18 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     }
                     "ilike" => {
                         translate_ilike(&toks, i, &mut out, &mut i, case_depth)?;
+                        continue;
+                    }
+                    // client text may spell LIKE as a keyword (the deparser
+                    // uses the ~~ operator); give a literal pattern the same
+                    // escape translation as the operator form
+                    "like" if matches!(toks.get(i + 1), Some(Tok::Str(_))) => {
+                        let Tok::Str(s) = &toks[i + 1] else {
+                            unreachable!();
+                        };
+                        out.push("LIKE".to_string());
+                        out.push(tsql_string_literal(&tsql_like_pattern(s)?));
+                        i += 2;
                         continue;
                     }
                     "is" => {
@@ -1807,7 +1840,7 @@ fn type_token_len(toks: &[Tok]) -> usize {
     len
 }
 
-fn parse_cast_type(toks: &[Tok]) -> Result<&'static str, TranslateError> {
+fn parse_cast_type(toks: &[Tok]) -> Result<String, TranslateError> {
     let len = type_token_len(toks);
     // reconstruct the name after the optional schema qualifier
     // (pg_catalog.int8 → int8), joining multi-word names with spaces
@@ -1833,10 +1866,92 @@ fn parse_cast_type(toks: &[Tok]) -> Result<&'static str, TranslateError> {
             reason: "missing type name after cast".to_string(),
         });
     }
-    types::pg_type_to_mssql(&name).ok_or_else(|| TranslateError::UnsupportedConstruct {
-        sql_fragment: format!("::{name}"),
-        reason: "cast target type has no T-SQL mapping".to_string(),
-    })
+
+    // `::numeric(p, s)` rounds to s decimals in PostgreSQL — keep the
+    // declared scale instead of the default numeric(38, 10) mapping, and
+    // keep timestamp/time precisions. varchar-style modifiers stay on the
+    // fixed nvarchar(4000) mapping: remote lengths do not travel with the
+    // cast and the local value already fits (locked by test).
+    //
+    // `len` (type_token_len) already includes the modifier list; find the
+    // name's end to read the modifier at the right offset.
+    let mut name_end = start;
+    while matches!(toks.get(name_end), Some(Tok::Word(_) | Tok::QIdent(_))) {
+        name_end += 1;
+        if matches!(toks.get(name_end), Some(Tok::Op(o)) if o == ".") {
+            name_end += 1;
+        }
+    }
+    let mods = modifier_list(toks, name_end);
+    let mod_err = || cast_mod_err(&name);
+    let mssql_type = match (name.as_str(), mods.as_slice()) {
+        ("numeric" | "decimal", mods) if !mods.is_empty() => {
+            let precision: i32 = mods[0].parse().map_err(|_| mod_err())?;
+            let scale: i32 = if mods.len() > 1 {
+                mods[1].parse().map_err(|_| mod_err())?
+            } else {
+                0
+            };
+            if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
+                return Err(mod_err());
+            }
+            format!("numeric({precision}, {scale})")
+        }
+        ("timestamp" | "timestamp without time zone", [p]) => {
+            let p: u8 = p.parse().map_err(|_| mod_err())?;
+            if p > 7 {
+                return Err(mod_err());
+            }
+            format!("datetime2({p})")
+        }
+        ("timestamptz" | "timestamp with time zone", [p]) => {
+            let p: u8 = p.parse().map_err(|_| mod_err())?;
+            if p > 7 {
+                return Err(mod_err());
+            }
+            format!("datetimeoffset({p})")
+        }
+        ("time" | "time without time zone", [p]) => {
+            let p: u8 = p.parse().map_err(|_| mod_err())?;
+            if p > 7 {
+                return Err(mod_err());
+            }
+            format!("time({p})")
+        }
+        _ => types::pg_type_to_mssql(&name)
+            .map(str::to_string)
+            .ok_or_else(|| TranslateError::UnsupportedConstruct {
+                sql_fragment: format!("::{name}"),
+                reason: "cast target type has no T-SQL mapping".to_string(),
+            })?,
+    };
+    Ok(mssql_type)
+}
+
+/// The `(n[,m]…)` modifier list following a cast's type name, when present.
+fn modifier_list(toks: &[Tok], type_len: usize) -> Vec<String> {
+    let mut mods = Vec::new();
+    if !matches!(toks.get(type_len), Some(Tok::Op(o)) if o == "(") {
+        return mods;
+    }
+    let mut j = type_len + 1;
+    while let Some(t) = toks.get(j) {
+        match t {
+            Tok::Num(n) => mods.push(n.clone()),
+            Tok::Op(o) if o == "," => {}
+            Tok::Op(o) if o == ")" => break,
+            _ => break,
+        }
+        j += 1;
+    }
+    mods
+}
+
+fn cast_mod_err(name: &str) -> TranslateError {
+    TranslateError::UnsupportedConstruct {
+        sql_fragment: format!("::{name}(…)"),
+        reason: "cast modifier is out of the supported range".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,13 +1981,23 @@ fn translate_ilike(
     out.truncate(start);
 
     let rhs = match toks.get(i + 1) {
-        Some(Tok::Word(w)) => w.clone(),
-        Some(Tok::QIdent(q)) => bracket_ident(q)?,
-        Some(Tok::Str(s)) => tsql_string_literal(s),
+        Some(Tok::Str(s)) => tsql_string_literal(&tsql_like_pattern(s)?),
+        // a pattern arriving as data follows PostgreSQL's LIKE rules when
+        // PostgreSQL evaluates it and T-SQL's when the remote does — the
+        // value cannot be rewritten, so refuse instead of silently changing
+        // the matched set
+        Some(Tok::Word(_) | Tok::QIdent(_)) => {
+            return Err(TranslateError::UnsupportedConstruct {
+                sql_fragment: "ILIKE <non-literal>".to_string(),
+                reason: "ILIKE pattern must be a literal; column patterns follow \
+                         different escape rules in T-SQL"
+                    .to_string(),
+            });
+        }
         _ => {
             return Err(TranslateError::UnsupportedConstruct {
                 sql_fragment: "ILIKE".to_string(),
-                reason: "ILIKE pattern must be a simple literal or column".to_string(),
+                reason: "ILIKE pattern must be a literal".to_string(),
             });
         }
     };
@@ -1926,15 +2051,23 @@ fn translate_like_operator(
                 }
                 used += 1 + len;
             }
-            (tsql_string_literal(s), used)
+            (tsql_string_literal(&tsql_like_pattern(s)?), used)
         }
-        Some(Tok::Word(w)) => (w.clone(), 1),
-        Some(Tok::QIdent(q)) => (bracket_ident(q)?, 1),
-        Some(Tok::Param(p)) => (format!("@P{p}"), 1),
+        // patterns arriving as data (column or bound parameter) follow
+        // PostgreSQL's LIKE rules locally and T-SQL's remotely — refuse
+        // instead of silently matching a different set
+        Some(Tok::Word(_) | Tok::QIdent(_) | Tok::Param(_)) => {
+            return Err(TranslateError::UnsupportedConstruct {
+                sql_fragment: "~~ <non-literal>".to_string(),
+                reason: "LIKE pattern must be a literal; column or parameter \
+                         patterns follow different escape rules in T-SQL"
+                    .to_string(),
+            });
+        }
         _ => {
             return Err(TranslateError::UnsupportedConstruct {
                 sql_fragment: "~~ …".to_string(),
-                reason: "LIKE pattern must be a literal, column, or parameter".to_string(),
+                reason: "LIKE pattern must be a literal".to_string(),
             });
         }
     };
@@ -2408,6 +2541,75 @@ fn tsql_string_literal(s: &str) -> String {
     } else {
         format!("N'{escaped}'")
     }
+}
+
+/// Normalize the UTC offset of a PostgreSQL timestamptz literal: PostgreSQL
+/// prints whole-hour offsets short (`…+00`, `…+03`) while T-SQL's
+/// `datetimeoffset` requires minutes (`+00:00`) — anything else fails at
+/// conversion with error 241. Only safe for values known to be timestamptz
+/// output (they always end with `±HH` or `±HH:MM`); a bare date could not be
+/// told apart from a negative offset by suffix alone.
+fn normalize_tz_literal(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3 {
+        let sign = bytes[bytes.len() - 3];
+        let h1 = bytes[bytes.len() - 2];
+        let h2 = bytes[bytes.len() - 1];
+        if matches!(sign, b'+' | b'-') && h1.is_ascii_digit() && h2.is_ascii_digit() {
+            return format!("{s}:00");
+        }
+    }
+    s.to_string()
+}
+
+/// Apply [`normalize_tz_literal`] to a rendered literal expression (`'…'` or
+/// `N'…'`); anything else comes back unchanged.
+fn normalize_datetimeoffset_expr(expr: &str) -> String {
+    let Some(inner) = expr.strip_suffix('\'') else {
+        return expr.to_string();
+    };
+    let (prefix, body) = if let Some(b) = inner.strip_prefix("N'") {
+        ("N'", b)
+    } else if let Some(b) = inner.strip_prefix('\'') {
+        ("'", b)
+    } else {
+        return expr.to_string();
+    };
+    format!("{prefix}{}'", normalize_tz_literal(body))
+}
+
+/// Translate a PostgreSQL LIKE pattern for T-SQL. PostgreSQL treats `\` as
+/// the default escape character and `[` as a literal; T-SQL has no default
+/// escape and reads `[…]` as a character class — translating the escaped and
+/// metacharacter forms keeps the matched set identical instead of silently
+/// changing it (`50\%` would match `50\` + anything instead of the literal
+/// `50%`). `%` and `_` are wildcards in both dialects and pass through.
+fn tsql_like_pattern(p: &str) -> Result<String, TranslateError> {
+    let mut out = String::with_capacity(p.len());
+    let mut chars = p.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // escaped character: literal in PostgreSQL
+            '\\' => match chars.next() {
+                None => {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: p.to_string(),
+                        reason: "LIKE pattern ends with the escape character".to_string(),
+                    });
+                }
+                Some('%') => out.push_str("[%]"),
+                Some('_') => out.push_str("[_]"),
+                Some('[') => out.push_str("[[]"),
+                Some(other) => out.push(other),
+            },
+            // wildcards mean the same in both dialects
+            '%' | '_' => out.push(c),
+            // a literal bracket in PostgreSQL, a class opener in T-SQL
+            '[' => out.push_str("[[]"),
+            other => out.push(other),
+        }
+    }
+    Ok(out)
 }
 
 /// Check whether the last meaningful piece is one of `words`. A dangling

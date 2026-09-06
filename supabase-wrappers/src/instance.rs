@@ -14,13 +14,15 @@ pub struct ForeignServer {
     pub options: HashMap<String, String>,
 }
 
-// create a fdw instance from its id
-pub(super) unsafe fn create_fdw_instance_from_server_id<
+// create a fdw instance from its id, reporting construction failure through
+// the Result — remote-path building degrades to a local plan instead of
+// ereporting at planning time (2026-09-06 review A8)
+pub(super) unsafe fn try_create_fdw_instance_from_server_id<
     E: Into<ErrorReport>,
     W: ForeignDataWrapper<E>,
 >(
     fserver_id: pg_sys::Oid,
-) -> W {
+) -> Result<W, E> {
     let to_string = |raw: *mut std::ffi::c_char| -> Option<String> {
         if raw.is_null() {
             return None;
@@ -44,9 +46,18 @@ pub(super) unsafe fn create_fdw_instance_from_server_id<
             server_version: to_string((*fserver).serverversion),
             options: options_to_hashmap((*fserver).options).report_unwrap(),
         };
-        let wrapper = W::new(server);
-        wrapper.report_unwrap()
+        W::new(server)
     }
+}
+
+// create a fdw instance from its id
+pub(super) unsafe fn create_fdw_instance_from_server_id<
+    E: Into<ErrorReport>,
+    W: ForeignDataWrapper<E>,
+>(
+    fserver_id: pg_sys::Oid,
+) -> W {
+    unsafe { try_create_fdw_instance_from_server_id(fserver_id).report_unwrap() }
 }
 
 // create a fdw instance from a foreign table id
@@ -59,5 +70,18 @@ pub(super) unsafe fn create_fdw_instance_from_table_id<
     unsafe {
         let ftable = pg_sys::GetForeignTable(ftable_id);
         create_fdw_instance_from_server_id((*ftable).serverid)
+    }
+}
+
+// create a fdw instance from a foreign table id, failure as Result
+pub(super) unsafe fn try_create_fdw_instance_from_table_id<
+    E: Into<ErrorReport>,
+    W: ForeignDataWrapper<E>,
+>(
+    ftable_id: pg_sys::Oid,
+) -> Result<W, E> {
+    unsafe {
+        let ftable = pg_sys::GetForeignTable(ftable_id);
+        try_create_fdw_instance_from_server_id((*ftable).serverid)
     }
 }

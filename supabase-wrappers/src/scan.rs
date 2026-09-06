@@ -125,6 +125,39 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
         }
     }
 
+    /// Like [`Self::new`], but reports FDW-instance construction failure as
+    /// `Err` instead of ereporting: remote-path construction uses it, so a
+    /// constructor error (a missing vault secret, an unreadable connection
+    /// string) degrades to "no remote path" and the query keeps its local
+    /// plan. Plain scans stay on [`Self::new`] — they cannot execute without
+    /// an instance, so there the error stands (2026-09-06 review A8).
+    pub(crate) unsafe fn try_new(foreigntableid: Oid, tmp_ctx: MemoryContext) -> Result<Self, E> {
+        Ok(Self {
+            foreigntableid,
+            instance: Some(unsafe {
+                instance::try_create_fdw_instance_from_table_id(foreigntableid)?
+            }),
+            quals: Vec::new(),
+            tgts: Vec::new(),
+            sorts: Vec::new(),
+            limit: None,
+            opts: HashMap::new(),
+            aggregates: Vec::new(),
+            group_by: Vec::new(),
+            full_query: None,
+            requires_full_query: false,
+            full_query_upper_only: false,
+            full_query_executable: true,
+            remote_query_policy: RemoteQueryPolicy::Optional,
+            tmp_ctx,
+            values: Vec::new(),
+            nulls: Vec::new(),
+            row: Row::new(),
+            param_fingerprint: String::new(),
+            _phantom: PhantomData,
+        })
+    }
+
     pub(crate) unsafe fn clone_for_execution(&self) -> Self {
         unsafe {
             // A ForeignScan plan can execute multiple times, especially for
@@ -1317,7 +1350,19 @@ pub(super) extern "C-unwind" fn get_foreign_join_paths<
 
         let ctx_name = format!("Wrappers_full_query_join_{}", first_relation.relid.to_u32());
         let ctx = memctx::create_wrappers_memctx(&ctx_name);
-        let mut state = FdwState::<E, W>::new(first_relation.relid, ctx);
+        // construction failure degrades to "no remote path": the base scans
+        // of this query already built their instances, so a second failed
+        // attempt (e.g. a transient vault read) must not fail planning of a
+        // query that can still run locally
+        let mut state = match FdwState::<E, W>::try_new(first_relation.relid, ctx) {
+            Ok(state) => state,
+            Err(_) => {
+                debug2!(
+                    "get_foreign_join_paths: FDW instance construction failed — serving locally"
+                );
+                return;
+            }
+        };
         debug2!("get_foreign_join_paths: created FDW state");
 
         let context = remote_query_context_from_planner(root, false);

@@ -7,7 +7,7 @@ use pgrx::pg_sys::panic::ErrorReport;
 use pgrx::{PgBox, debug2, pg_guard, pg_sys};
 use std::ptr;
 
-use crate::interface::{Aggregate, AggregateKind, Column};
+use crate::interface::{Aggregate, AggregateKind, Column, RemoteQueryPolicy};
 use crate::prelude::ForeignDataWrapper;
 use crate::scan::{
     FdwState, full_query_placeholder_from_planner, leak_state_in_current_context,
@@ -548,10 +548,15 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
             {
                 instance.remote_query_policy(&context)
             } else {
-                let instance = crate::instance::create_fdw_instance_from_server_id::<E, W>(
+                // construction failure must not ereport at planning time —
+                // treat it as "policy does not want a remote path" and keep
+                // the local plan (2026-09-06 review A8)
+                match crate::instance::try_create_fdw_instance_from_server_id::<E, W>(
                     first_relation.server_oid,
-                );
-                instance.remote_query_policy(&context)
+                ) {
+                    Ok(instance) => instance.remote_query_policy(&context),
+                    Err(_) => RemoteQueryPolicy::Optional,
+                }
             };
         }
         if !remote_query_policy.wants_remote_query() {
@@ -567,7 +572,17 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
             stage
         );
         let ctx = crate::memctx::create_wrappers_memctx(&ctx_name);
-        let mut state = FdwState::<E, W>::new(first_relation.relid, ctx);
+        // like the join path: a construction failure degrades to "no remote
+        // path" instead of ereporting at planning time
+        let mut state = match FdwState::<E, W>::try_new(first_relation.relid, ctx) {
+            Ok(state) => state,
+            Err(_) => {
+                debug2!(
+                    "add_full_query_upper_path: FDW instance construction failed — serving locally"
+                );
+                return false;
+            }
+        };
         state.tgts = columns;
         state.opts = first_relation.options.clone();
         state.full_query = Some(full_query);

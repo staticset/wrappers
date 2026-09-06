@@ -48,10 +48,12 @@ fn sql_predicate(field: &str, oper: &str, param: &str) -> String {
 
 /// Render one qual into a T-SQL predicate, appending typed parameters for
 /// every value (values are never concatenated into the SQL text, TZ §5.4).
+/// Returns `None` when the qual cannot be pushed down faithfully — the
+/// caller leaves it to PostgreSQL's local recheck over the returned rows.
 fn render_qual(
     qual: &Qual,
     params: &mut Vec<Box<dyn tiberius::ToSql>>,
-) -> MssqlFdwRqResult<String> {
+) -> MssqlFdwRqResult<Option<String>> {
     let field = bracket_name(&qual.field)?;
     let oper = qual.operator.as_str();
 
@@ -64,29 +66,42 @@ fn render_qual(
             qual.array_had_nulls,
             cells,
             params,
-        );
+        )
+        .map(Some);
     }
 
     match &qual.value {
-        Value::Cell(Cell::Bool(b)) if oper == "is" => Ok(format!("{field} = {}", *b as u8)),
+        Value::Cell(Cell::Bool(b)) if oper == "is" => Ok(Some(format!("{field} = {}", *b as u8))),
         // IS NOT TRUE / IS NOT FALSE also match NULL inputs in PostgreSQL;
         // bare `<> n` is UNKNOWN for NULL in T-SQL and would silently drop
         // those rows — add the NULL disjunct
-        Value::Cell(Cell::Bool(b)) if oper == "is not" => {
-            Ok(format!("({field} IS NULL OR {field} <> {})", *b as u8))
-        }
+        Value::Cell(Cell::Bool(b)) if oper == "is not" => Ok(Some(format!(
+            "({field} IS NULL OR {field} <> {})",
+            *b as u8
+        ))),
         // NullTest quals arrive as is/is not with the literal cell "null"
         Value::Cell(Cell::String(s)) if oper == "is" && s == "null" => {
-            Ok(format!("{field} IS NULL"))
+            Ok(Some(format!("{field} IS NULL")))
         }
         Value::Cell(Cell::String(s)) if oper == "is not" && s == "null" => {
-            Ok(format!("{field} IS NOT NULL"))
+            Ok(Some(format!("{field} IS NOT NULL")))
         }
         Value::Cell(cell) => {
+            // a LIKE-family pattern with PostgreSQL escape semantics
+            // (`\x` escapes the next character, `[` is a literal) reads
+            // differently under T-SQL rules (no default escape, `[…]` is a
+            // character class) — leave such quals to PostgreSQL's local
+            // recheck instead of silently matching a different set
+            if matches!(oper, "~~" | "!~~" | "~~*" | "!~~*")
+                && let Cell::String(pattern) = cell
+                && (pattern.contains('\\') || pattern.contains('['))
+            {
+                return Ok(None);
+            }
             let n = params.len() + 1;
             let cond = sql_predicate(&field, oper, &format!("@P{n}"));
             params.push(types::cell_to_sql(cell)?);
-            Ok(cond)
+            Ok(Some(cond))
         }
         // handled by the array branch above
         Value::Array(_) => unreachable!("array quals are rendered by render_array_qual"),
@@ -190,7 +205,9 @@ pub(super) fn plain_scan_sql(
     let mut params: Vec<Box<dyn tiberius::ToSql>> = Vec::new();
     let mut conds: Vec<String> = Vec::new();
     for qual in quals {
-        conds.push(render_qual(qual, &mut params)?);
+        if let Some(cond) = render_qual(qual, &mut params)? {
+            conds.push(cond);
+        }
     }
     if !conds.is_empty() {
         sql.push_str(" WHERE ");

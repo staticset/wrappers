@@ -726,14 +726,26 @@ impl Qual {
     pub fn deparse_with_fmt<T: CellFormatter>(&self, t: &mut T) -> String {
         if self.use_or {
             match &self.value {
-                Value::Cell(_) => unreachable!(),
+                // not produced by the framework's qual extraction; render it
+                // as the plain condition rather than panicking the backend
+                Value::Cell(cell) => {
+                    format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell))
+                }
                 Value::Array(cells) => {
-                    let conds: Vec<String> = cells
+                    let mut conds: Vec<String> = cells
                         .iter()
                         .map(|cell| {
                             format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell))
                         })
                         .collect();
+                    // NULL elements of the source array travel as the flag:
+                    // `field op null` is never TRUE under three-valued logic,
+                    // which is exactly the contribution the NULL element
+                    // makes inside `= ANY`/`<> ALL` — dropping it (the old
+                    // behavior) silently widened the matched set
+                    if self.array_had_nulls {
+                        conds.push(format!("{} {} null", self.field, self.operator));
+                    }
                     conds.join(" or ")
                 }
             }
@@ -750,7 +762,20 @@ impl Qual {
                     "!~~" => format!("{} not like {}", self.field, t.fmt_cell(cell)),
                     _ => format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell)),
                 },
-                Value::Array(_) => unreachable!(),
+                // `x <> ALL (ARRAY[…])`: AND-chain, NULL element included
+                // (never TRUE — matches PostgreSQL's `<> ALL` on NULL)
+                Value::Array(cells) => {
+                    let mut conds: Vec<String> = cells
+                        .iter()
+                        .map(|cell| {
+                            format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell))
+                        })
+                        .collect();
+                    if self.array_had_nulls {
+                        conds.push(format!("{} {} null", self.field, self.operator));
+                    }
+                    conds.join(" and ")
+                }
             }
         }
     }
@@ -1750,5 +1775,58 @@ mod tests {
     #[test]
     fn test_cell_into_datum_type_oid_is_invalid() {
         assert_eq!(Cell::type_oid(), Oid::INVALID);
+    }
+}
+
+// ==========================================================================
+// Tests for Qual::deparse
+// ==========================================================================
+#[cfg(test)]
+mod qual_deparse_tests {
+    use super::*;
+
+    fn qual(field: &str, operator: &str, value: Value, use_or: bool, had_nulls: bool) -> Qual {
+        Qual {
+            field: field.to_string(),
+            operator: operator.to_string(),
+            value,
+            use_or,
+            param: None,
+            array_had_nulls: had_nulls,
+        }
+    }
+
+    // 2026-09-06 review A9: NULL elements of a pushed array used to be
+    // dropped by the shared deparser, widening the matched set — `x <> ALL
+    // ('{1,NULL}')` matches no rows, the NULL-less rendering matched every
+    // `x <> 1`. Rendering `field op null` contributes exactly the NULL
+    // element's never-TRUE condition under three-valued logic.
+    #[test]
+    fn deparse_array_keeps_null_element() {
+        let all = qual("x", "<>", Value::Array(vec![Cell::I64(1)]), false, true);
+        assert_eq!(all.deparse(), "x <> 1 and x <> null");
+
+        let any = qual(
+            "x",
+            "=",
+            Value::Array(vec![Cell::I64(1), Cell::I64(2)]),
+            true,
+            true,
+        );
+        assert_eq!(any.deparse(), "x = 1 or x = 2 or x = null");
+
+        // without NULL elements the rendering is unchanged
+        let plain = qual("x", "=", Value::Array(vec![Cell::I64(1)]), true, false);
+        assert_eq!(plain.deparse(), "x = 1");
+    }
+
+    // the former `unreachable!()` paths render instead of panicking
+    #[test]
+    fn deparse_never_panics_on_odd_shapes() {
+        let cell_with_or = qual("x", "=", Value::Cell(Cell::I64(7)), true, false);
+        assert_eq!(cell_with_or.deparse(), "x = 7");
+
+        let array_without_or = qual("x", "<>", Value::Array(vec![Cell::I64(7)]), false, false);
+        assert_eq!(array_without_or.deparse(), "x <> 7");
     }
 }
