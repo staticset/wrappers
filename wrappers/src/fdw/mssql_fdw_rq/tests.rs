@@ -915,6 +915,36 @@ mod unit {
     }
 
     #[test]
+    fn deparser_any_array_over_qualified_column() {
+        // postgres_fdw qualifies every column (`c.code`), and its deparse
+        // prints IN-lists as `= ANY ('{…}')` — the bridge control-list shape
+        // (production: r2.monthofyearid = ANY('{0,…,12}'::integer[]))
+        assert_tsql(
+            "SELECT o.id FROM public.dbo_orders o \
+             JOIN public.dbo_customers c ON o.customer_id = c.id \
+             AND c.code = ANY ('{1,2,3}'::integer[])",
+            &two_tables_ctx(),
+            "SELECT o.id FROM [dbo].[Orders] o JOIN [dbo].[Customers] c \
+             ON o.customer_id = c.id AND (c.code IN (1, 2, 3))",
+        );
+    }
+
+    #[test]
+    fn cyrillic_literal_cast_subject() {
+        // tsql_string_literal renders non-ASCII literals as N'…'; that piece
+        // is the cast subject in the deparser's `literal::type` form and must
+        // stay capturable (production: Navigator's `<> 'Не задано'::text`
+        // bridge control lists failed on the N-prefix)
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE ((status <> 'Не задано'::text)) LIMIT '10'::bigint",
+            &orders_ctx(),
+            "SELECT TOP (10) id FROM [dbo].[Orders] \
+             WHERE ((status <> CAST(N'Не задано' AS nvarchar(4000))))",
+        );
+    }
+
+    #[test]
     fn array_subscript_outside_any_all_still_rejected() {
         assert_unsupported(
             "SELECT id FROM public.dbo_orders WHERE note[1] = 'x'",

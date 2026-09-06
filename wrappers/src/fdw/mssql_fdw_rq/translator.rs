@@ -1251,6 +1251,27 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     Ok(join_pieces(&out))
 }
 
+/// A captured subject that is a plain column reference — bare (`code`) or
+/// qualified (`r2.code`, `sch.tbl.code`; quoted parts are already rendered
+/// bracket-quoted). Returns the joined T-SQL reference, or None for anything
+/// else (parenthesized group, composite expression, literal).
+fn joined_column_reference(out: &[String], start: usize) -> Option<String> {
+    let span = &out[start..];
+    if span.len() % 2 == 0 {
+        return None;
+    }
+    for (k, piece) in span.iter().enumerate() {
+        if k % 2 == 0 {
+            if piece == "." || !is_plain_ident(piece) {
+                return None;
+            }
+        } else if piece != "." {
+            return None;
+        }
+    }
+    Some(span.join(""))
+}
+
 /// True when the subject captured at `start` spans a complete top-level or
 /// window ORDER BY item: the piece before it must open the item (`ORDER BY`)
 /// or separate items (`,`). Otherwise the item is a composite expression and
@@ -1552,7 +1573,15 @@ fn capture_subject(out: &[String], case_depth: usize) -> Result<usize, Translate
         });
     }
 
-    if !is_plain_ident(last) && !last.starts_with('\'') && !last.starts_with('@') {
+    // `N'…'` is a rendered string literal (tsql_string_literal adds the
+    // N-prefix for non-ASCII values), so it is as valid a subject as `'…'`:
+    // Navigator's `<> 'Не задано'` deparses with a cast directly over the
+    // literal (`'Не задано'::text`), and the piece no longer starts with `'`
+    if !is_plain_ident(last)
+        && !last.starts_with('\'')
+        && !last.starts_with("N'")
+        && !last.starts_with('@')
+    {
         return Err(TranslateError::UnsupportedConstruct {
             sql_fragment: last.clone(),
             reason: "expression subject is not simple enough for v1".to_string(),
@@ -1924,13 +1953,14 @@ fn translate_any_all(
     }
     out.pop();
     let start = capture_subject(out, case_depth)?;
-    if out.len() - start != 1 {
+    // postgres_fdw qualifies every column (`r2.monthofyearid`), so the
+    // subject may be a dotted reference, not just a bare name
+    let Some(field) = joined_column_reference(out, start) else {
         return Err(TranslateError::UnsupportedConstruct {
             sql_fragment: if is_any { "ANY (…)" } else { "ALL (…)" }.to_string(),
             reason: "ANY/ALL subject is not a simple column reference".to_string(),
         });
-    }
-    let field = out[start].clone();
+    };
     out.truncate(start);
 
     // two deparser shapes: `ARRAY[v1, v2]` (ArrayExpr) and `'{v1,v2}'::type[]`
