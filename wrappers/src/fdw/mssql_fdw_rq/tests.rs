@@ -759,6 +759,101 @@ mod unit {
         );
     }
 
+    // 2026-09-07 (Navigator constructor via the bridge): a computed column
+    // that is a plain constant (`100 AS pct`) grouped by its alias — the
+    // subquery flattens, postgres_fdw deparses `GROUP BY 3, 4, 5` where
+    // ordinal 5 resolves to the constant, and SQL Server rejected the
+    // literal with error 164 ("Each GROUP BY expression must contain at
+    // least one column that is not an outer reference"). PostgreSQL treats
+    // a constant item as a no-op grouping — dropping it is an exact
+    // translation; the SELECT-list constant stays.
+    #[test]
+    fn group_by_constant_item_dropped() {
+        // the production shape: constant last in the ordinal list
+        assert_tsql(
+            "SELECT sum(amount) AS total, name, 100 AS pct FROM public.dbo_orders GROUP BY 2, 3",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name, 100 AS [pct] FROM [dbo].[Orders] GROUP BY name",
+        );
+        // constant first: its separator is consumed with it
+        assert_tsql(
+            "SELECT sum(amount) AS total, name, 100 AS pct FROM public.dbo_orders GROUP BY 3, 2",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name, 100 AS [pct] FROM [dbo].[Orders] GROUP BY name",
+        );
+        // constant between two real keys
+        assert_tsql(
+            "SELECT sum(amount) AS total, name, status, 100 AS pct FROM public.dbo_orders \
+             GROUP BY 2, 3, 4",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name, status, 100 AS [pct] FROM [dbo].[Orders] \
+             GROUP BY name, status",
+        );
+        // constants only: the clause disappears — one group either way,
+        // including through the OFFSET tail the constructor appends
+        assert_tsql(
+            "SELECT sum(amount) AS total, 100 AS pct FROM public.dbo_orders GROUP BY 2 OFFSET 0",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], 100 AS [pct] FROM [dbo].[Orders] \
+             ORDER BY (SELECT NULL) OFFSET 0 ROWS",
+        );
+        // a direct literal item (constant folded by PostgreSQL, no ordinal)
+        // is dropped with its ::type cast tail
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY name, 'x'::text",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY 'x'::text, name",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        // a negative constant and a non-integer one (never ordinals)
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY name, -5::integer",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY name, 1.5",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        // a cast constant via an ordinal still selects the constant column
+        assert_tsql(
+            "SELECT sum(amount) AS total, name, CAST('100' AS integer) AS pct \
+             FROM public.dbo_orders GROUP BY 2, 3",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name, CAST('100' AS integer) AS [pct] \
+             FROM [dbo].[Orders] GROUP BY name",
+        );
+        // a literal that is an operand of a larger expression is NOT a
+        // constant grouping — it must stay (the expression carries columns)
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders \
+             GROUP BY name, name || 'x'",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name, name + 'x'",
+        );
+        // pg_get_querydef prints a constant grouping item as its literal
+        // value; beyond the SELECT-list length it re-parses as a bogus
+        // "ordinal" — recognized as the constant it is
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY name, 100",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        // ORDER BY keeps ordinals resolving to constants: T-SQL accepts a
+        // constant sort key (a no-op), only GROUP BY forbids them
+        assert_tsql(
+            "SELECT id, amount, 100 AS pct FROM public.dbo_orders ORDER BY 1, 3",
+            &orders_ctx(),
+            "SELECT id, amount, 100 AS [pct] FROM [dbo].[Orders] \
+             ORDER BY id, CASE WHEN 100 IS NULL THEN 1 ELSE 0 END, 100",
+        );
+    }
+
     // 2026-09-05 (Navigator widget SQL, test error 1.txt): aliases after AS
     // are bracket-quoted — T-SQL reserved words (PLAN, KEY…) are ordinary
     // PostgreSQL aliases but `AS plan` breaks MSSQL parsing
@@ -1926,6 +2021,105 @@ mod tests {
         };
         assert_eq!(pg, mssql);
         assert_eq!(pg.len(), 4);
+    }
+
+    #[pg_test]
+    fn group_by_constant_output_reference_matches_reference() {
+        setup_committed();
+
+        // 2026-09-07 (Navigator constructor via the bridge): a computed
+        // column that is a plain constant (`100 AS pct`) grouped by its
+        // output reference — postgres_fdw deparses grouped output columns
+        // as ordinals (`GROUP BY 1, 3`), the constant item must be dropped
+        // (SQL Server error 164 otherwise) without changing the grouping
+        let pg = Spi::connect(|c| {
+            let rows = c
+                .select(
+                    "SELECT * FROM dblink(\
+                         format('host=localhost port=%s dbname=rqjoin_test', \
+                                current_setting('port')), \
+                         $$SELECT c.name AS name, SUM(o.total_amount)::text AS total, \
+                                  100::text AS pct \
+                           FROM rqj_orders o JOIN rqj_customers c ON o.customer_id = c.id \
+                           GROUP BY 1, 3$$\
+                     ) AS t(name text, total text, pct text)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            let mut v: Vec<(String, String, String)> = rows
+                .filter_map(|r| {
+                    let name = r.get_by_name::<&str, _>("name").unwrap().map(str::to_owned);
+                    let total = r
+                        .get_by_name::<&str, _>("total")
+                        .unwrap()
+                        .map(str::to_owned);
+                    let pct = r.get_by_name::<&str, _>("pct").unwrap().map(str::to_owned);
+                    match (name, total, pct) {
+                        (Some(n), Some(t), Some(p)) => Some((n, t, p)),
+                        _ => None,
+                    }
+                })
+                .collect();
+            v.sort();
+            v
+        });
+
+        let mssql = {
+            let mut v = mssql_direct(
+                "SELECT c.name AS name, \
+                 CAST(CAST(SUM(o.total_amount) AS numeric(18,2)) AS nvarchar(30)) AS total \
+                 FROM dbo.orders o JOIN dbo.customers c ON o.customer_id = c.id \
+                 GROUP BY c.name",
+            );
+            v.sort();
+            v.into_iter()
+                .map(|(name, total)| (name, total, "100".to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pg, mssql);
+        assert!(!pg.is_empty());
+    }
+
+    #[pg_test]
+    fn group_by_constants_only_matches_reference() {
+        setup_committed();
+
+        // the constructor's `OFFSET 0` tail plus a constants-only GROUP BY:
+        // the clause disappears entirely (one group either way) and the
+        // statement still executes as one remote query
+        let pg = Spi::connect(|c| {
+            c.select(
+                "SELECT * FROM dblink(\
+                     format('host=localhost port=%s dbname=rqjoin_test', \
+                            current_setting('port')), \
+                     $$SELECT COUNT(*)::text AS total, 100::text AS pct \
+                       FROM rqj_orders \
+                       GROUP BY 2 OFFSET 0$$\
+                 ) AS t(total text, pct text)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| {
+                let total = r
+                    .get_by_name::<&str, _>("total")
+                    .unwrap()
+                    .map(str::to_owned);
+                let pct = r.get_by_name::<&str, _>("pct").unwrap().map(str::to_owned);
+                total.zip(pct)
+            })
+            .collect::<Vec<_>>()
+        });
+        let mssql = mssql_direct(
+            "SELECT CAST(COUNT(*) AS nvarchar(30)) AS name, \
+             CAST(CAST(100 AS numeric) AS nvarchar(30)) AS total \
+             FROM dbo.orders",
+        );
+        // mssql_direct returns (name, total); COUNT(*) is stable
+        assert_eq!(pg.len(), 1);
+        assert_eq!(pg[0].1, "100");
+        assert_eq!(pg[0].0, mssql[0].0.clone(), "row count matches MSSQL");
     }
 
     #[pg_test]

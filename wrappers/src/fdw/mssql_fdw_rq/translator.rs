@@ -648,6 +648,10 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     // BY (the previous piece is the substituted expression), so an active
     // list plus a preceding comma also opens a positional item
     let mut positional_list_active = false;
+    // top-level GROUP BY list is being consumed: a constant item there is a
+    // no-op grouping in PostgreSQL but an error in T-SQL (error 164) and
+    // must be dropped — see the Num/Str/`-` arms
+    let mut in_group_by = false;
 
     // top-level ORDER BY tracking: PostgreSQL's implicit NULL ordering
     // (ASC → NULLS LAST, DESC → NULLS FIRST) differs from T-SQL's (NULL is
@@ -838,6 +842,27 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         i += 1 + end;
                         continue;
                     }
+                    // a negative constant GROUP BY item (`GROUP BY -5`, the
+                    // deparser's spelling of a folded negative Const) — same
+                    // error 164 as any other constant, same drop; a minus in
+                    // front of anything else is an ordinary operator
+                    "-" if in_group_by
+                        && depth == 0
+                        && group_item_start(&out)
+                        && matches!(toks.get(i + 1), Some(Tok::Num(_)) | Some(Tok::Str(_))) =>
+                    {
+                        let item_len = group_const_item_len(&toks, i + 1);
+                        if item_len > 0 {
+                            let (extra, emptied) =
+                                drop_const_group_item(&mut out, &toks, i + 1 + item_len);
+                            if emptied {
+                                in_group_by = false;
+                                positional_list_active = false;
+                            }
+                            i += 1 + item_len + extra;
+                            continue;
+                        }
+                    }
                     _ => {}
                 }
                 out.push(o.clone());
@@ -852,12 +877,34 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // `BY` alone or the composite `ORDER BY` / `GROUP BY`,
                         // or the comma separating items of an active
                         // positional list (postgres_fdw deparses `GROUP BY
-                        // a, b` as `GROUP BY 3, 4`)
+                        // a, b` as `GROUP BY 3, 4`); in a GROUP BY list a
+                        // top-level comma always separates items, and a
+                        // non-integer number there is a constant, not an
+                        // ordinal (`GROUP BY name, 1.5`)
                         p.eq_ignore_ascii_case("by")
                             || p.to_ascii_uppercase().ends_with(" BY")
-                            || (positional_list_active && p == ",")
+                            || ((positional_list_active || in_group_by) && p == ",")
                     })
                 {
+                    // a non-integer number cannot be an output reference; in
+                    // a GROUP BY list it is a constant grouping (`GROUP BY
+                    // 1.5` — PostgreSQL folds it to a literal), which T-SQL
+                    // rejects with error 164: drop the item
+                    if in_group_by && n.parse::<usize>().is_err() {
+                        if !is_numeric_literal(n) {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: format!("BY {n}"),
+                                reason: "unparseable positional reference".to_string(),
+                            });
+                        }
+                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + 1);
+                        if emptied {
+                            in_group_by = false;
+                            positional_list_active = false;
+                        }
+                        i += 1 + extra;
+                        continue;
+                    }
                     let idx: usize =
                         n.parse()
                             .map_err(|_| TranslateError::UnsupportedConstruct {
@@ -865,6 +912,21 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 reason: "unparseable positional reference".to_string(),
                             })?;
                     let Some(expr) = positional_select_item(&out, idx) else {
+                        // pg_get_querydef (the single-relation deparse path)
+                        // prints a constant grouping item as its literal
+                        // value — `GROUP BY 2` over `2 AS pct` comes back as
+                        // `GROUP BY 2`, but `100 AS pct` as `GROUP BY 100`,
+                        // which re-parses as an out-of-range "ordinal". It is
+                        // the constant itself: drop it.
+                        if in_group_by && is_numeric_literal(n) {
+                            let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + 1);
+                            if emptied {
+                                in_group_by = false;
+                                positional_list_active = false;
+                            }
+                            i += 1 + extra;
+                            continue;
+                        }
                         return Err(TranslateError::UnsupportedConstruct {
                             sql_fragment: format!("BY {n}"),
                             reason: "positional reference does not point at a \
@@ -872,6 +934,21 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 .to_string(),
                         });
                     };
+                    // the ordinal resolves to a pure literal (a constant
+                    // computed column: `100 AS pct` grouped by its alias —
+                    // postgres_fdw turns the GROUP BY item into an ordinal):
+                    // PostgreSQL groups by the no-op constant, T-SQL refuses
+                    // it with error 164 — drop the item, keep the constant
+                    // in the SELECT list
+                    if in_group_by && is_literal_expr(&expr) {
+                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + 1);
+                        if emptied {
+                            in_group_by = false;
+                            positional_list_active = false;
+                        }
+                        i += 1 + extra;
+                        continue;
+                    }
                     out.push(expr);
                     positional_list_active = true;
                     // a substituted ordinal opens a fresh ORDER BY item (the
@@ -882,7 +959,24 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 }
                 out.push(n.clone());
             }
-            Tok::Str(s) => out.push(tsql_string_literal(s)),
+            Tok::Str(s) => {
+                // a standalone literal GROUP BY item (constant grouping,
+                // e.g. the deparser's `'k'::text` form of a folded Const) —
+                // dropped like every other constant, cast tail included
+                if in_group_by && depth == 0 && group_item_start(&out) {
+                    let item_len = group_const_item_len(&toks, i);
+                    if item_len > 0 {
+                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + item_len);
+                        if emptied {
+                            in_group_by = false;
+                            positional_list_active = false;
+                        }
+                        i += item_len + extra;
+                        continue;
+                    }
+                }
+                out.push(tsql_string_literal(s));
+            }
             Tok::Param(p) => out.push(format!("@P{p}")),
             Tok::QIdent(name) => {
                 // quoted names take part in relation matching too
@@ -961,6 +1055,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             order_item_closed = true;
                         }
                         in_order = false;
+                        in_group_by = false;
                         if use_fetch && clauses.offset.is_none() {
                             if !clauses.has_order_by {
                                 out.push("ORDER BY (SELECT NULL)".to_string());
@@ -993,6 +1088,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             order_item_closed = true;
                         }
                         in_order = false;
+                        in_group_by = false;
                         if use_fetch && !top_emitted {
                             if !clauses.has_order_by {
                                 out.push("ORDER BY (SELECT NULL)".to_string());
@@ -1016,6 +1112,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             order_item_closed = true;
                         }
                         in_order = false;
+                        in_group_by = false;
                         if !clauses.has_order_by {
                             out.push("ORDER BY (SELECT NULL)".to_string());
                         }
@@ -1052,7 +1149,10 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "case" => case_depth += 1,
                     "end" => case_depth = case_depth.saturating_sub(1),
                     // condition clauses: their top-level `,` lists mean AND
-                    "where" | "having" | "on" if depth == 0 => in_condition_clause = true,
+                    "where" | "having" | "on" if depth == 0 => {
+                        in_condition_clause = true;
+                        in_group_by = false;
+                    }
                     // top-level ORDER BY opens sort-key tracking; inside
                     // OVER() it only arms the closing-parenthesis check
                     "order" if matches!(toks.get(i + 1), Some(Tok::Word(b)) if b.eq_ignore_ascii_case("by")) =>
@@ -1062,12 +1162,32 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             in_order = true;
                             order_item_closed = false;
                             positional_list_active = false;
+                            in_group_by = false;
                         } else if over_paren_depth.is_some()
                             && depth >= over_paren_depth.unwrap_or(usize::MAX)
                         {
                             over_order_seen = true;
                         }
                         out.push("ORDER BY".to_string());
+                        i += 2;
+                        continue;
+                    }
+                    // top-level GROUP BY: emitted as one piece so ordinal
+                    // items right after it are recognized, and tracked so
+                    // constant items can be dropped (see the Num/Str arms)
+                    "group"
+                        if depth == 0
+                            && matches!(toks.get(i + 1), Some(Tok::Word(b)) if b.eq_ignore_ascii_case("by")) =>
+                    {
+                        in_condition_clause = false;
+                        if in_order && !order_item_closed {
+                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            order_item_closed = true;
+                        }
+                        in_order = false;
+                        in_group_by = true;
+                        positional_list_active = false;
+                        out.push("GROUP BY".to_string());
                         i += 2;
                         continue;
                     }
@@ -1080,6 +1200,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     {
                         in_condition_clause = false;
                         positional_list_active = false;
+                        in_group_by = false;
                         if in_order && !order_item_closed {
                             close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
                             order_item_closed = true;
@@ -1618,6 +1739,153 @@ fn alias_select_item(out: &[String], alias: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Is the rendered output at the start of a top-level GROUP BY item (right
+/// after the `GROUP BY` piece or after an item-separating comma)? In a GROUP
+/// BY list a top-level comma always separates items — the condition-clause
+/// comma→AND rewrite never applies there.
+fn group_item_start(out: &[String]) -> bool {
+    out.last().is_some_and(|p| {
+        p.eq_ignore_ascii_case("GROUP BY") || p.to_ascii_uppercase().ends_with(" BY") || p == ","
+    })
+}
+
+/// Token length of a standalone constant GROUP BY item whose literal starts
+/// at `i` (`'k'`, optionally followed by a `::type` cast tail), provided the
+/// item is closed by a list separator or a clause keyword. Returns 0 when
+/// the literal is part of a larger expression (`'x' || col`) — those are not
+/// constant groupings and must keep their literal.
+fn group_const_item_len(toks: &[Tok], i: usize) -> usize {
+    let mut len = 1usize; // the literal itself
+    if matches!(toks.get(i + len), Some(Tok::Op(o)) if o == "::") {
+        let type_len = type_token_len(&toks[i + len + 1..]);
+        if type_len == 0 {
+            return 0;
+        }
+        len += 1 + type_len;
+    }
+    match toks.get(i + len) {
+        None => len, // end of the statement
+        Some(Tok::Op(o)) if o == "," || o == ";" => len,
+        Some(Tok::Word(w)) => {
+            let lw = w.to_lowercase();
+            if matches!(
+                lw.as_str(),
+                "having"
+                    | "order"
+                    | "limit"
+                    | "offset"
+                    | "fetch"
+                    | "union"
+                    | "intersect"
+                    | "except"
+            ) {
+                len
+            } else {
+                0
+            }
+        }
+        _ => 0, // operator: the literal is an operand of a larger expression
+    }
+}
+
+/// Remove a constant GROUP BY item from the rendered output, keeping the
+/// list well-formed: a non-first item takes its leading comma with it, a
+/// dropped first item of a longer list consumes the following comma, and a
+/// clause left with no items at all is removed entirely (`GROUP BY` with an
+/// empty list is invalid T-SQL). `item_end` is the token index just past the
+/// dropped item; returns `(separator tokens to consume, clause emptied)`.
+///
+/// PostgreSQL accepts grouping by a constant (every row carries the same
+/// value, so the item partitions nothing — `GROUP BY a, 100` groups exactly
+/// like `GROUP BY a`, and a constant-only list is one group like no GROUP BY
+/// at all), while SQL Server rejects every constant item with error 164
+/// ("Each GROUP BY expression must contain at least one column that is not
+/// an outer reference"). Dropping the item is therefore an exact
+/// translation, including through HAVING: the aggregate query keeps its
+/// single group.
+fn drop_const_group_item(out: &mut Vec<String>, toks: &[Tok], item_end: usize) -> (usize, bool) {
+    if out.last().map(String::as_str) == Some(",") {
+        out.pop();
+        (0, false)
+    } else if matches!(toks.get(item_end), Some(Tok::Op(o)) if o == ",") {
+        // first item of a longer list — eat its separator so the next item
+        // lands directly after GROUP BY
+        (1, false)
+    } else if out
+        .last()
+        .is_some_and(|p| p.eq_ignore_ascii_case("GROUP BY"))
+    {
+        out.pop();
+        (0, true)
+    } else {
+        (0, false)
+    }
+}
+
+/// Is a resolved GROUP BY expression a pure literal — a constant with no
+/// column reference (`100`, `-5`, `1.5`, `'k'`, `N'…'`, `NULL`, or either of
+/// those rendered through a `CAST(…)`)? Such an item partitions nothing in
+/// PostgreSQL and must be dropped for T-SQL (see
+/// [`drop_const_group_item`]). Unquoted PostgreSQL identifiers never start
+/// with a digit, and quoted ones arrive bracket-quoted (`[5e]`), so a bare
+/// all-numeric piece can only be a literal.
+fn is_literal_expr(expr: &str) -> bool {
+    let t = expr.trim();
+    // spaces inside are piece-joiner artifacts (`- 100` is the tlist
+    // rendering of a negative constant), never part of a numeric literal
+    is_numeric_literal(&t.replace(' ', ""))
+        || is_closed_string_literal(t)
+        || t.eq_ignore_ascii_case("NULL")
+        || {
+            // a literal rendered through a cast: CAST('100' AS int),
+            // CAST(NULL AS nvarchar(4000)), CAST(1.5 AS numeric(18,2)).
+            // positional_select_item joins the pieces with single spaces,
+            // so normalize the spacing around the parens first
+            let n = t.replace(" (", "(").replace("( ", "(").replace(" )", ")");
+            let Some(rest) = n.strip_prefix("CAST(").and_then(|r| r.strip_suffix(')')) else {
+                return false;
+            };
+            let Some(as_pos) = rest.to_lowercase().find(" as ") else {
+                return false;
+            };
+            let subject = rest[..as_pos].trim();
+            is_numeric_literal(&subject.replace(' ', ""))
+                || is_closed_string_literal(subject)
+                || subject.eq_ignore_ascii_case("NULL")
+        }
+}
+
+/// The whole string is exactly one closed string literal (`'…'` / `N'…'`,
+/// with `''` doubling) — not an expression that merely starts with one
+/// (`'prefix' + name` must not pass).
+fn is_closed_string_literal(s: &str) -> bool {
+    let s = s.strip_prefix('N').unwrap_or(s);
+    let Some(rest) = s.strip_prefix('\'') else {
+        return false;
+    };
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next(); // doubled quote stays inside the literal
+            } else {
+                // the literal closed — only whitespace may follow
+                return chars.all(char::is_whitespace);
+            }
+        }
+    }
+    false // unterminated
+}
+
+fn is_numeric_literal(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
 }
 
 fn is_plain_ident(piece: &str) -> bool {
