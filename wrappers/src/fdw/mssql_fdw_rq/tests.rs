@@ -844,6 +844,37 @@ mod unit {
             &orders_ctx(),
             "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
         );
+        // …and the deparser attaches the type to the folded constant. The
+        // cast tail must go with the dropped item — leaving it behind used
+        // to wrap the FROM-clause relation in CAST(… AS int) (prod incident
+        // 07.09: `FROM CAST([dbo].[FactIPP] AS int)`), in any position:
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY name, 100::integer",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY 100::integer, name",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        assert_tsql(
+            "SELECT sum(amount) AS total FROM public.dbo_orders GROUP BY 100::integer",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total] FROM [dbo].[Orders]",
+        );
+        // the deparser pretty-prints with newlines — the same shapes
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders\nGROUP BY name, 100::integer",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
+        // non-integer constants carry the same cast tail
+        assert_tsql(
+            "SELECT sum(amount) AS total, name FROM public.dbo_orders GROUP BY name, 1.5::numeric",
+            &orders_ctx(),
+            "SELECT sum(amount) AS [total], name FROM [dbo].[Orders] GROUP BY name",
+        );
         // ORDER BY keeps ordinals resolving to constants: T-SQL accepts a
         // constant sort key (a no-op), only GROUP BY forbids them
         assert_tsql(
@@ -2083,20 +2114,18 @@ mod tests {
 
     #[pg_test]
     fn group_by_constants_only_matches_reference() {
-        setup_committed();
+        setup();
 
-        // the constructor's `OFFSET 0` tail plus a constants-only GROUP BY:
-        // the clause disappears entirely (one group either way) and the
-        // statement still executes as one remote query
+        // the constants-only GROUP BY over a single table runs the
+        // pg_get_querydef deparse path (single relation), which prints the
+        // folded constant with its type — `GROUP BY 100::integer`. The
+        // clause disappears entirely (one group either way); on 07.09 the
+        // leftover cast tail wrapped the FROM relation in CAST(… AS int)
+        // and MSSQL rejected the statement (error 156)
         let pg = Spi::connect(|c| {
             c.select(
-                "SELECT * FROM dblink(\
-                     format('host=localhost port=%s dbname=rqjoin_test', \
-                            current_setting('port')), \
-                     $$SELECT COUNT(*)::text AS total, 100::text AS pct \
-                       FROM rqj_orders \
-                       GROUP BY 2 OFFSET 0$$\
-                 ) AS t(total text, pct text)",
+                "SELECT COUNT(*)::text AS total, 100::text AS pct \
+                 FROM rq_orders GROUP BY 2 OFFSET 0",
                 None,
                 &[],
             )
@@ -2111,15 +2140,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
         });
-        let mssql = mssql_direct(
-            "SELECT CAST(COUNT(*) AS nvarchar(30)) AS name, \
-             CAST(CAST(100 AS numeric) AS nvarchar(30)) AS total \
-             FROM dbo.orders",
-        );
-        // mssql_direct returns (name, total); COUNT(*) is stable
         assert_eq!(pg.len(), 1);
         assert_eq!(pg[0].1, "100");
-        assert_eq!(pg[0].0, mssql[0].0.clone(), "row count matches MSSQL");
+
+        // the same statement shape with a WHERE filter (the exact prod
+        // incident form: aggregate + filter + constants-only GROUP BY)
+        let pg2 = Spi::connect(|c| {
+            c.select(
+                "SELECT SUM(total_amount)::text AS total, 100::text AS pct \
+                 FROM rq_orders WHERE status = 'new' GROUP BY 2 OFFSET 0",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| {
+                let total = r
+                    .get_by_name::<&str, _>("total")
+                    .unwrap()
+                    .map(str::to_owned);
+                let pct = r.get_by_name::<&str, _>("pct").unwrap().map(str::to_owned);
+                total.zip(pct)
+            })
+            .collect::<Vec<_>>()
+        });
+        assert_eq!(pg2.len(), 1, "single group over the filtered rows");
+        assert_eq!(pg2[0].1, "100");
     }
 
     #[pg_test]

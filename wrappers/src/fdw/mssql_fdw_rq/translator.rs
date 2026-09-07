@@ -888,21 +888,27 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 {
                     // a non-integer number cannot be an output reference; in
                     // a GROUP BY list it is a constant grouping (`GROUP BY
-                    // 1.5` — PostgreSQL folds it to a literal), which T-SQL
-                    // rejects with error 164: drop the item
+                    // 1.5`, or the deparser's `1.5::numeric` spelling),
+                    // which T-SQL rejects with error 164: drop the item
+                    // together with its optional ::type cast tail
                     if in_group_by && n.parse::<usize>().is_err() {
-                        if !is_numeric_literal(n) {
+                        let item_len = if is_numeric_literal(n) {
+                            group_const_item_len(&toks, i)
+                        } else {
+                            0
+                        };
+                        if item_len == 0 {
                             return Err(TranslateError::UnsupportedConstruct {
                                 sql_fragment: format!("BY {n}"),
                                 reason: "unparseable positional reference".to_string(),
                             });
                         }
-                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + 1);
+                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + item_len);
                         if emptied {
                             in_group_by = false;
                             positional_list_active = false;
                         }
-                        i += 1 + extra;
+                        i += item_len + extra;
                         continue;
                     }
                     let idx: usize =
@@ -914,17 +920,23 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     let Some(expr) = positional_select_item(&out, idx) else {
                         // pg_get_querydef (the single-relation deparse path)
                         // prints a constant grouping item as its literal
-                        // value — `GROUP BY 2` over `2 AS pct` comes back as
-                        // `GROUP BY 2`, but `100 AS pct` as `GROUP BY 100`,
-                        // which re-parses as an out-of-range "ordinal". It is
-                        // the constant itself: drop it.
-                        if in_group_by && is_numeric_literal(n) {
-                            let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + 1);
+                        // value with the type attached — `100 AS pct` comes
+                        // back as `GROUP BY 100::integer` — which re-parses
+                        // as an out-of-range "ordinal". It is the constant
+                        // itself: drop it, cast tail included.
+                        let item_len = if in_group_by && is_numeric_literal(n) {
+                            group_const_item_len(&toks, i)
+                        } else {
+                            0
+                        };
+                        if item_len > 0 {
+                            let (extra, emptied) =
+                                drop_const_group_item(&mut out, &toks, i + item_len);
                             if emptied {
                                 in_group_by = false;
                                 positional_list_active = false;
                             }
-                            i += 1 + extra;
+                            i += item_len + extra;
                             continue;
                         }
                         return Err(TranslateError::UnsupportedConstruct {
@@ -941,12 +953,15 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     // it with error 164 — drop the item, keep the constant
                     // in the SELECT list
                     if in_group_by && is_literal_expr(&expr) {
-                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + 1);
+                        // an explicit cast tail (`GROUP BY 2::integer` over a
+                        // constant item) goes with the dropped item
+                        let item_len = group_const_item_len(&toks, i).max(1);
+                        let (extra, emptied) = drop_const_group_item(&mut out, &toks, i + item_len);
                         if emptied {
                             in_group_by = false;
                             positional_list_active = false;
                         }
-                        i += 1 + extra;
+                        i += item_len + extra;
                         continue;
                     }
                     out.push(expr);
