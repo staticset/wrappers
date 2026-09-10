@@ -1936,6 +1936,40 @@ mod tests {
         assert_eq!(rows[4], (5, 5));
     }
 
+    // 2026-09-10 DWH install: a hand-written foreign table may declare a
+    // tinyint column as integer (DimCalendar.MonthOfYearId in the wild) —
+    // the INT4 read path only fell back to i16, so every read of such a
+    // column failed with "cannot interpret U8(..) as an i16 value"
+    #[pg_test]
+    fn tinyint_column_reads_through_integer_mapping() {
+        setup();
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_order_items_int (\
+               id bigint, discount_pct integer\
+             ) SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'order_items')",
+        )
+        .unwrap();
+        let rows: Vec<(i64, i32)> = Spi::connect(|c| {
+            c.select(
+                "SELECT id, discount_pct FROM rq_order_items_int ORDER BY id LIMIT 5",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| {
+                Some((
+                    r.get_by_name::<i64, _>("id").unwrap()?,
+                    r.get_by_name::<i32, _>("discount_pct").unwrap()?,
+                ))
+            })
+            .collect()
+        });
+        assert_eq!(rows.len(), 5);
+        // seed: discount_pct = n % 15 for item id n
+        assert_eq!(rows[0], (1, 1));
+        assert_eq!(rows[4], (5, 5));
+    }
+
     /// The framework deparses the TOP-LEVEL statement for join queries, which
     /// inside a #[pg_test] is the test function call. The join acceptance
     /// query therefore runs through dblink (a real top-level statement) in a

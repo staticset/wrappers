@@ -513,24 +513,31 @@ pub(super) fn field_to_cell(
         }
         PgOid::BuiltIn(PgBuiltInOids::INT4OID) => {
             // MSSQL aggregate results are int32 even when Postgres expects
-            // int4 from smallint inputs; widen where lossless
+            // int4 from smallint inputs; widen where lossless. tinyint is
+            // decoded by tiberius strictly as u8 — a foreign table may also
+            // declare a tinyint column as integer, not just smallint
             if let Ok(v) = src_row.try_get::<i32, usize>(idx) {
                 v.map(Cell::I32)
+            } else if let Ok(v) = src_row.try_get::<i16, usize>(idx) {
+                v.map(|v| Cell::I32(i32::from(v)))
             } else {
                 src_row
-                    .try_get::<i16, usize>(idx)?
+                    .try_get::<u8, usize>(idx)?
                     .map(|v| Cell::I32(i32::from(v)))
             }
         }
         PgOid::BuiltIn(PgBuiltInOids::INT8OID) => {
-            // T-SQL COUNT()/SUM(int) return int32; Postgres expects int8
+            // T-SQL COUNT()/SUM(int) return int32; Postgres expects int8.
+            // tinyint lands here when the column is declared bigint
             if let Ok(v) = src_row.try_get::<i64, usize>(idx) {
                 v.map(Cell::I64)
             } else if let Ok(v) = src_row.try_get::<i32, usize>(idx) {
                 v.map(|x| Cell::I64(i64::from(x)))
+            } else if let Ok(v) = src_row.try_get::<i16, usize>(idx) {
+                v.map(|x| Cell::I64(i64::from(x)))
             } else {
                 src_row
-                    .try_get::<i16, usize>(idx)?
+                    .try_get::<u8, usize>(idx)?
                     .map(|x| Cell::I64(i64::from(x)))
             }
         }
@@ -559,6 +566,10 @@ pub(super) fn field_to_cell(
             } else if let Ok(v) = src_row.try_get::<i64, usize>(idx) {
                 v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
             } else if let Ok(v) = src_row.try_get::<i32, usize>(idx) {
+                v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
+            } else if let Ok(v) = src_row.try_get::<i16, usize>(idx) {
+                v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
+            } else if let Ok(v) = src_row.try_get::<u8, usize>(idx) {
                 v.map(|x| Cell::Numeric(pgrx::AnyNumeric::from(i128::from(x))))
             } else {
                 let v = src_row.try_get::<f64, usize>(idx)?;
