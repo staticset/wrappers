@@ -728,6 +728,51 @@ mod unit {
         );
     }
 
+    // 2026-09-17 (Navigator constructor via the bridge): COUNT over a
+    // text/LOB column renders as COUNT(CAST(… AS nvarchar(max))); the type
+    // piece used to hide one closing parenthesis from the SELECT-list comma
+    // split, `GROUP BY 2` stopped resolving and the folded-constant fallback
+    // dropped the whole GROUP BY clause — MSSQL answered error 8120
+    // (aggregate + non-aggregated column, no GROUP BY). The pieces are
+    // paren-balanced now, so the ordinal substitutes the grouped column.
+    // (The substituted item keeps the piece-joiner spaces around `.` — valid
+    // T-SQL, expression-identical to the SELECT item.)
+    #[test]
+    fn positional_group_by_with_lob_count_resolved() {
+        let mut ctx = two_tables_ctx();
+        ctx.text_columns.push("note".into());
+        assert_tsql(
+            "SELECT count(o.note), c.name FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY 2",
+            &ctx,
+            "SELECT COUNT(CAST(o.note AS nvarchar(max))), c.name FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name",
+        );
+        // aliased form: the alias is stripped off the substituted item
+        assert_tsql(
+            "SELECT count(o.note) AS cnt, c.name AS nm FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY 2",
+            &ctx,
+            "SELECT COUNT(CAST(o.note AS nvarchar(max))) AS [cnt], c.name AS [nm] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name",
+        );
+        // the ordinal over the LOB-count item itself still resolves
+        assert_tsql(
+            "SELECT count(o.note), c.name FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY 1, 2",
+            &ctx,
+            "SELECT COUNT(CAST(o.note AS nvarchar(max))), c.name FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY COUNT(CAST(o.note AS nvarchar(max))), c.name",
+        );
+    }
+
+    // an ordinal whose SELECT-list split failed structurally (a target-list
+    // subquery shifts the FROM boundary, leaving the span unbalanced) must
+    // fail loudly instead of being dropped as a folded constant — dropping
+    // it once shipped the query without its GROUP BY clause (MSSQL 8120)
+    #[test]
+    fn unresolvable_group_by_ordinal_fails_closed() {
+        assert_unsupported(
+            "SELECT (SELECT id FROM dbo_orders), name FROM dbo_orders GROUP BY 2",
+            &orders_ctx(),
+            "BY 2",
+        );
+    }
+
     // 2026-09-06 (bridge aggregate pushdown): postgres_fdw deparses
     // `GROUP BY a, b` as `GROUP BY 3, 4` — only the first ordinal sat right
     // after BY, the second leaked into T-SQL as a literal and MSSQL
@@ -1399,7 +1444,7 @@ mod unit {
             "SELECT c.name, SUM(o.amount) AS total FROM public.dbo_orders o JOIN public.dbo_customers c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 ORDER BY total DESC LIMIT 5",
             &two_tables_ctx(),
             "SELECT c.name, SUM(o.amount) AS [total] FROM [dbo].[Orders] o JOIN [dbo].[Customers] c ON o.customer_id = c.id GROUP BY c.name HAVING SUM(o.amount) > 100 \
-             ORDER BY CASE WHEN SUM ( o . amount ) IS NULL THEN 1 ELSE 0 END DESC, SUM ( o . amount ) DESC \
+             ORDER BY CASE WHEN SUM(o.amount) IS NULL THEN 1 ELSE 0 END DESC, SUM(o.amount) DESC \
              OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
         );
     }
@@ -2142,6 +2187,54 @@ mod tests {
                 .map(|(name, total)| (name, total, "100".to_string()))
                 .collect::<Vec<_>>()
         };
+        assert_eq!(pg, mssql);
+        assert!(!pg.is_empty());
+    }
+
+    #[pg_test]
+    fn group_by_ordinal_with_lob_count_matches_reference() {
+        setup_committed();
+
+        // 2026-09-17 (Navigator constructor via the bridge): COUNT over a
+        // text/LOB column plus a positional GROUP BY over a join. The LOB
+        // count's rendering hid one closing parenthesis from the
+        // SELECT-list comma split, `GROUP BY 2` stopped resolving and the
+        // folded-constant fallback dropped the whole GROUP BY clause —
+        // MSSQL answered error 8120 (aggregate + non-aggregated column).
+        // The pieces are paren-balanced now; the ordinal substitutes the
+        // grouped column and the statement ships as one T-SQL query.
+        let pg = Spi::connect(|c| {
+            let rows = c
+                .select(
+                    "SELECT * FROM dblink(\
+                         format('host=localhost port=%s dbname=rqjoin_test', \
+                                current_setting('port')), \
+                         $$SELECT count(o.status)::text AS cnt, c.name AS name \
+                           FROM rqj_orders o JOIN rqj_customers c ON o.customer_id = c.id \
+                           GROUP BY 2$$\
+                     ) AS t(cnt text, name text)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            // (name, total) — the column order mssql_direct compares with
+            let mut v: Vec<(String, String)> = rows
+                .filter_map(|r| {
+                    let cnt = r.get_by_name::<&str, _>("cnt").unwrap().map(str::to_owned);
+                    let name = r.get_by_name::<&str, _>("name").unwrap().map(str::to_owned);
+                    name.zip(cnt)
+                })
+                .collect();
+            v.sort();
+            v
+        });
+
+        let mut mssql = mssql_direct(
+            "SELECT c.name AS name, CAST(COUNT(o.status) AS nvarchar(30)) AS total \
+             FROM dbo.orders o JOIN dbo.customers c ON o.customer_id = c.id \
+             GROUP BY c.name",
+        );
+        mssql.sort();
         assert_eq!(pg, mssql);
         assert!(!pg.is_empty());
     }

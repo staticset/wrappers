@@ -923,13 +923,23 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // value with the type attached — `100 AS pct` comes
                         // back as `GROUP BY 100::integer` — which re-parses
                         // as an out-of-range "ordinal". It is the constant
-                        // itself: drop it, cast tail included.
+                        // itself: drop it, cast tail included — but only when
+                        // a *reliably split* SELECT list confirms the ordinal
+                        // is beyond its last item. A structurally failed
+                        // split (unbalanced target-list parens — the
+                        // 2026-09-17 incident) must not silently swallow a
+                        // real grouping column: the query then shipped
+                        // without its GROUP BY clause and MSSQL rejected it
+                        // with error 8120.
                         let item_len = if in_group_by && is_numeric_literal(n) {
                             group_const_item_len(&toks, i)
                         } else {
                             0
                         };
-                        if item_len > 0 {
+                        if item_len > 0
+                            && split_select_list(&out)
+                                .is_some_and(|list| list.balanced && idx > list.items.len())
+                        {
                             let (extra, emptied) =
                                 drop_const_group_item(&mut out, &toks, i + item_len);
                             if emptied {
@@ -1473,7 +1483,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         out.push("(".to_string());
                         out.extend(pieces);
                         out.push("AS".to_string());
-                        out.push("nvarchar(max))".to_string());
+                        // keep every parenthesis its own piece: a composite
+                        // piece hides it from split_select_list's balance
+                        // counter, the SELECT-list comma split goes wrong
+                        // and positional GROUP BY items stop resolving
+                        // (2026-09-17 incident: the whole GROUP BY clause
+                        // was dropped, MSSQL error 8120)
+                        out.push("nvarchar(max)".to_string());
+                        out.push(")".to_string());
                         out.push(")".to_string());
                         i += 2 + arg_len + 1; // '(' arg ')'
                         continue;
@@ -1674,11 +1691,21 @@ fn unbracket(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+/// The top-level SELECT list located in the rendered output, split into its
+/// items on top-level commas. `balanced` is false when the parentheses of
+/// the target-list span do not balance to zero — composite pieces can hide
+/// parentheses from the counter, and an unbalanced span means the comma
+/// split (and any item count derived from it) is unreliable.
+struct SelectList {
+    items: Vec<Vec<String>>,
+    balanced: bool,
+}
+
 /// Locate the top-level SELECT list in the rendered output and split it into
 /// its items on top-level commas. Returns None when the list cannot be
 /// located (e.g. subqueries in the target list shifted the FROM boundary) —
 /// callers reject or fall back then (fail-closed).
-fn split_select_list(out: &[String]) -> Option<Vec<Vec<String>>> {
+fn split_select_list(out: &[String]) -> Option<SelectList> {
     let select_at = out.iter().position(|p| p.eq_ignore_ascii_case("SELECT"))?;
     // the first FROM after the SELECT closes the target list (target-list
     // subqueries are rejected elsewhere; a stray inner FROM makes the span
@@ -1705,7 +1732,10 @@ fn split_select_list(out: &[String]) -> Option<Vec<Vec<String>>> {
         }
     }
     items.push(current);
-    Some(items)
+    Some(SelectList {
+        items,
+        balanced: paren == 0,
+    })
 }
 
 /// Resolve a positional reference (`GROUP BY 2`) to the n-th SELECT-list
@@ -1716,7 +1746,13 @@ fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
     if idx == 0 {
         return None;
     }
-    let mut item = split_select_list(out)?.into_iter().nth(idx - 1)?;
+    let list = split_select_list(out)?;
+    if !list.balanced {
+        // an unbalanced span hides item boundaries; resolving an ordinal
+        // against it would substitute (or drop) the wrong expression
+        return None;
+    }
+    let mut item = list.items.into_iter().nth(idx - 1)?;
     // drop the output alias: `expr AS name` (positional refs point at the
     // expression; T-SQL allows no alias in GROUP BY/ORDER BY position) —
     // resolved on pieces so a literal ` AS ` inside a string cannot fool it
@@ -1730,7 +1766,11 @@ fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
             item.truncate(as_pos);
         }
     }
-    let item = item.join(" ").trim().to_string();
+    // join like the statement renderer (no spaces around `.`/parens): a
+    // blank-space-joined `c . name` would fail the plain-identifier checks
+    // downstream (capture_subject/close_order_item reject pieces with
+    // spaces), breaking ORDER BY ordinals over qualified columns
+    let item = join_pieces(&item).trim().to_string();
     if item.is_empty() { None } else { Some(item) }
 }
 
@@ -1741,12 +1781,18 @@ fn positional_select_item(out: &[String], idx: usize) -> Option<String> {
 /// bare alias itself would not resolve on MSSQL. Returns None when the list
 /// or the aliased item cannot be located.
 fn alias_select_item(out: &[String], alias: &str) -> Option<String> {
-    for item in split_select_list(out)? {
+    let list = split_select_list(out)?;
+    if !list.balanced {
+        return None;
+    }
+    for item in list.items {
         // a declared alias is always emitted as `… AS [alias]`
         if item.len() >= 2 && item[item.len() - 2].eq_ignore_ascii_case("as") {
             let last = &item[item.len() - 1];
             if unbracket(last).to_lowercase() == alias {
-                let expr = item[..item.len() - 2].join(" ").trim().to_string();
+                // same compact join as positional_select_item: spaces around
+                // `.` would break the plain-identifier checks downstream
+                let expr = join_pieces(&item[..item.len() - 2]).trim().to_string();
                 if !expr.is_empty() {
                     return Some(expr);
                 }
