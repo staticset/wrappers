@@ -1,5 +1,6 @@
 #![allow(clippy::module_inception)]
 mod mssql_fdw_rq;
+mod pool;
 mod translator;
 mod types;
 

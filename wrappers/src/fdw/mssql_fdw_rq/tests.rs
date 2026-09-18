@@ -2295,6 +2295,37 @@ mod tests {
         assert_eq!(pg.len(), 2);
     }
 
+    // 2026-09-18 performance: every scan used to pay a fresh TCP+TLS+login
+    // (~100 ms LAN, ~300 ms over the customer's WAN). The process-wide pool
+    // reuses the login across the statements of one session; the contract
+    // tested here is the correctness of reuse — a fully drained connection
+    // is returned and leased by the next statement. Plain scans throughout:
+    // mixing in a full-query aggregate would hit a PRE-EXISTING framework
+    // bug ("cache lookup failed for type 0" for a plain scan that follows a
+    // full-query scan inside one SPI session — reproduces without the pool,
+    // see FIX_PLAN round 6).
+    #[pg_test]
+    fn pooled_connection_reused_across_statements() {
+        setup();
+
+        // sequential plain scans in this backend: every scan after the
+        // first leases the connection the previous one returned
+        let id1: i64 = Spi::get_one("SELECT id FROM rq_orders WHERE id = 1")
+            .unwrap()
+            .unwrap();
+        let id2: i64 = Spi::get_one("SELECT id FROM rq_orders WHERE id = 2")
+            .unwrap()
+            .unwrap();
+        let status3: String = Spi::get_one("SELECT status FROM rq_orders WHERE id = 3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        // seed: status = CHOOSE(n%4+1, 'new','paid','shipped','done')
+        // → id 3 is the 4th choice
+        assert_eq!(status3, "done");
+    }
+
     #[pg_test]
     fn group_by_constant_output_reference_matches_reference() {
         setup_committed();

@@ -3,12 +3,11 @@ use pgrx::pg_sys;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::time::Instant;
-use tiberius::{Client, Config};
-use tokio::net::TcpStream;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
+use tiberius::Config;
 
 use supabase_wrappers::prelude::*;
 
+use super::pool;
 use super::translator::{self, RelationMapping, TranslateContext};
 use super::types;
 use super::{MssqlFdwRqError, MssqlFdwRqResult};
@@ -218,9 +217,9 @@ pub(super) fn plain_scan_sql(
 }
 
 /// Cloneable blueprint of the running scan so a rescan can replay it:
-/// [`MssqlFdwRq::spawn_streaming_query`] opens a fresh connection and
-/// consumes its parameters by value, so the statement is rebuilt from
-/// these inputs each time it (re-)executes.
+/// [`MssqlFdwRq::spawn_streaming_query`] executes on a (possibly pooled)
+/// connection and consumes its parameters by value, so the statement is
+/// rebuilt from these inputs each time it (re-)executes.
 enum ScanPlan {
     /// plain single-table scan: rebuildable with [`plain_scan_sql`]
     Plain {
@@ -287,8 +286,10 @@ fn bind_remote_parameters(
     error_type = "MssqlFdwRqError"
 )]
 pub(crate) struct MssqlFdwRq {
-    rt: Runtime,
     config: Config,
+    /// identity of the pool bucket this scan's connections belong to
+    /// (resolved conn_string + user-mapping login)
+    pool_key: pool::PoolKey,
     log_remote_query: bool,
     /// rows arrive from a background task through a bounded channel, so
     /// large results never sit fully in memory (TZ §6.1 streaming)
@@ -333,12 +334,13 @@ impl MssqlFdwRq {
         ret
     }
 
-    /// SQL Server credentials from the user mapping, if provided there.
-    /// `username` is accepted alongside `user` — it is the spelling tools
-    /// generate for tds_fdw-compatible sources (Sber Navigator's templates).
+    /// SQL Server credentials from the user mapping, if provided there:
+    /// `(login, auth)`. `username` is accepted alongside `user` — it is the
+    /// spelling tools generate for tds_fdw-compatible sources (Sber
+    /// Navigator's templates); the login also keys the connection pool.
     fn user_mapping_auth(
         server_oid: pg_sys::Oid,
-    ) -> MssqlFdwRqResult<Option<tiberius::AuthMethod>> {
+    ) -> MssqlFdwRqResult<Option<(String, tiberius::AuthMethod)>> {
         let options = unsafe { Self::user_mapping_options(server_oid) };
         let user = options.get("user").or_else(|| options.get("username"));
         let password = match options.get("password") {
@@ -348,16 +350,15 @@ impl MssqlFdwRq {
                 .map(|id| get_vault_secret(id).unwrap_or_default()),
         };
         match (user, password) {
-            (Some(user), Some(password)) if !user.is_empty() && !password.is_empty() => Ok(Some(
+            (Some(user), Some(password)) if !user.is_empty() && !password.is_empty() => Ok(Some((
+                user.clone(),
                 tiberius::AuthMethod::sql_server(user.clone(), password),
-            )),
+            ))),
             // partial or empty credentials are an error; none at all means
             // the connection string is expected to carry them
-            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
-                Err(MssqlFdwRqError::InvalidOption(
-                    "user mapping must provide both 'user' and 'password'".to_string(),
-                ))
-            }
+            (Some(_), _) | (_, Some(_)) => Err(MssqlFdwRqError::InvalidOption(
+                "user mapping must provide both 'user' and 'password'".to_string(),
+            )),
             (None, None) => Ok(None),
         }
     }
@@ -498,7 +499,10 @@ impl MssqlFdwRq {
     /// Execute the query on a background task that streams rows through a
     /// bounded channel: `iter_scan` pulls one row at a time, so arbitrarily
     /// large results never materialize in memory (TZ §6.1). Dropping the
-    /// receiver stops the task.
+    /// receiver stops the task. The connection comes from the process-wide
+    /// pool when one is idle (issue #15: a fresh TCP+TLS+login per scan cost
+    /// a fixed ~100 ms on the LAN bridge, ~300 ms over the customer's WAN)
+    /// and is returned to it only after the stream was fully drained.
     fn spawn_streaming_query(
         &self,
         tsql: String,
@@ -511,38 +515,59 @@ impl MssqlFdwRq {
 
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let config = self.config.clone();
-        self.rt.spawn(async move {
-            let tcp = match TcpStream::connect(config.get_addr()).await {
-                Ok(tcp) => tcp,
-                Err(e) => {
-                    let _ = tx.send(Err(e.into())).await;
-                    return;
+        let pool_key = self.pool_key.clone();
+        let mut leased = pool::lease(&pool_key);
+        if self.log_remote_query {
+            pgrx::log!(
+                "mssql_fdw_rq: connection {}",
+                if leased.is_some() {
+                    "leased from pool"
+                } else {
+                    "opened (pool empty)"
                 }
-            };
-            let _ = tcp.set_nodelay(true);
-            let mut client = match Client::connect(config, tcp.compat_write()).await {
-                Ok(client) => client,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
+            );
+        }
+        pool::runtime().spawn(async move {
+            loop {
+                let (mut client, reused) = match leased.take() {
+                    Some(conn) => (conn, true),
+                    None => match pool::connect(&config).await {
+                        Ok(client) => (client, false),
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    },
+                };
+                let refs: Vec<&dyn tiberius::ToSql> = params
+                    .iter()
+                    .map(|b| &**b as &dyn tiberius::ToSql)
+                    .collect();
+                // keep the query result as a match temporary: it holds the
+                // client borrow and dies at the end of this statement,
+                // before the stream is drained and the client is released
+                let mut row_stream = match client.query(&tsql, &refs).await {
+                    Ok(stream) => stream.into_row_stream(),
+                    // a stale lease the server reset fails before producing
+                    // any row — discard it and retry once on a fresh login
+                    Err(_) if reused => continue,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                while let Some(item) = row_stream.next().await {
+                    if tx.send(item).await.is_err() {
+                        // receiver dropped: the scan was cancelled with the
+                        // stream unfinished — the TDS framing is unreliable,
+                        // so the connection is discarded rather than pooled
+                        return;
+                    }
                 }
-            };
-            let refs: Vec<&dyn tiberius::ToSql> = params
-                .iter()
-                .map(|b| &**b as &dyn tiberius::ToSql)
-                .collect();
-            let mut row_stream = match client.query(tsql, &refs).await {
-                Ok(stream) => stream.into_row_stream(),
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-            while let Some(item) = row_stream.next().await {
-                if tx.send(item).await.is_err() {
-                    // receiver dropped: the scan was cancelled
-                    break;
-                }
+                drop(row_stream);
+                // fully drained: safe for the next query
+                pool::release(&pool_key, client);
+                return;
             }
         });
         Ok(rx)
@@ -551,7 +576,6 @@ impl MssqlFdwRq {
 
 impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
     fn new(server: ForeignServer) -> MssqlFdwRqResult<Self> {
-        let rt = create_async_runtime()?;
         let conn_str = match server.options.get("conn_string") {
             Some(conn_str) => conn_str.to_owned(),
             None => {
@@ -560,6 +584,8 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             }
         };
         let mut config = Config::from_ado_string(&conn_str)?;
+        // the pool bucket: same conn_string + same login ⇒ reusable sessions
+        let mut pool_key = conn_str.clone();
         if server.options.get("auth").map(String::as_str) == Some("kerberos") {
             // Windows Integrated / Kerberos: negotiate via GSSAPI (TZ §5.1 M2)
             #[cfg(feature = "mssql_fdw_rq_kerberos")]
@@ -570,8 +596,10 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                  with the mssql_fdw_rq_kerberos feature"
                     .to_string(),
             ));
-        } else if let Some(auth) = Self::user_mapping_auth(server.server_oid)? {
+        } else if let Some((user, auth)) = Self::user_mapping_auth(server.server_oid)? {
             config.authentication(auth);
+            pool_key.push('\u{0}');
+            pool_key.push_str(&user);
         } else if !conn_str_has_user(&conn_str) {
             return Err(MssqlFdwRqError::InvalidOption(
                 "no credentials: provide a user mapping (user/password) or User ID=/UID= in conn_string"
@@ -584,8 +612,8 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .is_some_and(|v| v == "true");
 
         Ok(MssqlFdwRq {
-            rt,
             config,
+            pool_key,
             log_remote_query,
             rx: None,
             tgt_cols: Vec::new(),
@@ -814,7 +842,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         // pull exactly one row from the streaming channel; the connection
         // task stays parked until the next call
         let item = match self.rx.as_mut() {
-            Some(rx) => self.rt.block_on(rx.recv()),
+            Some(rx) => pool::runtime().block_on(rx.recv()),
             None => return Ok(None),
         };
         match item {
@@ -841,8 +869,8 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         // inner side of a nested-loop join. The framework already routed
         // parameter changes through end_scan/begin_scan, so here the
         // statement is unchanged: cancel the running stream (dropping the
-        // receiver aborts the background query) and execute it again on a
-        // fresh connection.
+        // receiver aborts the background query) and execute it again — on
+        // a pooled connection when one is idle.
         let (sql, params) = match self.rescan_plan.as_ref() {
             Some(plan) => plan.materialize()?,
             None => return Ok(()),
@@ -892,7 +920,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 "unexpected NULL in INFORMATION_SCHEMA result".to_string(),
             )
         };
-        while let Some(item) = self.rt.block_on(rx.recv()) {
+        while let Some(item) = pool::runtime().block_on(rx.recv()) {
             let row = item?;
             let table = row
                 .try_get::<&str, usize>(0)?
