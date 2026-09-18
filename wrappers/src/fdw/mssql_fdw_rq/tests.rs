@@ -495,6 +495,39 @@ mod unit {
         );
     }
 
+    // 2026-09-18 review P0-3: quoted (QIdent) aliases never entered
+    // declared_aliases — `ORDER BY "Total"` then lost the NULL tiebreaker or
+    // bound to a same-named table column (MSSQL 207 otherwise)
+    #[test]
+    fn quoted_alias_in_order_by_gets_tiebreaker() {
+        assert_tsql(
+            "SELECT amount AS \"Total\" FROM public.dbo_orders ORDER BY \"Total\" LIMIT 5",
+            &orders_ctx(),
+            "SELECT amount AS [Total] FROM [dbo].[Orders] ORDER BY \
+             CASE WHEN amount IS NULL THEN 1 ELSE 0 END, amount \
+             OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+        );
+        // a quoted alias over a NOT NULL column needs no tiebreaker
+        assert_tsql(
+            "SELECT id AS \"Key\" FROM public.dbo_orders ORDER BY \"Key\"",
+            &orders_ctx(),
+            "SELECT id AS [Key] FROM [dbo].[Orders] ORDER BY id",
+        );
+    }
+
+    // 2026-09-18 review P0-5: an alias whose SELECT expression cannot be
+    // re-rendered (inner FROM shifts the select-list boundary) used to
+    // silently keep the bare alias — T-SQL NULL ordering, a different row
+    // set under LIMIT. Now rejected fail-closed, like positional GROUP BY.
+    #[test]
+    fn order_by_alias_with_unresolvable_select_item_rejected() {
+        assert_unsupported(
+            "SELECT (SELECT max(id) FROM dbo_orders) AS m FROM dbo_orders ORDER BY m",
+            &orders_ctx(),
+            "ORDER BY",
+        );
+    }
+
     // -- regression round 2026-09-04 (CODE_REVIEW blockers) ------------------
 
     // E: a composite ORDER BY key used to be captured partially — only its
@@ -683,6 +716,107 @@ mod unit {
             "SELECT id FROM public.dbo_orders WHERE note = E'a\\tb\\n'",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] WHERE note = 'a\tb\n'",
+        );
+    }
+
+    // 2026-09-18 review P0-4: pg_get_querydef octal-escapes control bytes in
+    // E'' literals (`\101`); the decoder dropped the backslash and kept the
+    // digits verbatim. Octal and hex forms now decode to the byte value.
+    #[test]
+    fn escape_string_octal_and_hex_escapes() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE note = E'\\101\\102\\x43'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note = 'ABC'",
+        );
+        // single-digit octal and a mixed follow-up digit: `\7` is BEL, then
+        // a literal digit that is not part of the escape
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE note = E'\\78'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE note = '\u{7}8'",
+        );
+    }
+
+    // 2026-09-18 review P3: IS [NOT] DISTINCT FROM used to pass through to
+    // T-SQL verbatim and die on the server with a misleading error 102
+    #[test]
+    fn is_distinct_from_rejected() {
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE note IS DISTINCT FROM 'x'",
+            &orders_ctx(),
+            "IS DISTINCT FROM",
+        );
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders WHERE note IS NOT DISTINCT FROM 'x'",
+            &orders_ctx(),
+            "IS NOT DISTINCT FROM",
+        );
+    }
+
+    // 2026-09-18 review P3: explicit window frames used to travel to T-SQL
+    // with PostgreSQL RANGE semantics; only the implicit default frame
+    // (which the deparser materializes) maps 1:1
+    #[test]
+    fn explicit_window_frame_rejected() {
+        assert_unsupported(
+            "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING \
+             AND CURRENT ROW) FROM public.dbo_orders",
+            &orders_ctx(),
+            "explicit window frame",
+        );
+    }
+
+    // 2026-09-18 review P3: a constant ORDER BY key is a PostgreSQL no-op
+    // but a T-SQL error 1008; positional references (bare numbers) are
+    // resolved earlier and unaffected
+    #[test]
+    fn constant_order_by_rejected() {
+        assert_unsupported(
+            "SELECT id FROM public.dbo_orders ORDER BY 'k'",
+            &orders_ctx(),
+            "ORDER BY",
+        );
+    }
+
+    // 2026-09-18 review P0-2: money values decode through tiberius's f64
+    // (/1e4); the cents reconstruction is exact wherever the f64 still
+    // carries the fraction, and never worse than a direct f64→numeric
+    // conversion above that. The oversized literal is the point: it
+    // documents what f64 cannot represent.
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn money_cents_recovery_exact_where_f64_allows() {
+        use super::super::types::money_cents_to_decimal;
+
+        // inside f64's exact-cents range (ULP ≪ 1/20000): exact
+        assert_eq!(
+            money_cents_to_decimal(123_456.678_9).to_string(),
+            "123456.6789"
+        );
+        assert_eq!(money_cents_to_decimal(-0.580_7).to_string(), "-0.5807");
+        assert_eq!(money_cents_to_decimal(0.157).to_string(), "0.1570");
+        // at 1.2e14 the f64 ULP is 1/64 — the fraction is already gone in
+        // tiberius's decode; the scaling then yields the nearest
+        // representable value (no fabricated cents, same bound as before)
+        assert_eq!(
+            money_cents_to_decimal(123_456_789_012_502.678_9).to_string(),
+            "123456789012502.6719"
+        );
+    }
+
+    // 2026-09-18 review P3: the modifier list used to hide the multi-word
+    // tail of `timestamp(3) with time zone`, leaving `with time zone`
+    // behind as stray tokens — and mapping to datetime2 instead of
+    // datetimeoffset
+    #[test]
+    fn cast_with_modifier_and_timezone_tail() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE ts = '2026-01-01'::timestamp(3) with time zone",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] \
+             WHERE ts = CAST('2026-01-01' AS datetimeoffset(3))",
         );
     }
 
@@ -2324,6 +2458,78 @@ mod tests {
         // seed: status = CHOOSE(n%4+1, 'new','paid','shipped','done')
         // → id 3 is the 4th choice
         assert_eq!(status3, "done");
+    }
+
+    // 2026-09-18 review P0-1: a varchar parameter (PREPARE p(varchar) — the
+    // form parameterized bridge sessions use) decoded to None and the FDW
+    // silently bound NULL into the used placeholder: the filter matched
+    // nothing. The text-family decode now carries the value through.
+    #[pg_test]
+    fn varchar_parameter_binds_value_not_null() {
+        setup_committed();
+
+        // a varchar-typed foreign column so PREPARE p(varchar) compares
+        // varchar = varchar without PostgreSQL coercing the parameter type;
+        // the server and the tables live in rqjoin_test, so the whole
+        // sequence runs through the dblink session
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqvc', {conn})")).unwrap();
+        Spi::run("SELECT dblink_exec('rqvc', $$DROP FOREIGN TABLE IF EXISTS rq_orders_vc$$)")
+            .unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqvc', \
+             $$CREATE FOREIGN TABLE rq_orders_vc (id bigint, status varchar(16)) \
+               SERVER rqj_srv OPTIONS (schema 'dbo', table 'orders')$$)",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqvc', \
+             $$PREPARE pvc(varchar) AS SELECT count(*)::text AS cnt FROM rq_orders_vc \
+               WHERE status = $1$$)",
+        )
+        .unwrap();
+        let count = |param: &str| {
+            Spi::connect(|c| {
+                c.select(
+                    &format!(
+                        "SELECT * FROM dblink('rqvc', $$EXECUTE pvc('{param}')$$) AS t(cnt text)"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .filter_map(|r| r.get_by_name::<&str, _>("cnt").unwrap().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .pop()
+                .expect("count")
+            })
+        };
+        // seed: CHOOSE(n%4+1,…) over ids 1..60 → 15 rows per status
+        assert_eq!(count("done"), "15");
+        // before the fix both executions returned 0: the parameter was NULL
+        assert_eq!(count("no-such-status"), "0");
+        Spi::run("SELECT dblink_exec('rqvc', $$DROP FOREIGN TABLE rq_orders_vc$$)").unwrap();
+        Spi::run("SELECT dblink_disconnect('rqvc')").unwrap();
+    }
+
+    // 2026-09-18 review P0-2: tiberius decodes TDS money as f64 (raw i64
+    // /1e4) and the old f64→numeric fallback lost the last cents from ~1e13
+    // up. The money branch re-scales to integer cents, which is exact over
+    // the whole money range.
+    #[pg_test]
+    fn money_large_value_keeps_exact_cents() {
+        setup();
+
+        // seed: id 1 → total_amount = money(120 + 1*37) = 157.0000; T-SQL
+        // types money × numeric as decimal with combined scale — every
+        // digit must arrive intact end-to-end (a 1.26e14 value with 8
+        // decimals: any f64 shortcut in the decode path would drift)
+        let got = Spi::get_one::<String>(
+            "SELECT (total_amount * 8034567890.1234)::text FROM rq_orders WHERE id = 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, "1261427158749.37380000");
     }
 
     #[pg_test]

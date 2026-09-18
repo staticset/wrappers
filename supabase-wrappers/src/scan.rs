@@ -345,8 +345,100 @@ unsafe fn drop_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
     if fdw_state.is_null() {
         return;
     }
+    deregister_fdw_state(fdw_state.cast());
     let boxed_fdw_state = unsafe { Box::from_raw(fdw_state) };
     drop(boxed_fdw_state);
+}
+
+/// Type-erased drop function for a registered live FdwState.
+type ErasedStateDrop = unsafe fn(*mut c_void);
+
+thread_local! {
+    /// FdwState pointers alive in this backend. An ereport longjmp past
+    /// ExecutorEnd leaks the Box (and whatever the state holds — sockets,
+    /// parked streaming tasks); the transaction callback registered below
+    /// drops everything still registered when the transaction aborts
+    /// (review 2026-09-18, P1-2).
+    static LIVE_FDW_STATES: std::cell::RefCell<Vec<(*mut c_void, ErasedStateDrop)>> =
+        std::cell::RefCell::new(Vec::new());
+    static XACT_CALLBACK_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Track a freshly stored FdwState for abort-time cleanup.
+///
+/// # Safety
+/// `ptr` must be the Box::into_raw pointer stored in `node->fdw_state`, and
+/// every drop of that Box must go through [`drop_fdw_state`].
+unsafe fn register_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
+    ptr: *mut FdwState<E, W>,
+) {
+    unsafe fn erased_drop<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(raw: *mut c_void) {
+        // SAFETY: raw is the Box::into_raw pointer register_fdw_state stored.
+        unsafe { drop_fdw_state(raw as *mut FdwState<E, W>) };
+    }
+    XACT_CALLBACK_REGISTERED.with(|registered| {
+        if !registered.get() {
+            registered.set(true);
+            unsafe {
+                pg_sys::RegisterXactCallback(
+                    Some(drop_live_fdw_states_on_abort),
+                    ptr::null_mut(),
+                );
+                pg_sys::RegisterSubXactCallback(
+                    Some(drop_live_fdw_states_on_subxact_abort),
+                    ptr::null_mut(),
+                );
+            }
+        }
+    });
+    LIVE_FDW_STATES.with_borrow_mut(|states| states.push((ptr.cast(), erased_drop::<E, W>)));
+}
+
+fn deregister_fdw_state(ptr: *mut c_void) {
+    LIVE_FDW_STATES.with_borrow_mut(|states| {
+        if let Some(pos) = states.iter().position(|(p, _)| *p == ptr) {
+            states.swap_remove(pos);
+        }
+    });
+}
+
+/// Drain the registry, dropping every leaked state. Dropping releases the
+/// Box (closing sockets the state owns) and closes its streaming channels —
+/// parked tasks then finish on the next runtime drive.
+fn drop_registered_fdw_states() {
+    LIVE_FDW_STATES.with_borrow_mut(|states| {
+        for (ptr, drop_fn) in states.drain(..) {
+            unsafe { drop_fn(ptr) };
+        }
+    });
+}
+
+/// XACT_EVENT_ABORT-family callback: the executor longjmp'd past
+/// ExecutorEnd, so every still-registered state is a leak.
+unsafe extern "C-unwind" fn drop_live_fdw_states_on_abort(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut c_void,
+) {
+    if event != pg_sys::XactEvent::XACT_EVENT_ABORT
+        && event != pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
+    {
+        return;
+    }
+    drop_registered_fdw_states();
+}
+
+/// Subtransaction aborts (ROLLBACK TO SAVEPOINT, PL/pgSQL EXCEPTION blocks)
+/// arrive through their own callback family.
+unsafe extern "C-unwind" fn drop_live_fdw_states_on_subxact_abort(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut c_void,
+) {
+    if event != pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB {
+        return;
+    }
+    drop_registered_fdw_states();
 }
 
 pub(crate) unsafe fn leak_state_in_current_context<
@@ -597,7 +689,25 @@ unsafe fn deserialize_plan_snapshot<E: Into<ErrorReport>, W: ForeignDataWrapper<
                 return None;
             }
             let json = String::from_datum(cst.constvalue, cst.constisnull)?;
-            let snapshot = serde_json::from_str::<PlanStateSnapshot>(&json).ok()?;
+            let snapshot = match serde_json::from_str::<PlanStateSnapshot>(&json) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    // A TEXT const that fails snapshot parsing means the
+                    // format changed underneath a cached plan (extension
+                    // upgrade in a live session). Falling into the legacy
+                    // numeric path would read varlena bytes as an i64 and
+                    // clone a garbage state — fail the query instead
+                    // (review 2026-09-18, P2-1).
+                    report_error(
+                        PgSqlErrorCode::ERRCODE_FDW_ERROR,
+                        &format!(
+                            "cannot parse the cached plan state snapshot: {err}; \
+                             discard the cached plan (reconnect or DEALLOCATE) and retry"
+                        ),
+                    );
+                    return None;
+                }
+            };
             Some(snapshot.into_state())
         })
     }
@@ -917,10 +1027,21 @@ fn normalize_current_statement_sql(sql: &str) -> Option<String> {
 
     let sql = sql.trim().trim_end_matches(';').trim();
     if sql.is_empty() {
-        None
-    } else {
-        Some(sql.to_string())
+        return None;
     }
+
+    // The slice can only be garbage when stmt_location pointed into the
+    // middle of a literal that happens to contain the statement keywords —
+    // a fragment that is not a top-level query must never reach translation
+    // (review 2026-09-18, P3: harden the EXECUTE-time statement slice).
+    if !(starts_with_ascii_keyword(sql, "select")
+        || starts_with_ascii_keyword(sql, "with")
+        || starts_with_ascii_keyword(sql, "values"))
+    {
+        return None;
+    }
+
+    Some(sql.to_string())
 }
 
 fn starts_with_ascii_keyword(sql: &str, keyword: &str) -> bool {
@@ -1146,6 +1267,19 @@ pub(crate) unsafe fn query_requires_full_query(root: *mut pg_sys::PlannerInfo) -
     }
 }
 
+/// The query carries `FOR UPDATE`/`FOR SHARE` row marks. PostgreSQL does not
+/// wrap an FDW upper path in LockRows, so a full-query plan would silently
+/// drop the locking semantics — the FDW sees this flag and stays on the
+/// base-scan path (review 2026-09-18, P3).
+pub(crate) unsafe fn query_has_row_marks(root: *mut pg_sys::PlannerInfo) -> bool {
+    unsafe {
+        if root.is_null() || (*root).parse.is_null() {
+            return false;
+        }
+        !(*(*root).parse).rowMarks.is_null()
+    }
+}
+
 pub(crate) unsafe fn remote_query_context_from_planner(
     root: *mut pg_sys::PlannerInfo,
     has_unpushed_quals: bool,
@@ -1161,6 +1295,7 @@ pub(crate) unsafe fn remote_query_context_from_planner(
             has_multiple_base_relations: query_has_multiple_base_relations(root),
             has_non_relation_inputs: query_has_non_relation_inputs(root),
             has_non_var_targets: query_has_non_var_targets(root),
+            has_row_marks: query_has_row_marks(root),
             has_unpushed_quals,
             all_referenced_relations_are_foreign: foreign_relations.is_some(),
             foreign_relation_count: foreign_relations.as_ref().map_or(0, Vec::len),
@@ -1957,9 +2092,7 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             if param.id > 0 && param.id <= params_cnt {
                                 let plist = (*plist_info).params.as_slice(params_cnt);
                                 let p: pg_sys::ParamExternData = plist[param.id - 1];
-                                if let Some(cell) =
-                                    Cell::from_polymorphic_datum(p.value, p.isnull, p.ptype)
-                                {
+                                if let Some(cell) = decode_parameter(p.value, p.isnull, p.ptype) {
                                     qual.value = Value::Cell(cell.clone());
                                     current_value = Some(Value::Cell(cell));
                                 }
@@ -1980,8 +2113,7 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             param.expr_eval.expr_state,
                             econtext,
                             &mut isnull,
-                        ) && let Some(cell) =
-                            Cell::from_polymorphic_datum(datum, isnull, param.type_oid)
+                        ) && let Some(cell) = decode_parameter(datum, isnull, param.type_oid)
                         {
                             qual.value = Value::Cell(cell.clone());
                             current_value = Some(Value::Cell(cell));
@@ -1999,6 +2131,33 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                 }
             }
         }
+    }
+}
+
+/// Decode a pushdown parameter datum, failing the query when a non-NULL
+/// value cannot be decoded. Silently substituting NULL would bind NULL into
+/// a used placeholder and push a filter that matches nothing (review
+/// 2026-09-18, P0-1); a real NULL parameter decodes to None legitimately.
+///
+/// # Safety
+/// The datum must be valid for `type_oid` (or null).
+unsafe fn decode_parameter(
+    datum: pg_sys::Datum,
+    is_null: bool,
+    type_oid: pg_sys::Oid,
+) -> Option<Cell> {
+    unsafe {
+        let cell = Cell::from_polymorphic_datum(datum, is_null, type_oid);
+        if cell.is_none() && !is_null {
+            report_error(
+                PgSqlErrorCode::ERRCODE_FDW_ERROR,
+                &format!(
+                    "cannot decode a non-NULL parameter of type OID {type_oid}: \
+                     unsupported parameter type for pushdown"
+                ),
+            );
+        }
+        cell
     }
 }
 
@@ -2034,14 +2193,14 @@ unsafe fn assign_remote_query_parameters<E: Into<ErrorReport>, W: ForeignDataWra
                 if param.ptype == Oid::INVALID {
                     continue;
                 }
+                let cell = decode_parameter(param.value, param.isnull, param.ptype);
                 upsert_remote_query_parameter(
                     &mut parameters,
                     RemoteQueryParameter {
                         kind: ParamKind::PARAM_EXTERN,
                         id: idx + 1,
                         type_oid: param.ptype,
-                        value: Cell::from_polymorphic_datum(param.value, param.isnull, param.ptype)
-                            .map(Value::Cell),
+                        value: cell.map(Value::Cell),
                     },
                 );
             }
@@ -2214,6 +2373,7 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         }
 
         (*node).fdw_state = state.into_pg() as _;
+        register_fdw_state((*node).fdw_state as *mut FdwState<E, W>);
     }
 }
 

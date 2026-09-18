@@ -9,6 +9,7 @@ on:
       - "supabase-wrappers/**"
       - "wrappers/src/fdw/mssql_fdw_rq/**"
       - "wrappers/Cargo.toml"
+      - "Cargo.lock"
       - ".dev/mssql/**"
       - ".github/workflows/mssql-fdw-rq.yml"
   pull_request:
@@ -16,6 +17,7 @@ on:
       - "supabase-wrappers/**"
       - "wrappers/src/fdw/mssql_fdw_rq/**"
       - "wrappers/Cargo.toml"
+      - "Cargo.lock"
       - ".dev/mssql/**"
       - ".github/workflows/mssql-fdw-rq.yml"
 

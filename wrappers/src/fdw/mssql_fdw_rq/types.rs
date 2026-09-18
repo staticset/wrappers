@@ -472,30 +472,54 @@ fn cell_kind(cell: &Cell) -> &'static str {
 // Result rows: tiberius Row → framework Cell (by target column OID)
 // ---------------------------------------------------------------------------
 
+/// Resolve, once per scan, which result-stream column feeds each target
+/// column: a name matching exactly one result column resolves to it; every
+/// other case falls back to the target-list position. Two full-query shapes
+/// cannot be matched by name: join-path target lists carry positional names
+/// (`column_N`) that never exist in the remote result, and a join may select
+/// identically-named columns from two tables — both mirror the PostgreSQL
+/// target list order. The mapping is identical for every row of one result
+/// (review 2026-09-18, P4: the lookup ran per cell before).
+pub(super) fn resolve_column_positions(src_row: &tiberius::Row, tgt_cols: &[Column]) -> Vec<usize> {
+    tgt_cols
+        .iter()
+        .enumerate()
+        .map(|(pos, tgt_col)| {
+            let col_name = tgt_col.name.as_str();
+            let mut hits = src_row
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.name() == col_name)
+                .map(|(i, _)| i);
+            match (hits.next(), hits.next()) {
+                (Some(idx), None) => idx,
+                _ => pos,
+            }
+        })
+        .collect()
+}
+
+/// Reconstruct a decimal from tiberius's f64 money decode (`raw_i64 / 1e4`).
+/// The scaling runs in exact integer arithmetic (integer units + rounded
+/// fractional cents), which is exact wherever the f64 still carries the
+/// cents — up to ~2e11, where the f64 ULP crosses half a cent. Above that
+/// the f64 already lost the fraction (tiberius's decode, not the scaling,
+/// is the bottleneck): the result is then the nearest representable value
+/// quantized to 4 digits — never worse than the old direct f64→numeric
+/// conversion (review 2026-09-18, P0-2). Pure function, unit-tested.
+pub(super) fn money_cents_to_decimal(v: f64) -> Decimal {
+    let units = v.trunc() as i128;
+    let frac_cents = (v.fract() * 10_000.0).round() as i128;
+    let cents = units * 10_000 + frac_cents;
+    Decimal::from_i128_with_scale(cents, 4)
+}
+
 pub(super) fn field_to_cell(
     src_row: &tiberius::Row,
     tgt_col: &Column,
-    pos: usize,
+    idx: usize,
 ) -> MssqlFdwRqResult<Option<Cell>> {
-    // Resolve the result column by name. Two full-query shapes cannot be
-    // matched by name: join-path target lists carry positional names
-    // (`column_N`) that never exist in the remote result, and a join may
-    // select identically-named columns from two tables. Both fall back to
-    // the result position, which mirrors the PostgreSQL target list order.
-    let col_name = tgt_col.name.as_str();
-    let name_positions: Vec<usize> = src_row
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.name() == col_name)
-        .map(|(i, _)| i)
-        .collect();
-    let idx = if name_positions.len() == 1 {
-        name_positions[0]
-    } else {
-        pos
-    };
-
     let ret = match PgOid::from(tgt_col.type_oid) {
         PgOid::BuiltIn(PgBuiltInOids::BOOLOID) => {
             src_row.try_get::<bool, usize>(idx)?.map(Cell::Bool)
@@ -554,6 +578,24 @@ pub(super) fn field_to_cell(
             }
         }
         PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => {
+            // money/smallmoney: tiberius decodes TDS MONEY straight to f64
+            // (raw i64 / 1e4), so the Decimal branch below misses and the
+            // old f64 fallback lost the last cents from ~1e13 up (review
+            // 2026-09-18, P0-2). The money scale is exactly 4 and the raw
+            // value is an exact i64 below 2^63, so re-scaling and rounding
+            // recovers the exact number of cents: |raw| ≤ 9.2e18 means
+            // |raw/1e4 * 1e4 - raw| < 0.5 after f64 round-trip.
+            if matches!(
+                src_row.columns()[idx].column_type(),
+                tiberius::ColumnType::Money | tiberius::ColumnType::Money4
+            ) {
+                let v = src_row.try_get::<f64, usize>(idx)?;
+                return Ok(v
+                    .map(|v| pgrx::AnyNumeric::from_str(&money_cents_to_decimal(v).to_string()))
+                    .transpose()
+                    .map_err(dt_err)?
+                    .map(Cell::Numeric));
+            }
             // decimal, or an int/float aggregate result coerced to numeric
             if let Ok(v) = src_row.try_get::<Decimal, usize>(idx) {
                 // Converting Decimal through f64 silently corrupts money

@@ -1,0 +1,60 @@
+# Ubuntu 24.04 (noble) build env for mssql_fdw_rq — for Ubuntu 24.04 prod
+# targets (glibc 2.39; .so built on Debian bookworm may misbehave elsewhere).
+# PostgreSQL 17 from PGDG (noble itself ships only PG16), Rust 1.88.0,
+# cargo-pgrx 0.16.1 — same pins as .dev/Dockerfile.builder.
+#
+# Usage:
+#   docker build -t mssql-fdw-rq-builder-u24 -f Dockerfile.ubuntu24 .
+#   docker run -d --name mssql-fdw-rq-builder-u24 \
+#     --network mssql-fdw-rq-dev_default \
+#     -v mssql-fdw-rq-u24-target:/opt/target \
+#     -v mssql-fdw-rq-dev_cargo-registry:/opt/cargo/registry \
+#     mssql-fdw-rq-builder-u24 sleep infinity
+#   # then feed sources and build (git archive keeps OneDrive out of the build):
+#   cd <repo root> && git -C wrappers archive HEAD \
+#     | docker exec -i mssql-fdw-rq-builder-u24 tar -x -C /work
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential pkg-config curl ca-certificates libssl-dev git tar \
+ && rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL 17 from PGDG
+RUN install -d /usr/share/postgresql-common/pgdg \
+ && curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update -y --fix-missing \
+ && apt-get install -y --no-install-recommends \
+      postgresql-client-17 postgresql-17 postgresql-server-dev-17 \
+ && apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Rust 1.88.0 (workspace rust-version) under /opt so caches live in volumes
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.88.0 --profile minimal \
+ && rustup component add rustfmt clippy
+
+# pgrx refuses to run PostgreSQL as root: build as the unprivileged user.
+# ubuntu:24.04 already ships user `ubuntu` with uid 1000 (same uid as `dev`
+# in the Debian builder, so the shared cargo-registry volume stays writable).
+RUN PG_BIN=/usr/lib/postgresql/17/bin \
+ && chmod a+rwx "$("$PG_BIN/pg_config" --pkglibdir)" \
+               "$("$PG_BIN/pg_config" --sharedir)"/extension \
+               /var/run/postgresql /var/lib/postgresql \
+ && mkdir -p /opt/target /work \
+ && chown -R ubuntu:ubuntu /opt/target /opt/cargo /opt/rustup /work
+
+USER ubuntu
+ENV HOME=/home/ubuntu
+ENV CARGO_TARGET_DIR=/opt/target
+
+RUN cargo install --locked cargo-pgrx --version 0.16.1
+RUN cargo pgrx init --pg17 /usr/lib/postgresql/17/bin/pg_config
+
+WORKDIR /work
+CMD ["bash"]

@@ -262,6 +262,9 @@ impl IntoDatum for Cell {
             || other == pg_sys::INT8OID
             || other == pg_sys::NUMERICOID
             || other == pg_sys::TEXTOID
+            || other == pg_sys::VARCHAROID
+            || other == pg_sys::BPCHAROID
+            || other == pg_sys::NAMEOID
             || other == pg_sys::DATEOID
             || other == pg_sys::TIMEOID
             || other == pg_sys::TIMESTAMPOID
@@ -313,6 +316,14 @@ impl FromDatum for Cell {
                     AnyNumeric::from_datum(datum, is_null).map(Cell::Numeric)
                 }
                 PgOid::BuiltIn(PgBuiltInOids::TEXTOID) => {
+                    String::from_datum(datum, is_null).map(Cell::String)
+                }
+                // text-family parameters previously decoded to None and the
+                // FDW silently bound NULL (review 2026-09-18, P0-1) — a
+                // varlena string datum is the same payload for all of them
+                PgOid::BuiltIn(PgBuiltInOids::VARCHAROID)
+                | PgOid::BuiltIn(PgBuiltInOids::BPCHAROID)
+                | PgOid::BuiltIn(PgBuiltInOids::NAMEOID) => {
                     String::from_datum(datum, is_null).map(Cell::String)
                 }
                 PgOid::BuiltIn(PgBuiltInOids::DATEOID) => {
@@ -575,6 +586,11 @@ pub struct RemoteQueryContext {
 
     /// The query contains inputs that are not plain relation references.
     pub has_non_relation_inputs: bool,
+
+    /// The query carries `FOR UPDATE`/`FOR SHARE` row marks. PostgreSQL does
+    /// not wrap FDW paths in LockRows, so claiming the whole statement would
+    /// silently drop the locking semantics.
+    pub has_row_marks: bool,
 
     /// The query target list contains expressions that cannot be represented as
     /// a simple base table column scan.

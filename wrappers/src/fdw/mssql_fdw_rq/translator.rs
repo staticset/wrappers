@@ -323,10 +323,76 @@ fn decode_escape_string(s: &str) -> Result<String, TranslateError> {
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
             Some('v') => out.push('\u{000B}'),
+            // hexadecimal byte value: one or two hex digits
+            Some('x') => {
+                let mut val = 0u32;
+                let mut len = 0usize;
+                while len < 2
+                    && let Some(h) = chars.clone().next().and_then(|c| c.to_digit(16))
+                {
+                    chars.next();
+                    val = val * 16 + h;
+                    len += 1;
+                }
+                if len == 0 {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: "\\x".to_string(),
+                        reason: "\\x escape without hex digits".to_string(),
+                    });
+                }
+                // a longer hex run is ambiguous against PostgreSQL's
+                // digit-pair decoding — refuse rather than mis-decode
+                if len == 2 && chars.clone().next().is_some_and(|c| c.is_ascii_hexdigit()) {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: "\\x…".to_string(),
+                        reason: "hex escape longer than two digits is not \
+                                 supported"
+                            .to_string(),
+                    });
+                }
+                push_escaped_byte(&mut out, val)?;
+            }
+            // octal byte value: one to three octal digits. pg_get_querydef
+            // octal-escapes control bytes in E'' literals; the old decoder
+            // dropped the backslash and kept the digits verbatim (review
+            // 2026-09-18, P0-4)
+            Some(c @ '0'..='7') => {
+                let mut val = c.to_digit(8).expect("octal digit");
+                let mut len = 1usize;
+                while len < 3
+                    && let Some(o) = chars.clone().next().and_then(|c| c.to_digit(8))
+                {
+                    chars.next();
+                    val = val * 8 + o;
+                    len += 1;
+                }
+                push_escaped_byte(&mut out, val)?;
+            }
             Some(other) => out.push(other),
         }
     }
     Ok(out)
+}
+
+/// Append the byte value of an octal/hex `E''` escape. pg_get_querydef
+/// emits raw UTF-8 for non-ASCII text, so an escaped value outside ASCII
+/// (a lone continuation byte) and NUL are rejected rather than silently
+/// corrupted.
+fn push_escaped_byte(out: &mut String, val: u32) -> Result<(), TranslateError> {
+    match val {
+        0 => Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("\\{val:o}"),
+            reason: "NUL byte escape is not representable in a T-SQL string".to_string(),
+        }),
+        1..=0x7F => {
+            out.push(char::from_u32(val).expect("value is an ASCII byte"));
+            Ok(())
+        }
+        _ => Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("\\{val:o}"),
+            reason: "escape value outside ASCII is not representable".to_string(),
+        }),
+    }
 }
 
 /// Match a LIMIT/OFFSET value token: the deparser prints constants as
@@ -731,6 +797,28 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 if !last_desc {
                                     pop_if_word(&mut out, "asc");
                                 }
+                                // PG17's deparser materializes the default
+                                // frame (`ROWS/RANGE UNBOUNDED PRECEDING`),
+                                // which T-SQL forbids on ranking functions
+                                // and which equals T-SQL's implicit default
+                                // anyway — drop it. Any other frame changes
+                                // which rows a window aggregate sees, and
+                                // PostgreSQL/RANGE vs T-SQL/ROWS semantics
+                                // differ — reject instead of silently
+                                // reshaping the window (review 2026-09-18, P3).
+                                let is_default_frame = frame.len() == 3
+                                    && matches!(frame[0].as_str(), "ROWS" | "RANGE")
+                                    && frame[1].eq_ignore_ascii_case("UNBOUNDED")
+                                    && frame[2].eq_ignore_ascii_case("PRECEDING");
+                                if !frame.is_empty() && !is_default_frame {
+                                    return Err(TranslateError::UnsupportedConstruct {
+                                        sql_fragment: "OVER (… explicit window frame)".to_string(),
+                                        reason: "only the default ROWS/RANGE UNBOUNDED \
+                                                 PRECEDING window frame is supported; explicit \
+                                                 frames differ between PostgreSQL and T-SQL"
+                                            .to_string(),
+                                    });
+                                }
                                 // the capture must succeed: swallowing the
                                 // error would skip the NULL-ordering check
                                 // entirely while the popped direction is
@@ -770,18 +858,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 }
                                 if last_desc {
                                     out.push("DESC".to_string());
-                                }
-                                // PG17's deparser materializes the default
-                                // frame (`ROWS/RANGE UNBOUNDED PRECEDING`),
-                                // which T-SQL forbids on ranking functions
-                                // and which equals T-SQL's implicit default
-                                // anyway — drop it; keep explicit frames.
-                                let is_default_frame = frame.len() == 3
-                                    && matches!(frame[0].as_str(), "ROWS" | "RANGE")
-                                    && frame[1].eq_ignore_ascii_case("UNBOUNDED")
-                                    && frame[2].eq_ignore_ascii_case("PRECEDING");
-                                if !is_default_frame {
-                                    out.extend(frame);
                                 }
                             }
                         }
@@ -1023,6 +1099,16 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     out.push(format!("{rendered} = {}", if negated { 0 } else { 1 }));
                     i += 1;
                     continue;
+                }
+                // a quoted alias declares the output name exactly like a bare
+                // one (`AS "Total"`): ORDER BY resolves bare sort keys through
+                // declared_aliases, and an unregistered quoted alias would
+                // silently drop the NULL tiebreaker or bind to a same-named
+                // table column (review 2026-09-18, P0-3)
+                if out.last().is_some_and(|p| p.eq_ignore_ascii_case("as"))
+                    && cast_paren_depth.is_none_or(|d| depth != d)
+                {
+                    declared_aliases.insert(name.to_lowercase());
                 }
                 out.push(bracket_ident(name)?);
             }
@@ -1545,6 +1631,17 @@ fn is_whole_order_item(out: &[String], start: usize) -> bool {
         )
 }
 
+/// A single rendered ORDER BY piece that is a literal constant: string
+/// literals and the `TRUE`/`FALSE`/`NULL` spellings. Bare numbers are
+/// positional references and are resolved before an item reaches this check.
+fn looks_like_order_constant(piece: &str) -> bool {
+    piece.starts_with('\'')
+        || piece.starts_with("N'")
+        || piece.eq_ignore_ascii_case("true")
+        || piece.eq_ignore_ascii_case("false")
+        || piece.eq_ignore_ascii_case("null")
+}
+
 /// Render the full ORDER BY item that `start` was captured from, walking back
 /// to the item's opening piece — used for error diagnostics so the reported
 /// fragment shows `amount + fee`, not just the captured `fee`.
@@ -1595,38 +1692,61 @@ fn close_order_item(
                 .to_string(),
         });
     }
+    // PostgreSQL treats a bare constant as a no-op sort key, T-SQL rejects
+    // it outright (error 1008) — refuse instead of emitting a doomed query
+    // (review 2026-09-18, P3; positional refs meet the same fate: PG's
+    // deparser prints them as bare numbers, indistinguishable from
+    // constants, and resolving them like GROUP BY ordinals is future work).
+    if out.len() - start == 1 && looks_like_order_constant(&out[start]) {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("ORDER BY {}", order_item_fragment(out, start)),
+            reason: "constant ORDER BY keys are a PostgreSQL no-op but a T-SQL \
+                     syntax error"
+                .to_string(),
+        });
+    }
     // PostgreSQL resolves a bare ORDER BY name as an output alias first (the
     // alias shadows a same-named column). The bare alias itself cannot carry
     // the NULL-tiebreaker CASE — T-SQL would resolve it as a column — so sort
     // by the aliased SELECT expression instead. If that expression cannot be
-    // located, keep the bare alias (T-SQL NULL ordering applies — the old
-    // behavior, better than failing the query).
+    // located, the bare alias would silently sort with T-SQL NULL ordering —
+    // a different row set under LIMIT/OFFSET — or bind to a same-named table
+    // column, so the query is rejected instead (review 2026-09-18, P0-5;
+    // mirrors the fail-closed positional GROUP BY of round 4).
     if out.len() - start == 1
         && !expr.contains(' ')
         && declared_aliases.contains(&unbracket(&expr).to_lowercase())
     {
         let alias = unbracket(&expr).to_lowercase();
-        if let Some(resolved) = alias_select_item(out, &alias) {
-            // a NOT NULL aliased column needs no tiebreaker either
-            if !resolved.contains(' ')
-                && ctx
-                    .not_null_columns
-                    .contains(&unbracket(&resolved).to_lowercase())
-            {
-                out.truncate(start);
-                out.push(resolved);
-                if desc == Some(true) {
-                    out.push("DESC".to_string());
+        match alias_select_item(out, &alias) {
+            Some(resolved) => {
+                // a NOT NULL aliased column needs no tiebreaker either
+                if !resolved.contains(' ')
+                    && ctx
+                        .not_null_columns
+                        .contains(&unbracket(&resolved).to_lowercase())
+                {
+                    out.truncate(start);
+                    out.push(resolved);
+                    if desc == Some(true) {
+                        out.push("DESC".to_string());
+                    }
+                    return Ok(());
                 }
+                push_null_tiebreaker(out, start, &resolved, desc.unwrap_or(false));
                 return Ok(());
             }
-            push_null_tiebreaker(out, start, &resolved, desc.unwrap_or(false));
-            return Ok(());
+            None => {
+                return Err(TranslateError::UnsupportedConstruct {
+                    sql_fragment: format!("ORDER BY {}", order_item_fragment(out, start)),
+                    reason: "sort key is a declared output alias whose SELECT \
+                             expression cannot be re-rendered for PostgreSQL NULL \
+                             ordering; sort by the underlying expression or a \
+                             plain column instead"
+                        .to_string(),
+                });
+            }
         }
-        if desc == Some(true) {
-            out.push("DESC".to_string());
-        }
-        return Ok(());
     }
     let bare_not_null = out.len() - start == 1
         && !expr.contains(' ')
@@ -2161,8 +2281,30 @@ fn type_token_len(toks: &[Tok]) -> usize {
             match t {
                 Tok::Num(_) => j += 1,
                 Tok::Op(op) if op == "," => j += 1,
-                Tok::Op(op) if op == ")" => return j + 1,
+                Tok::Op(op) if op == ")" => {
+                    len = j + 1;
+                    break;
+                }
                 _ => break,
+            }
+        }
+        // multi-word tail after the modifier: `timestamp(3) with time zone`
+        // — the modifier sits between the name and the tail, so the check
+        // above missed it and `with time zone` stayed behind as stray
+        // tokens (review 2026-09-18, P3)
+        for multi in MULTIWORD_PG_TYPES {
+            let words: Vec<&str> = multi.split(' ').collect();
+            let end = len + words.len() - 1;
+            if toks.len() >= end
+                && words.len() > 1
+                && matches!(toks.get(name_start), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(words[0]))
+                && toks[len..end]
+                    .iter()
+                    .enumerate()
+                    .all(|(k, t)| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case(words[k + 1])))
+            {
+                len = end;
+                break;
             }
         }
     }
@@ -2185,6 +2327,10 @@ fn parse_cast_type(toks: &[Tok]) -> Result<String, TranslateError> {
             Tok::Word(w) => parts.push(w.clone()),
             Tok::QIdent(q) => parts.push(q.clone()),
             Tok::Op(o) if o == "." => continue,
+            // modifier list between the name and a multi-word tail:
+            // `timestamp(3) with time zone` (review 2026-09-18, P3)
+            Tok::Num(_) => continue,
+            Tok::Op(o) if o == "(" || o == ")" || o == "," => continue,
             _ => break,
         }
     }
@@ -2735,6 +2881,15 @@ fn translate_is(
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case("true") => ("true", 3),
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case("false") => ("false", 3),
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case("unknown") => ("unknown", 3),
+            // `IS NOT DISTINCT FROM` has no T-SQL equivalent — emitting it
+            // verbatim dies on the server with a misleading syntax error
+            // (review 2026-09-18, P3)
+            Some(Tok::Word(w)) if w.eq_ignore_ascii_case("distinct") => {
+                return Err(TranslateError::UnsupportedConstruct {
+                    sql_fragment: "IS NOT DISTINCT FROM".to_string(),
+                    reason: "IS [NOT] DISTINCT FROM has no T-SQL equivalent".to_string(),
+                });
+            }
             // `IS NOT NULL` passes through unchanged (emit and advance!)
             _ => {
                 out.push("IS".to_string());
@@ -2742,6 +2897,13 @@ fn translate_is(
                 return Ok(());
             }
         },
+        // `IS DISTINCT FROM` — same treatment as the negated form
+        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("distinct") => {
+            return Err(TranslateError::UnsupportedConstruct {
+                sql_fragment: "IS DISTINCT FROM".to_string(),
+                reason: "IS [NOT] DISTINCT FROM has no T-SQL equivalent".to_string(),
+            });
+        }
         // `IS NULL` passes through unchanged (emit and advance!)
         _ => {
             out.push("IS".to_string());

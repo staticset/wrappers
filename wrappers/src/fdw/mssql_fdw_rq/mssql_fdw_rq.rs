@@ -295,6 +295,10 @@ pub(crate) struct MssqlFdwRq {
     /// large results never sit fully in memory (TZ §6.1 streaming)
     rx: Option<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>,
     tgt_cols: Vec<Column>,
+    /// which result-stream column feeds each target column, resolved from
+    /// the first row of a scan (review 2026-09-18, P4: the name lookup ran
+    /// per cell before)
+    column_positions: Option<Vec<usize>>,
     /// what to re-execute when PostgreSQL rescans this ForeignScan
     rescan_plan: Option<ScanPlan>,
 }
@@ -306,9 +310,21 @@ impl MssqlFdwRq {
         use pgrx::list::List;
         use pgrx::memcx::current_context;
         use std::ffi::{CStr, c_void};
+        use std::ptr;
 
         let mut ret = HashMap::new();
-        let umapping = unsafe { pg_sys::GetUserMapping(pg_sys::GetUserId(), server_oid) };
+        // GetUserMapping ereports "user mapping not found" when this user has
+        // no mapping for the server; a server whose conn_string carries the
+        // credentials must work without one (EXPLAIN included), so probe and
+        // degrade to no options (review 2026-09-18, P3). Only the
+        // undefined-object error is swallowed; anything else rethrows.
+        let umapping = pgrx::PgTryBuilder::new(|| unsafe {
+            pg_sys::GetUserMapping(pg_sys::GetUserId(), server_oid)
+        })
+        .catch_when(pgrx::PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT, |_| {
+            ptr::null_mut()
+        })
+        .execute();
         if umapping.is_null() {
             return ret;
         }
@@ -509,7 +525,8 @@ impl MssqlFdwRq {
         params: Vec<Box<dyn tiberius::ToSql>>,
     ) -> MssqlFdwRqResult<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>
     {
-        use futures_util::StreamExt;
+        use futures_util::{FutureExt, StreamExt};
+        use std::panic::AssertUnwindSafe;
 
         const CHANNEL_CAPACITY: usize = 256;
 
@@ -527,7 +544,12 @@ impl MssqlFdwRq {
                 }
             );
         }
-        pool::runtime().spawn(async move {
+        // Surface a panic inside the query task as a query error instead of
+        // a silently empty result: tokio's task harness swallows panics, the
+        // channel then just closes, and iter_scan would report "no rows"
+        // (review 2026-09-18, P1-3).
+        let panic_tx = tx.clone();
+        let query_task = async move {
             loop {
                 let (mut client, reused) = match leased.take() {
                     Some(conn) => (conn, true),
@@ -568,6 +590,20 @@ impl MssqlFdwRq {
                 // fully drained: safe for the next query
                 pool::release(&pool_key, client);
                 return;
+            }
+        };
+        pool::runtime().spawn(async move {
+            if let Err(panic) = FutureExt::catch_unwind(AssertUnwindSafe(query_task)).await {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                let _ = panic_tx
+                    .send(Err(tiberius::error::Error::from(std::io::Error::other(
+                        format!("mssql_fdw_rq: query task panicked: {message}"),
+                    ))))
+                    .await;
             }
         });
         Ok(rx)
@@ -617,6 +653,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             log_remote_query,
             rx: None,
             tgt_cols: Vec::new(),
+            column_positions: None,
             rescan_plan: None,
         })
     }
@@ -704,6 +741,14 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
         // GetForeignJoinPaths/GetForeignUpperPaths as one unit, so a remote
         // plan would never be built and Require would turn into a hard error)
         // keep the planner free to decompose.
+        if context.has_row_marks {
+            // SELECT FOR UPDATE/SHARE: PostgreSQL does not wrap FDW upper
+            // paths in LockRows, so a full-query plan would silently drop
+            // the locking semantics; stay on the base-scan path where
+            // PostgreSQL applies its standard foreign-table row marking
+            // (review 2026-09-18, P3)
+            return RemoteQueryPolicy::Optional;
+        }
         if context.all_referenced_relations_are_foreign && context.foreign_relations_share_server()
         {
             RemoteQueryPolicy::Require
@@ -778,6 +823,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             bind_remote_parameters(&tsql, &query.parameters)?;
 
         self.tgt_cols = query.columns.clone();
+        self.column_positions = None;
         self.rescan_plan = Some(ScanPlan::Remote {
             tsql: tsql.clone(),
             parameters: query.parameters.clone(),
@@ -821,6 +867,7 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .to_string();
 
         self.tgt_cols = columns.to_vec();
+        self.column_positions = None;
         self.rescan_plan = Some(ScanPlan::Plain {
             remote_schema: remote_schema.clone(),
             remote_table: remote_table.clone(),
@@ -839,17 +886,44 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
     }
 
     fn iter_scan(&mut self, row: &mut Row) -> MssqlFdwRqResult<Option<()>> {
-        // pull exactly one row from the streaming channel; the connection
-        // task stays parked until the next call
+        // Pull exactly one row from the streaming channel, polling for
+        // PostgreSQL interrupts while the remote side is slow: statement
+        // timeouts and pg_cancel_backend must take effect between rows even
+        // before MSSQL has produced the first one (review 2026-09-18, P1-1).
+        // The connection task stays parked between polls.
         let item = match self.rx.as_mut() {
-            Some(rx) => pool::runtime().block_on(rx.recv()),
+            Some(rx) => loop {
+                // the timeout future must be constructed inside the async
+                // block: `Sleep` grabs the runtime's timer handle eagerly in
+                // this tokio version, and evaluating it on the backend
+                // thread (outside `block_on`) panics with "there is no
+                // reactor running"
+                let item = pool::runtime().block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+                });
+                match item {
+                    Ok(item) => break item,
+                    Err(_poll_window_elapsed) => {
+                        // CHECK_FOR_INTERRUPTS: longjmps out of the scan when
+                        // a cancel arrived, otherwise a no-op
+                        if unsafe { pgrx::pg_sys::InterruptPending } != 0 {
+                            unsafe { pgrx::pg_sys::ProcessInterrupts() };
+                        }
+                    }
+                }
+            },
             None => return Ok(None),
         };
         match item {
             Some(Ok(src_row)) => {
+                // resolve the result-column mapping once per scan, on the
+                // first row (review 2026-09-18, P4)
+                let positions = self.column_positions.get_or_insert_with(|| {
+                    types::resolve_column_positions(&src_row, &self.tgt_cols)
+                });
                 let mut tgt_row = Row::new();
                 for (pos, tgt_col) in self.tgt_cols.iter().enumerate() {
-                    let cell = types::field_to_cell(&src_row, tgt_col, pos)?;
+                    let cell = types::field_to_cell(&src_row, tgt_col, positions[pos])?;
                     tgt_row.push(&tgt_col.name, cell);
                 }
                 row.replace_with(tgt_row);

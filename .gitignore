@@ -17,3 +17,7 @@ results/
 wrappers/results/
 wrappers/regression.*
 .venv/
+
+# vendored PostgreSQL sources kept for reference (review 2026-09-18 P5)
+/allpaths.c
+/prepunion.c
