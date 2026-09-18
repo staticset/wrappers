@@ -2429,10 +2429,57 @@ fn translate_like_operator(
     Ok(())
 }
 
-/// Parse an array constant in PostgreSQL output form: `'{v1,v2,…}'`. String
-/// elements are quoted with `"…"` (inner quotes doubled); NULL elements never
-/// satisfy `= ANY` / fail `<> ALL`, so they are dropped; boolean elements are
-/// printed as t/f. Anything not numeric, quoted, NULL or t/f is rejected.
+/// `[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?` — the exact shape PostgreSQL
+/// prints for numeric array elements (`123`, `-1.5`, `1e+30`). The deparser's
+/// own constant rule is a looser any-of `0-9+-eE.` scan, but that would also
+/// wave through `2026-01-01`, which must be treated as a string: as a bare
+/// T-SQL token a date would silently become subtraction.
+fn is_numeric_array_element(v: &str) -> bool {
+    let mut chars = v.chars().peekable();
+    if matches!(chars.peek(), Some('+') | Some('-')) {
+        chars.next();
+    }
+    let mut mantissa_digits = 0usize;
+    while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+        chars.next();
+        mantissa_digits += 1;
+    }
+    if chars.peek() == Some(&'.') {
+        chars.next();
+        while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+            chars.next();
+            mantissa_digits += 1;
+        }
+    }
+    if mantissa_digits == 0 {
+        return false;
+    }
+    if matches!(chars.peek(), Some('e') | Some('E')) {
+        chars.next();
+        if matches!(chars.peek(), Some('+') | Some('-')) {
+            chars.next();
+        }
+        let mut exponent_digits = 0usize;
+        while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+            chars.next();
+            exponent_digits += 1;
+        }
+        if exponent_digits == 0 {
+            return false;
+        }
+    }
+    chars.peek().is_none()
+}
+
+/// Parse an array constant in PostgreSQL output form: `'{v1,v2,…}'` — the
+/// deparser shape of a constant-folded IN-list (`x = ANY ('{…}'::type[])`).
+/// `array_out` quotes an element with `"…"` (inner quotes doubled) only when
+/// it has to: uuids, dates, enum labels and clean text words arrive as bare
+/// words, so those are rendered as T-SQL string literals (MSSQL converts the
+/// literal on comparison to uniqueidentifier, date, …). Strictly numeric
+/// elements pass through bare. NULL elements never satisfy `= ANY` / fail
+/// `<> ALL` only because T-SQL IN/NOT IN share PostgreSQL's three-valued
+/// semantics, so they stay in the list; booleans print as t/f.
 fn parse_array_literal(s: &str) -> Result<Vec<String>, TranslateError> {
     let t = s.trim();
     if !t.starts_with('{') || !t.ends_with('}') {
@@ -2498,17 +2545,18 @@ fn parse_array_literal(s: &str) -> Result<Vec<String>, TranslateError> {
                 "NULL" => items.push("NULL".to_string()),
                 "t" => items.push("1".to_string()),
                 "f" => items.push("0".to_string()),
-                v if !v.is_empty()
-                    && v.chars().all(|c| {
-                        c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')
-                    }) =>
-                {
+                v if !v.is_empty() && is_numeric_array_element(v) => {
                     items.push(v.to_string());
                 }
+                // bare word: uuid, date, enum label, clean text — a string
+                // literal compares correctly against every such column type
+                // (MSSQL converts it), while passing it through bare would
+                // turn `2026-01-01` into subtraction
+                v if !v.is_empty() => items.push(tsql_string_literal(v)),
                 other => {
                     return Err(TranslateError::UnsupportedConstruct {
                         sql_fragment: format!("'{{{other}}}'"),
-                        reason: "array constant contains an unsupported element".to_string(),
+                        reason: "array constant contains an empty element".to_string(),
                     });
                 }
             }

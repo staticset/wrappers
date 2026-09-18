@@ -1375,12 +1375,70 @@ mod unit {
 
     #[test]
     fn deparser_any_array_constant_strings() {
-        // PostgreSQL's array output always quotes string elements
+        // array_out quotes string elements only when they contain a space,
+        // quote, brace, comma or backslash (inner quotes doubled)
         assert_tsql(
             "SELECT id FROM public.dbo_orders \
              WHERE note = ANY ('{\"a\"\"b\",\"c\"}'::text[])",
             &orders_ctx(),
             "SELECT id FROM [dbo].[Orders] WHERE (note IN ('a\"b', 'c'))",
+        );
+    }
+
+    #[test]
+    fn deparser_any_array_constant_bare_words() {
+        // array_out leaves an element bare whenever it can: uuids, enum
+        // labels and clean text words arrive without any quotes. Production
+        // (DWH, 2026-09-18): `f.storageroomid = ANY('{cfb380e3-…,…}'::uuid[])`
+        // died on "array constant contains an unsupported element"
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE note = ANY ('{cfb380e3-2614-11ea-824a-0050569258a5,\
+dbb19de8-57d2-11f0-b512-00620b98e933}'::uuid[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] \
+             WHERE (note IN ('cfb380e3-2614-11ea-824a-0050569258a5', \
+'dbb19de8-57d2-11f0-b512-00620b98e933'))",
+        );
+        // clean text words arrive bare too; NULL keeps its IN/NOT IN role
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE note = ANY ('{active,pending}'::text[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note IN ('active', 'pending'))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE note <> ALL ('{active,NULL}'::text[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note NOT IN ('active', NULL))",
+        );
+        // one list can mix bare and "…"-quoted elements
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE note = ANY ('{active,\"pending x\"}'::text[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (note IN ('active', 'pending x'))",
+        );
+    }
+
+    #[test]
+    fn deparser_any_array_constant_dates_are_not_arithmetic() {
+        // `2026-01-01` survives the deparser's loose `0-9+-eE.` numeric scan
+        // but is a date: bare it would silently be subtraction in T-SQL, so
+        // it must be quoted; real numerics keep their bare form
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE order_date = ANY ('{2026-01-01,2026-01-29}'::date[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] \
+             WHERE (order_date IN ('2026-01-01', '2026-01-29'))",
+        );
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders \
+             WHERE amount = ANY ('{1.5e+3,-2}'::float8[])",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE (amount IN (1.5e+3, -2))",
         );
     }
 
@@ -2131,6 +2189,110 @@ mod tests {
         };
         assert_eq!(pg, mssql);
         assert_eq!(pg.len(), 4);
+    }
+
+    /// Fetch (name, total) pairs from rqjoin_test through dblink with a
+    /// real top-level statement, the only path the full-query translator
+    /// sees inside a #[pg_test].
+    fn dblink_pairs(sql: &str) -> Vec<(String, String)> {
+        Spi::connect(|c| {
+            let rows = c
+                .select(
+                    &format!(
+                        "SELECT * FROM dblink(\
+                             format('host=localhost port=%s dbname=rqjoin_test', \
+                                    current_setting('port')), \
+                             $q${sql}$q$) AS t(name text, total text)"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap();
+            let mut v: Vec<(String, String)> = rows
+                .filter_map(|r| {
+                    let name = r.get_by_name::<&str, _>("name").unwrap().map(str::to_owned);
+                    let total = r
+                        .get_by_name::<&str, _>("total")
+                        .unwrap()
+                        .map(str::to_owned);
+                    name.zip(total)
+                })
+                .collect();
+            v.sort();
+            v
+        })
+    }
+
+    // 2026-09-18 DWH incident: a widget filter `f.storageroomid IN (23 uuid
+    // literals)` const-folds to `= ANY('{uuid,…}'::uuid[])`, and array_out
+    // leaves uuid elements bare — the translator rejected the first bare
+    // non-numeric element and the whole widget died. Bare words must render
+    // as string literals (MSSQL converts them to uniqueidentifier).
+    #[pg_test]
+    fn uuid_in_list_array_constant_pushes_down() {
+        setup_committed();
+
+        // two real customer ids (NEWID() seed): customers with code 1 and 2
+        let ids: Vec<String> = Spi::connect(|c| {
+            c.select(
+                "SELECT id FROM dblink(\
+                     format('host=localhost port=%s dbname=rqjoin_test', \
+                            current_setting('port')), \
+                     $$SELECT id::text FROM rqj_customers \
+                       WHERE code IN (1, 2) ORDER BY code$$\
+                 ) AS t(id text)",
+                None,
+                &[],
+            )
+            .unwrap()
+            .filter_map(|r| r.get_by_name::<&str, _>("id").unwrap().map(str::to_owned))
+            .collect()
+        });
+        assert_eq!(ids.len(), 2, "seed must provide customers 1 and 2");
+        let (u1, u2) = (&ids[0], &ids[1]);
+
+        let pg = dblink_pairs(&format!(
+            "SELECT c.name AS name, COUNT(*)::text AS total \
+             FROM rqj_orders o JOIN rqj_customers c ON o.customer_id = c.id \
+             WHERE o.customer_id IN ('{u1}', '{u2}') \
+             GROUP BY c.name ORDER BY c.name"
+        ));
+        let mssql = mssql_direct(&format!(
+            "SELECT c.name AS name, CAST(COUNT(*) AS nvarchar(20)) AS total \
+             FROM dbo.orders o JOIN dbo.customers c ON o.customer_id = c.id \
+             WHERE o.customer_id IN ('{u1}', '{u2}') \
+             GROUP BY c.name ORDER BY c.name"
+        ));
+        assert_eq!(pg, mssql);
+        // seed: customer code = (n % 25) + 1 → code 1 owns orders 25, 50;
+        // code 2 owns orders 1, 26, 51
+        assert_eq!(pg.len(), 2);
+    }
+
+    // Same deparser shape with date elements: `{2026-01-10,…}'::date[]` —
+    // the elements pass the deparser's loose numeric scan, but as bare
+    // T-SQL tokens they would silently be subtraction (2026-01-10 = 2015).
+    // They must ship quoted and compare as dates.
+    #[pg_test]
+    fn date_in_list_array_constant_pushes_down() {
+        setup_committed();
+
+        let pg = dblink_pairs(
+            "SELECT c.name AS name, COUNT(*)::text AS total \
+             FROM rqj_orders o JOIN rqj_customers c ON o.customer_id = c.id \
+             WHERE o.order_date IN (DATE '2026-01-10', DATE '2026-01-19') \
+             GROUP BY c.name ORDER BY c.name",
+        );
+        let mssql = mssql_direct(
+            "SELECT c.name AS name, CAST(COUNT(*) AS nvarchar(20)) AS total \
+             FROM dbo.orders o JOIN dbo.customers c ON o.customer_id = c.id \
+             WHERE o.order_date IN ('2026-01-10', '2026-01-19') \
+             GROUP BY c.name ORDER BY c.name",
+        );
+        assert_eq!(pg, mssql);
+        // seed: order_date = 2026-(1+n%9)-(1+n%28) → 2026-01-10 is n=9,
+        // 2026-01-19 is n=18 — two orders, two distinct customers
+        assert_eq!(pg.len(), 2);
     }
 
     #[pg_test]
