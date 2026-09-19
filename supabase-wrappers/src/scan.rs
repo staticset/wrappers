@@ -350,8 +350,16 @@ unsafe fn drop_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
     drop(boxed_fdw_state);
 }
 
-/// Type-erased drop function for a registered live FdwState.
-type ErasedStateDrop = unsafe fn(*mut c_void);
+/// One registered live FdwState: the stored pointer, the `node->fdw_state`
+/// slot it is stored in, and the type-erased drop. The slot must be nulled
+/// before the Box is dropped on abort — PostgreSQL's error-path estate
+/// teardown still runs ExecutorEnd (through FreeExecutorState →
+/// ExecEndNode), and a dangling fdw_state there is a double free.
+struct RegisteredFdwState {
+    slot: *mut *mut c_void,
+    ptr: *mut c_void,
+    drop_fn: unsafe fn(*mut c_void),
+}
 
 thread_local! {
     /// FdwState pointers alive in this backend. An ereport longjmp past
@@ -359,7 +367,7 @@ thread_local! {
     /// parked streaming tasks); the transaction callback registered below
     /// drops everything still registered when the transaction aborts
     /// (review 2026-09-18, P1-2).
-    static LIVE_FDW_STATES: std::cell::RefCell<Vec<(*mut c_void, ErasedStateDrop)>> =
+    static LIVE_FDW_STATES: std::cell::RefCell<Vec<RegisteredFdwState>> =
         std::cell::RefCell::new(Vec::new());
     static XACT_CALLBACK_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -367,18 +375,25 @@ thread_local! {
 /// Track a freshly stored FdwState for abort-time cleanup.
 ///
 /// # Safety
-/// `ptr` must be the Box::into_raw pointer stored in `node->fdw_state`, and
-/// every drop of that Box must go through [`drop_fdw_state`].
+/// `ptr` must be the Box::into_raw pointer stored in `*slot`
+/// (`&mut (*node).fdw_state`), and every drop of that Box must go through
+/// [`drop_fdw_state`].
 unsafe fn register_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
+    slot: *mut *mut c_void,
     ptr: *mut FdwState<E, W>,
 ) {
     unsafe fn erased_drop<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(raw: *mut c_void) {
         // SAFETY: raw is the Box::into_raw pointer register_fdw_state stored.
         unsafe { drop_fdw_state(raw as *mut FdwState<E, W>) };
     }
-    XACT_CALLBACK_REGISTERED.with(|registered| {
-        if !registered.get() {
-            registered.set(true);
+    let registered = RegisteredFdwState {
+        slot,
+        ptr: ptr.cast(),
+        drop_fn: erased_drop::<E, W>,
+    };
+    XACT_CALLBACK_REGISTERED.with(|flag| {
+        if !flag.get() {
+            flag.set(true);
             unsafe {
                 pg_sys::RegisterXactCallback(
                     Some(drop_live_fdw_states_on_abort),
@@ -391,24 +406,30 @@ unsafe fn register_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
             }
         }
     });
-    LIVE_FDW_STATES.with_borrow_mut(|states| states.push((ptr.cast(), erased_drop::<E, W>)));
+    LIVE_FDW_STATES.with_borrow_mut(|states| states.push(registered));
 }
 
 fn deregister_fdw_state(ptr: *mut c_void) {
     LIVE_FDW_STATES.with_borrow_mut(|states| {
-        if let Some(pos) = states.iter().position(|(p, _)| *p == ptr) {
+        if let Some(pos) = states.iter().position(|s| s.ptr == ptr) {
             states.swap_remove(pos);
         }
     });
 }
 
-/// Drain the registry, dropping every leaked state. Dropping releases the
-/// Box (closing sockets the state owns) and closes its streaming channels —
-/// parked tasks then finish on the next runtime drive.
+/// Drain the registry, dropping every leaked state. The `node->fdw_state`
+/// slot is nulled FIRST: PostgreSQL's error-path estate teardown still runs
+/// ExecutorEnd, which would otherwise double-free the Box. Dropping
+/// releases the Box (closing sockets the state owns) and closes its
+/// streaming channels — parked tasks then finish on the next runtime drive.
 fn drop_registered_fdw_states() {
     LIVE_FDW_STATES.with_borrow_mut(|states| {
-        for (ptr, drop_fn) in states.drain(..) {
-            unsafe { drop_fn(ptr) };
+        for state in states.drain(..) {
+            // SAFETY: the slot is &mut (*node).fdw_state captured at
+            // registration; the node outlives transaction abort.
+            unsafe { *state.slot = ptr::null_mut() };
+            // SAFETY: state.ptr is the Box::into_raw pointer of the state.
+            unsafe { (state.drop_fn)(state.ptr) };
         }
     });
 }
@@ -2373,7 +2394,8 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         }
 
         (*node).fdw_state = state.into_pg() as _;
-        register_fdw_state((*node).fdw_state as *mut FdwState<E, W>);
+        let state_ptr = (*node).fdw_state as *mut FdwState<E, W>;
+        register_fdw_state((&mut (*node).fdw_state) as *mut _, state_ptr);
     }
 }
 
