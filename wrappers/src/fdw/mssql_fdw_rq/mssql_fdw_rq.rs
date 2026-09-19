@@ -904,10 +904,14 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                 match item {
                     Ok(item) => break item,
                     Err(_poll_window_elapsed) => {
-                        // CHECK_FOR_INTERRUPTS: longjmps out of the scan when
-                        // a cancel arrived, otherwise a no-op
+                        // CHECK_FOR_INTERRUPTS equivalent without the
+                        // longjmp: a bare ProcessInterrupts() ereports from
+                        // a non-"C-unwind" Rust frame and aborts the backend
+                        // ("failed to initiate panic" → SIGABRT), so surface
+                        // the interrupt as a normal query error and let the
+                        // executor unwind through Rust frames cleanly
                         if unsafe { pgrx::pg_sys::InterruptPending } != 0 {
-                            unsafe { pgrx::pg_sys::ProcessInterrupts() };
+                            return Err(MssqlFdwRqError::QueryCanceled);
                         }
                     }
                 }

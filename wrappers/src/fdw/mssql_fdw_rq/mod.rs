@@ -48,6 +48,9 @@ pub(super) enum MssqlFdwRqError {
 
     #[error("mssql_fdw_rq: {0}")]
     IoError(#[from] std::io::Error),
+
+    #[error("mssql_fdw_rq: query was canceled (statement timeout or pg_cancel_backend)")]
+    QueryCanceled,
 }
 
 impl From<MssqlFdwRqError> for ErrorReport {
