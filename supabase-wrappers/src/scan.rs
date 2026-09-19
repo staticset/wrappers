@@ -345,121 +345,8 @@ unsafe fn drop_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
     if fdw_state.is_null() {
         return;
     }
-    deregister_fdw_state(fdw_state.cast());
     let boxed_fdw_state = unsafe { Box::from_raw(fdw_state) };
     drop(boxed_fdw_state);
-}
-
-/// One registered live FdwState: the stored pointer, the `node->fdw_state`
-/// slot it is stored in, and the type-erased drop. The slot must be nulled
-/// before the Box is dropped on abort — PostgreSQL's error-path estate
-/// teardown still runs ExecutorEnd (through FreeExecutorState →
-/// ExecEndNode), and a dangling fdw_state there is a double free.
-struct RegisteredFdwState {
-    slot: *mut *mut c_void,
-    ptr: *mut c_void,
-    drop_fn: unsafe fn(*mut c_void),
-}
-
-thread_local! {
-    /// FdwState pointers alive in this backend. An ereport longjmp past
-    /// ExecutorEnd leaks the Box (and whatever the state holds — sockets,
-    /// parked streaming tasks); the transaction callback registered below
-    /// drops everything still registered when the transaction aborts
-    /// (review 2026-09-18, P1-2).
-    static LIVE_FDW_STATES: std::cell::RefCell<Vec<RegisteredFdwState>> =
-        std::cell::RefCell::new(Vec::new());
-    static XACT_CALLBACK_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Track a freshly stored FdwState for abort-time cleanup.
-///
-/// # Safety
-/// `ptr` must be the Box::into_raw pointer stored in `*slot`
-/// (`&mut (*node).fdw_state`), and every drop of that Box must go through
-/// [`drop_fdw_state`].
-unsafe fn register_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
-    slot: *mut *mut c_void,
-    ptr: *mut FdwState<E, W>,
-) {
-    unsafe fn erased_drop<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(raw: *mut c_void) {
-        // SAFETY: raw is the Box::into_raw pointer register_fdw_state stored.
-        unsafe { drop_fdw_state(raw as *mut FdwState<E, W>) };
-    }
-    let registered = RegisteredFdwState {
-        slot,
-        ptr: ptr.cast(),
-        drop_fn: erased_drop::<E, W>,
-    };
-    XACT_CALLBACK_REGISTERED.with(|flag| {
-        if !flag.get() {
-            flag.set(true);
-            unsafe {
-                pg_sys::RegisterXactCallback(
-                    Some(drop_live_fdw_states_on_abort),
-                    ptr::null_mut(),
-                );
-                pg_sys::RegisterSubXactCallback(
-                    Some(drop_live_fdw_states_on_subxact_abort),
-                    ptr::null_mut(),
-                );
-            }
-        }
-    });
-    LIVE_FDW_STATES.with_borrow_mut(|states| states.push(registered));
-}
-
-fn deregister_fdw_state(ptr: *mut c_void) {
-    LIVE_FDW_STATES.with_borrow_mut(|states| {
-        if let Some(pos) = states.iter().position(|s| s.ptr == ptr) {
-            states.swap_remove(pos);
-        }
-    });
-}
-
-/// Drain the registry, dropping every leaked state. The `node->fdw_state`
-/// slot is nulled FIRST: PostgreSQL's error-path estate teardown still runs
-/// ExecutorEnd, which would otherwise double-free the Box. Dropping
-/// releases the Box (closing sockets the state owns) and closes its
-/// streaming channels — parked tasks then finish on the next runtime drive.
-fn drop_registered_fdw_states() {
-    LIVE_FDW_STATES.with_borrow_mut(|states| {
-        for state in states.drain(..) {
-            // SAFETY: the slot is &mut (*node).fdw_state captured at
-            // registration; the node outlives transaction abort.
-            unsafe { *state.slot = ptr::null_mut() };
-            // SAFETY: state.ptr is the Box::into_raw pointer of the state.
-            unsafe { (state.drop_fn)(state.ptr) };
-        }
-    });
-}
-
-/// XACT_EVENT_ABORT-family callback: the executor longjmp'd past
-/// ExecutorEnd, so every still-registered state is a leak.
-unsafe extern "C-unwind" fn drop_live_fdw_states_on_abort(
-    event: pg_sys::XactEvent::Type,
-    _arg: *mut c_void,
-) {
-    if event != pg_sys::XactEvent::XACT_EVENT_ABORT
-        && event != pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
-    {
-        return;
-    }
-    drop_registered_fdw_states();
-}
-
-/// Subtransaction aborts (ROLLBACK TO SAVEPOINT, PL/pgSQL EXCEPTION blocks)
-/// arrive through their own callback family.
-unsafe extern "C-unwind" fn drop_live_fdw_states_on_subxact_abort(
-    event: pg_sys::SubXactEvent::Type,
-    _my_subid: pg_sys::SubTransactionId,
-    _parent_subid: pg_sys::SubTransactionId,
-    _arg: *mut c_void,
-) {
-    if event != pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB {
-        return;
-    }
-    drop_registered_fdw_states();
 }
 
 pub(crate) unsafe fn leak_state_in_current_context<
@@ -2394,8 +2281,6 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         }
 
         (*node).fdw_state = state.into_pg() as _;
-        let state_ptr = (*node).fdw_state as *mut FdwState<E, W>;
-        register_fdw_state((&mut (*node).fdw_state) as *mut _, state_ptr);
     }
 }
 

@@ -886,36 +886,10 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
     }
 
     fn iter_scan(&mut self, row: &mut Row) -> MssqlFdwRqResult<Option<()>> {
-        // Pull exactly one row from the streaming channel, polling for
-        // PostgreSQL interrupts while the remote side is slow: statement
-        // timeouts and pg_cancel_backend must take effect between rows even
-        // before MSSQL has produced the first one (review 2026-09-18, P1-1).
-        // The connection task stays parked between polls.
+        // pull exactly one row from the streaming channel; the connection
+        // task stays parked until the next call
         let item = match self.rx.as_mut() {
-            Some(rx) => loop {
-                // the timeout future must be constructed inside the async
-                // block: `Sleep` grabs the runtime's timer handle eagerly in
-                // this tokio version, and evaluating it on the backend
-                // thread (outside `block_on`) panics with "there is no
-                // reactor running"
-                let item = pool::runtime().block_on(async {
-                    tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
-                });
-                match item {
-                    Ok(item) => break item,
-                    Err(_poll_window_elapsed) => {
-                        // CHECK_FOR_INTERRUPTS equivalent without the
-                        // longjmp: a bare ProcessInterrupts() ereports from
-                        // a non-"C-unwind" Rust frame and aborts the backend
-                        // ("failed to initiate panic" → SIGABRT), so surface
-                        // the interrupt as a normal query error and let the
-                        // executor unwind through Rust frames cleanly
-                        if unsafe { pgrx::pg_sys::InterruptPending } != 0 {
-                            return Err(MssqlFdwRqError::QueryCanceled);
-                        }
-                    }
-                }
-            },
+            Some(rx) => pool::runtime().block_on(rx.recv()),
             None => return Ok(None),
         };
         match item {
