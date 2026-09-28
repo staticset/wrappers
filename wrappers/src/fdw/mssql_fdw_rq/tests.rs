@@ -36,6 +36,28 @@ mod unit {
         assert_eq!(actual, expected, "input: {sql}");
     }
 
+    // 2026-09-28 (bridge, use_remote_estimate): postgres_fdw deparses the
+    // pushed aggregate with the sort attached — `GROUP BY 2 ORDER BY
+    // sum(col) DESC NULLS FIRST`. The aggregate sort key must survive
+    // translation with its NULL tiebreaker (a dispatched T-SQL once looked
+    // like the clause was lost — that run had simply planned the local-Sort
+    // variant, but the remote-sort form is equally reachable and must be
+    // faithful).
+    #[test]
+    fn order_by_aggregate_desc_nulls_first() {
+        assert_tsql(
+            "SELECT sum(r2.amount), r3.name FROM public.dbo_orders r2 \
+             JOIN public.dbo_customers r3 ON r2.customer_id = r3.id \
+             GROUP BY 2 ORDER BY sum(r2.amount) DESC NULLS FIRST",
+            &two_tables_ctx(),
+            "SELECT sum(r2.amount), r3.name FROM [dbo].[Orders] r2 \
+             JOIN [dbo].[Customers] r3 ON r2.customer_id = r3.id \
+             GROUP BY r3.name \
+             ORDER BY CASE WHEN sum ( [r2] . [amount] ) IS NULL THEN 1 ELSE 0 END DESC, \
+             sum ( [r2] . [amount] ) DESC",
+        );
+    }
+
     fn assert_unsupported(sql: &str, ctx: &TranslateContext, fragment: &str) {
         match translate(sql, ctx) {
             Err(TranslateError::UnsupportedConstruct { sql_fragment, .. }) => assert!(
