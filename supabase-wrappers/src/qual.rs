@@ -188,9 +188,19 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 ),
                                 None,
                             )
-                        } else if is_a(right, pg_sys::NodeTag::T_Param) {
-                            // add a dummy value if this is query parameter, the actual value
-                            // will be extracted from execution state
+                        } else if is_a(right, pg_sys::NodeTag::T_Param)
+                            && (*(right as *mut pg_sys::Param)).paramkind
+                                == pg_sys::ParamKind::PARAM_EXTERN
+                        {
+                            // external statement parameter ($1, $2, …): add a
+                            // dummy value, the actual one will be extracted
+                            // from execution state. Internal executor
+                            // parameters (PARAM_EXEC/SQ/MULTIEXPR — sublinks
+                            // and subplans) are deliberately not pushed: they
+                            // are not evaluable at plan time, and decoding the
+                            // unevaluated datum fail-closes the statement —
+                            // postgres_fdw's use_remote_estimate probes ship
+                            // exactly that shape. They stay local filters.
                             let right = right as *mut pg_sys::Param;
                             let param = Param {
                                 kind: (*right).paramkind,
@@ -198,11 +208,7 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 type_oid: (*right).paramtype,
                                 eval_value: Mutex::new(None).into(),
                                 expr_eval: ExprEval {
-                                    expr: if (*right).paramkind == pg_sys::ParamKind::PARAM_EXEC {
-                                        right as _
-                                    } else {
-                                        ptr::null_mut()
-                                    },
+                                    expr: ptr::null_mut(),
                                     expr_state: ptr::null_mut(),
                                 },
                             };

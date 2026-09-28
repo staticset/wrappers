@@ -2693,6 +2693,54 @@ mod tests {
         assert_eq!(pg2[0].1, "100");
     }
 
+    // 2026-09-28 (customer bridge, postgres_fdw use_remote_estimate): its
+    // join-cost probes arrive on the DWH side as
+    // `EXPLAIN … WHERE col = ((SELECT null::T)::T)` — a SubLink standing in
+    // for the other relation's variable. That shape used to reach the
+    // full-query path and segfault the backend inside pg_get_querydef
+    // (gdb: full_query_sql_from_planner → pg_get_querydef, SIGSEGV in
+    // ruleutils). Sublink statements now stay local over plain scans: the
+    // probe EXPLAIN must answer, and a sublink query must return correct
+    // rows with the backend alive.
+    #[pg_test]
+    fn sublink_statement_serves_locally_without_crash() {
+        setup();
+
+        // the postgres_fdw probe shape, with an extractable qual beside the
+        // sublink one so the statement cannot collapse to a qual-only scan
+        Spi::run(
+            "EXPLAIN SELECT id, status FROM rq_orders \
+             WHERE ((status = ((SELECT null::text)::text))) \
+               AND ((total_amount > 0::numeric))",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn sublink_qual_query_returns_correct_rows() {
+        setup_committed();
+
+        // a sublink the planner keeps: served locally, rows correct (order 1
+        // is the only one with id = 1). Runs through dblink into the
+        // committed rqjoin_test database — reading the result of an
+        // InitPlan-carrying statement through SPI inside a #[pg_test] trips a
+        // pgrx framework quirk (InvalidPosition / "cache lookup failed for
+        // type 0"), same class as prepared_statement_parameter
+        let test_conn = Spi::get_one::<String>(
+            "SELECT format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))",
+        )
+        .unwrap()
+        .unwrap();
+        let id: String = Spi::get_one(&format!(
+            "SELECT * FROM dblink('{test_conn}', \
+             $$SELECT id::text AS id FROM rqj_orders WHERE id = (SELECT 1::bigint)$$) \
+             AS t(id text)"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(id, "1");
+    }
+
     #[pg_test]
     fn prepared_statement_parameter() {
         setup_committed();

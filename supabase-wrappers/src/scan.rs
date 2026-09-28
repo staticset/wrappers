@@ -1175,6 +1175,24 @@ pub(crate) unsafe fn query_requires_full_query(root: *mut pg_sys::PlannerInfo) -
     }
 }
 
+/// The query still carries a SubLink (`WHERE col = (SELECT …)`). Deparsing
+/// such a tree with `pg_get_querydef()` mid-planning segfaults the backend
+/// (gdb 2026-09-28: `full_query_sql_from_planner` → `pg_get_querydef`,
+/// SIGSEGV inside ruleutils), and postgres_fdw's `use_remote_estimate` join
+/// probes are exactly this shape — `WHERE col = ((SELECT null::T)::T)`
+/// placeholders standing in for the other relations' variables. Full-query
+/// paths must not be built (nor required) for sublink queries: they are
+/// served locally over plain scans, which is also all a probing postgres_fdw
+/// needs when estimating a fetch.
+pub(crate) unsafe fn query_has_sublinks(root: *mut pg_sys::PlannerInfo) -> bool {
+    unsafe {
+        if root.is_null() || (*root).parse.is_null() {
+            return false;
+        }
+        (*(*root).parse).hasSubLinks
+    }
+}
+
 /// The query carries `FOR UPDATE`/`FOR SHARE` row marks. PostgreSQL does not
 /// wrap an FDW upper path in LockRows, so a full-query plan would silently
 /// drop the locking semantics — the FDW sees this flag and stays on the
@@ -1360,6 +1378,10 @@ pub(super) extern "C-unwind" fn get_foreign_join_paths<
         // of foreign base relations in the query. A partial join path would let
         // PostgreSQL perform some of the query locally, which breaks wrappers
         // that require full remote execution.
+        if query_has_sublinks(root) {
+            debug2!("get_foreign_join_paths: query carries a sublink — serving locally");
+            return;
+        }
         let Some((query_relids, relations)) = query_foreign_relations(root) else {
             debug2!("get_foreign_join_paths: query has non-foreign inputs");
             return;
@@ -1571,9 +1593,10 @@ pub(super) extern "C-unwind" fn get_foreign_rel_size<
         // query. Do not require one: PostgreSQL must stay free to execute
         // locally over per-table plain scans instead of failing with
         // "remote-query execution is required".
-        let remote_path_constructible = !remote_sql_requires_top_statement(root)
-            || query_foreign_relations(root)
-                .is_none_or(|(_, rels)| top_statement_mentions_relations(root, &rels));
+        let remote_path_constructible = !query_has_sublinks(root)
+            && (!remote_sql_requires_top_statement(root)
+                || query_foreign_relations(root)
+                    .is_none_or(|(_, rels)| top_statement_mentions_relations(root, &rels)));
         state.requires_full_query = state.remote_query_policy.wants_remote_query()
             && remote_query_context.requires_remote_query_shape()
             && remote_query_context.all_referenced_relations_are_foreign

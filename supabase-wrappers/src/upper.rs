@@ -11,9 +11,9 @@ use crate::interface::{Aggregate, AggregateKind, Column, RemoteQueryPolicy};
 use crate::prelude::ForeignDataWrapper;
 use crate::scan::{
     FdwState, full_query_placeholder_from_planner, leak_state_in_current_context,
-    query_requires_full_query, remote_query_context_from_planner, remote_query_local_path_penalty,
-    remote_sql_requires_top_statement, target_columns_from_reltarget,
-    top_statement_mentions_relations,
+    query_has_sublinks, query_requires_full_query, remote_query_context_from_planner,
+    remote_query_local_path_penalty, remote_sql_requires_top_statement,
+    target_columns_from_reltarget, top_statement_mentions_relations,
 };
 
 /// Helper to iterate over a pg_sys::List using raw pointer access.
@@ -465,6 +465,15 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
     unsafe {
         if root.is_null() || input_rel.is_null() || output_rel.is_null() {
             debug2!("add_full_query_upper_path: missing planner relation state");
+            return false;
+        }
+
+        // Sublink-carrying queries must stay local: deparsing them with
+        // pg_get_querydef() mid-planning crashes the backend (postgres_fdw's
+        // use_remote_estimate probes are exactly that shape). See
+        // scan::query_has_sublinks.
+        if query_has_sublinks(root) {
+            debug2!("add_full_query_upper_path: query carries a sublink — serving locally");
             return false;
         }
 
