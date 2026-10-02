@@ -1418,13 +1418,17 @@ pub(super) extern "C-unwind" fn get_foreign_join_paths<
         // construction failure degrades to "no remote path": the base scans
         // of this query already built their instances, so a second failed
         // attempt (e.g. a transient vault read) must not fail planning of a
-        // query that can still run locally
+        // query that can still run locally. The context was already created
+        // as a child of WrappersRoot (under CacheMemoryContext) — delete it
+        // or it leaks for the rest of the session on every failed planning
+        // (review 2026-09-28, MEDIUM-10)
         let mut state = match FdwState::<E, W>::try_new(first_relation.relid, ctx) {
             Ok(state) => state,
             Err(_) => {
                 debug2!(
                     "get_foreign_join_paths: FDW instance construction failed — serving locally"
                 );
+                pg_sys::MemoryContextDelete(ctx);
                 return;
             }
         };

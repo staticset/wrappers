@@ -2448,6 +2448,49 @@ mod tests {
         );
     }
 
+    // 2026-10-02 round 9 (review 2026-09-28, HIGH-2 + MEDIUM-10): a
+    // construction failure on the upper paths must degrade coherently — a
+    // deterministic misconfiguration fails the GROUP_AGG and the FINAL
+    // constructions alike, no intermediate full-query path is added, and the
+    // query surfaces the configuration error itself instead of reaching
+    // execution as "remote-query execution must reach the final upper
+    // relation". The failed constructions must also not leak their memory
+    // contexts (children of WrappersRoot live until session end).
+    #[pg_test]
+    fn aggregate_over_misconfigured_server_errors_clearly() {
+        setup();
+        Spi::run(&format!(
+            "CREATE SERVER mssql_rq_srv_badagg FOREIGN DATA WRAPPER mssql_fdw_rq_fwd \
+             OPTIONS (conn_string '{};User ID=sa;Password={}', connect_timeout 'soon')",
+            mssql_conn_string(),
+            mssql_password()
+        ))
+        .unwrap();
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_badagg (id bigint, amount numeric(18,2)) \
+             SERVER mssql_rq_srv_badagg OPTIONS (schema 'dbo', table 'orders')",
+        )
+        .unwrap();
+
+        // several failing plannings, each through the join/upper try_new path
+        for _ in 0..3 {
+            let message = pg_error_message("SELECT sum(amount) FROM rq_badagg ORDER BY 1");
+            assert!(
+                message.contains("whole number of seconds"),
+                "got: {message:?}"
+            );
+        }
+
+        let leaked: i64 = Spi::get_one(
+            "SELECT count(*) FROM pg_backend_memory_contexts \
+             WHERE name LIKE 'Wrappers_full_query_upper%' \
+                OR name LIKE 'Wrappers_full_query_join%'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(leaked, 0, "failed constructions must delete their contexts");
+    }
+
     // 2026-10-02 round 9 (review 2026-09-28, MEDIUM-5): the full-query
     // pushdown inlines numeric Consts as `'…'::numeric`; the old fixed
     // numeric(38,10) cast rounded a 12-decimal literal to 10 decimals, so

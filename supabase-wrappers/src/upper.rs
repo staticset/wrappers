@@ -582,13 +582,38 @@ unsafe fn add_full_query_upper_path<E: Into<ErrorReport>, W: ForeignDataWrapper<
         );
         let ctx = crate::memctx::create_wrappers_memctx(&ctx_name);
         // like the join path: a construction failure degrades to "no remote
-        // path" instead of ereporting at planning time
+        // path" instead of ereporting at planning time. On the FINAL stage one
+        // retry is attempted first: a transient construction failure there is
+        // the dangerous kind — the intermediate upper paths of this same
+        // query (GROUP_AGG and friends, full_query_executable=false) were
+        // already added by successful constructions, they price cheaper than
+        // the penalized local paths, and executing one ends in
+        // "remote-query execution must reach the final upper relation"
+        // instead of a valid plan (review 2026-09-28, HIGH-2). A second
+        // failure still degrades: the planner then falls back to the fully
+        // local plan over base scans.
         let mut state = match FdwState::<E, W>::try_new(first_relation.relid, ctx) {
             Ok(state) => state,
+            Err(_) if is_final => {
+                debug2!(
+                    "add_full_query_upper_path: FINAL FDW instance construction failed — retrying once"
+                );
+                match FdwState::<E, W>::try_new(first_relation.relid, ctx) {
+                    Ok(state) => state,
+                    Err(_) => {
+                        debug2!(
+                            "add_full_query_upper_path: FDW instance construction failed — serving locally"
+                        );
+                        pg_sys::MemoryContextDelete(ctx);
+                        return false;
+                    }
+                }
+            }
             Err(_) => {
                 debug2!(
                     "add_full_query_upper_path: FDW instance construction failed — serving locally"
                 );
+                pg_sys::MemoryContextDelete(ctx);
                 return false;
             }
         };
