@@ -236,6 +236,52 @@ mod unit {
         );
     }
 
+    // 2026-10-02 round 9 (review 2026-09-28, MEDIUM-7): the NULL tiebreaker
+    // CASE is not a SELECT-list item, and under SELECT DISTINCT T-SQL
+    // requires every ORDER BY item to match the list (error 145) — the
+    // whole query failed on MSSQL with an opaque error. Nullable sort keys
+    // under DISTINCT are refused up front; NOT NULL keys need no tiebreaker
+    // and keep working.
+    #[test]
+    fn distinct_order_by_nullable_rejected() {
+        // status is nullable in orders_ctx (id is the NOT NULL one)
+        assert_unsupported(
+            "SELECT DISTINCT status FROM public.dbo_orders ORDER BY status",
+            &orders_ctx(),
+            "SELECT DISTINCT",
+        );
+        // ASC NULLS LAST needs the tiebreaker CASE — same rejection
+        assert_unsupported(
+            "SELECT DISTINCT status FROM public.dbo_orders ORDER BY status NULLS LAST",
+            &orders_ctx(),
+            "SELECT DISTINCT",
+        );
+        // DESC keeps PostgreSQL NULLS FIRST — still the tiebreaker CASE
+        assert_unsupported(
+            "SELECT DISTINCT status FROM public.dbo_orders ORDER BY status DESC",
+            &orders_ctx(),
+            "SELECT DISTINCT",
+        );
+        // ASC NULLS FIRST matches T-SQL's implicit rule — no CASE, legal
+        assert_tsql(
+            "SELECT DISTINCT status FROM public.dbo_orders ORDER BY status NULLS FIRST",
+            &orders_ctx(),
+            "SELECT DISTINCT status FROM [dbo].[Orders] ORDER BY [status]",
+        );
+        // a NOT NULL column sorts without a tiebreaker — legal under DISTINCT
+        assert_tsql(
+            "SELECT DISTINCT id FROM public.dbo_orders ORDER BY id DESC",
+            &orders_ctx(),
+            "SELECT DISTINCT id FROM [dbo].[Orders] ORDER BY [id] DESC",
+        );
+        // NULLS LAST on DESC matches T-SQL's implicit rule — no CASE needed
+        assert_tsql(
+            "SELECT DISTINCT id FROM public.dbo_orders ORDER BY id DESC NULLS LAST",
+            &orders_ctx(),
+            "SELECT DISTINCT id FROM [dbo].[Orders] ORDER BY [id] DESC",
+        );
+    }
+
     #[test]
     fn distinct_on_rejected() {
         assert_unsupported(
@@ -2399,6 +2445,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(id, 1, "only the row above the exact literal passes");
+    }
+
+    // 2026-10-02 round 9 (review 2026-09-28, MEDIUM-7): DISTINCT + ORDER BY
+    // on a nullable column reached MSSQL and died with its opaque error 145
+    // (the NULL tiebreaker CASE is not a SELECT-list item); the translator
+    // now refuses the form with a message that names the workaround
+    #[pg_test]
+    fn distinct_order_by_nullable_rejected_with_guidance() {
+        setup();
+        let message = pg_error_message("SELECT DISTINCT status FROM rq_orders ORDER BY status");
+        assert!(
+            message.contains("SELECT DISTINCT") && message.contains("error 145"),
+            "got: {message:?}"
+        );
     }
 
     /// The framework deparses the TOP-LEVEL statement for join queries, which

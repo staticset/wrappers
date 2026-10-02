@@ -704,6 +704,9 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     let mut depth = 0usize;
     let mut first_select_seen = false;
     let mut top_emitted = false;
+    // top-level SELECT DISTINCT: its ORDER BY items must match the SELECT
+    // list in T-SQL (error 145), which the NULL tiebreaker cannot
+    let mut select_distinct = false;
     // CASE ... END tracking: casts/ILIKE may not cross an open CASE
     let mut case_depth = 0usize;
     // current top-level clause: the deparser prints top-level AND-chains in
@@ -875,7 +878,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     "," if in_order && depth == 0 => {
                         // close the previous ORDER BY item, start the next
                         if !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                None,
+                                &declared_aliases,
+                                select_distinct,
+                            )?;
                             order_item_closed = true;
                         }
                         out.push(",".to_string());
@@ -1168,7 +1178,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // injected at the SELECT, otherwise the OFFSET/FETCH
                         // clause belongs at this position (right after ORDER BY)
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                None,
+                                &declared_aliases,
+                                select_distinct,
+                            )?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -1201,7 +1218,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             && limit_value_at(&toks, i + 2).is_some() =>
                     {
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                None,
+                                &declared_aliases,
+                                select_distinct,
+                            )?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -1225,7 +1249,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         // in canonical form, so consume everything analyze
                         // measured for this clause
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                None,
+                                &declared_aliases,
+                                select_distinct,
+                            )?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -1251,6 +1282,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         if let Some(Tok::Word(d)) = toks.get(i) {
                             if d.eq_ignore_ascii_case("distinct") {
                                 out.push("DISTINCT".to_string());
+                                select_distinct = true;
                                 i += 1;
                             }
                         }
@@ -1298,7 +1330,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     {
                         in_condition_clause = false;
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                None,
+                                &declared_aliases,
+                                select_distinct,
+                            )?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -1319,7 +1358,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         positional_list_active = false;
                         in_group_by = false;
                         if in_order && !order_item_closed {
-                            close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+                            close_order_item(
+                                &mut out,
+                                ctx,
+                                case_depth,
+                                None,
+                                &declared_aliases,
+                                select_distinct,
+                            )?;
                             order_item_closed = true;
                         }
                         in_order = false;
@@ -1346,6 +1392,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 case_depth,
                                 Some(desc),
                                 &declared_aliases,
+                                select_distinct,
                             )?;
                             order_item_closed = true;
                         }
@@ -1460,6 +1507,22 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             } else {
                                 expr
                             };
+                            // the tiebreaker CASE is not a SELECT-list item —
+                            // under DISTINCT T-SQL rejects it outright (145)
+                            if select_distinct {
+                                return Err(TranslateError::UnsupportedConstruct {
+                                    sql_fragment: format!(
+                                        "SELECT DISTINCT … ORDER BY {} NULLS …",
+                                        order_item_fragment(&out, start)
+                                    ),
+                                    reason: "under SELECT DISTINCT every ORDER BY item must \
+                                             match the SELECT list (T-SQL error 145), so the \
+                                             PostgreSQL NULL-ordering tiebreaker cannot be \
+                                             applied; sort by a NOT NULL column or remove \
+                                             DISTINCT"
+                                        .to_string(),
+                                });
+                            }
                             push_null_tiebreaker(&mut out, start, &expr, dir_desc);
                         } else {
                             // matches the T-SQL default: keep the plain term
@@ -1609,7 +1672,14 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
 
     // an ORDER BY list can end with the statement itself
     if in_order && !order_item_closed {
-        close_order_item(&mut out, ctx, case_depth, None, &declared_aliases)?;
+        close_order_item(
+            &mut out,
+            ctx,
+            case_depth,
+            None,
+            &declared_aliases,
+            select_distinct,
+        )?;
     }
 
     Ok(join_pieces(&out))
@@ -1698,7 +1768,23 @@ fn close_order_item(
     case_depth: usize,
     desc: Option<bool>,
     declared_aliases: &HashSet<String>,
+    select_distinct: bool,
 ) -> Result<(), TranslateError> {
+    /// The NULL tiebreaker cannot live under SELECT DISTINCT: T-SQL (error
+    /// 145) requires every ORDER BY item to match the SELECT list, and the
+    /// `CASE WHEN … IS NULL …` expression is not an item of it. Sorting
+    /// without it would silently apply T-SQL NULL ordering instead of
+    /// PostgreSQL's, so the query is refused (review 2026-09-28, MEDIUM-7).
+    fn distinct_tiebreaker_err(item: &str) -> TranslateError {
+        TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("SELECT DISTINCT … ORDER BY {item}"),
+            reason: "under SELECT DISTINCT every ORDER BY item must match the \
+                     SELECT list (T-SQL error 145), so the PostgreSQL NULL-ordering \
+                     tiebreaker cannot be applied; sort by a NOT NULL column, add the \
+                     expression to the SELECT list, or remove DISTINCT"
+                .to_string(),
+        }
+    }
     let start = capture_subject(out, case_depth)?;
     let expr = out[start..].join(" ");
     if !is_whole_order_item(out, start) {
@@ -1751,6 +1837,9 @@ fn close_order_item(
                     }
                     return Ok(());
                 }
+                if select_distinct {
+                    return Err(distinct_tiebreaker_err(&expr));
+                }
                 push_null_tiebreaker(out, start, &resolved, desc.unwrap_or(false));
                 return Ok(());
             }
@@ -1779,6 +1868,9 @@ fn close_order_item(
         return Ok(());
     }
 
+    if select_distinct {
+        return Err(distinct_tiebreaker_err(&expr));
+    }
     push_null_tiebreaker(out, start, &expr, desc.unwrap_or(false));
     Ok(())
 }
