@@ -32,6 +32,22 @@ fn conn_str_has_user(conn_str: &str) -> bool {
     })
 }
 
+/// Parse a whole-seconds network timeout server option (`connect_timeout`,
+/// `stream_idle_timeout`). `None` when absent; a present but malformed value
+/// is a configuration error rather than a silent default.
+fn timeout_option(
+    options: &HashMap<String, String>,
+    name: &str,
+) -> Option<MssqlFdwRqResult<std::time::Duration>> {
+    let raw = options.get(name)?;
+    Some(match raw.parse::<u64>() {
+        Ok(secs) => Ok(std::time::Duration::from_secs(secs)),
+        Err(_) => Err(MssqlFdwRqError::InvalidOption(format!(
+            "option '{name}' must be a whole number of seconds, got '{raw}'"
+        ))),
+    })
+}
+
 /// Map a PostgreSQL qual operator name to its T-SQL rendering; returns the
 /// whole predicate shape for the pattern operators (ILIKE needs LOWER on
 /// both sides, mirroring the full-query translator).
@@ -291,6 +307,14 @@ pub(crate) struct MssqlFdwRq {
     /// (resolved conn_string + user-mapping login)
     pool_key: pool::PoolKey,
     log_remote_query: bool,
+    /// Network bounds (review 2026-09-28, HIGH-1): without them a
+    /// black-holed WAN route parks the backend in an uninterruptible
+    /// `block_on` until pg_terminate. `connect_timeout` bounds TCP+login;
+    /// `stream_idle_timeout` bounds every wait for the server's next
+    /// response token — the first included, a server that accepted the
+    /// query but never answers is the same hang. `ZERO` disables a bound.
+    connect_timeout: std::time::Duration,
+    stream_idle_timeout: std::time::Duration,
     /// rows arrive from a background task through a bounded channel, so
     /// large results never sit fully in memory (TZ §6.1 streaming)
     rx: Option<tokio::sync::mpsc::Receiver<Result<tiberius::Row, tiberius::error::Error>>>,
@@ -533,6 +557,8 @@ impl MssqlFdwRq {
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
         let config = self.config.clone();
         let pool_key = self.pool_key.clone();
+        let connect_timeout = self.connect_timeout;
+        let stream_idle_timeout = self.stream_idle_timeout;
         let mut leased = pool::lease(&pool_key);
         if self.log_remote_query {
             pgrx::log!(
@@ -553,7 +579,7 @@ impl MssqlFdwRq {
             loop {
                 let (mut client, reused) = match leased.take() {
                     Some(conn) => (conn, true),
-                    None => match pool::connect(&config).await {
+                    None => match pool::connect(&config, connect_timeout).await {
                         Ok(client) => (client, false),
                         Err(e) => {
                             let _ = tx.send(Err(e)).await;
@@ -565,20 +591,34 @@ impl MssqlFdwRq {
                     .iter()
                     .map(|b| &**b as &dyn tiberius::ToSql)
                     .collect();
-                // keep the query result as a match temporary: it holds the
-                // client borrow and dies at the end of this statement,
-                // before the stream is drained and the client is released
-                let mut row_stream = match client.query(&tsql, &refs).await {
-                    Ok(stream) => stream.into_row_stream(),
-                    // a stale lease the server reset fails before producing
-                    // any row — discard it and retry once on a fresh login
-                    Err(_) if reused => continue,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-                while let Some(item) = row_stream.next().await {
+                // bound the send-to-first-token wait too: a WAN that went
+                // dark after login hangs the query the same way a
+                // black-holed route hangs the connect
+                let mut row_stream =
+                    match pool::bounded(stream_idle_timeout, client.query(&tsql, &refs)).await {
+                        Ok(Ok(stream)) => stream.into_row_stream(),
+                        // a stale lease the server reset (or that stopped
+                        // answering) fails before producing any row —
+                        // discard it and retry once on a fresh login
+                        Err(_) if reused => continue,
+                        Err(e) | Ok(Err(e)) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    };
+                loop {
+                    let item = match pool::bounded(stream_idle_timeout, row_stream.next()).await {
+                        // the route or server went dark mid-stream: error
+                        // instead of parking the backend; the connection is
+                        // dropped (framing unreliable after an aborted
+                        // stream), not pooled
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                        Ok(None) => break,
+                        Ok(Some(item)) => item,
+                    };
                     if tx.send(item).await.is_err() {
                         // receiver dropped: the scan was cancelled with the
                         // stream unfinished — the TDS framing is unreliable,
@@ -646,11 +686,24 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             .options
             .get("log_remote_query")
             .is_some_and(|v| v == "true");
+        let connect_timeout = match timeout_option(&server.options, "connect_timeout") {
+            Some(parsed) => parsed?,
+            None => std::time::Duration::from_secs(15),
+        };
+        // generous default: a legitimate DWH aggregate can run for minutes
+        // before the first row arrives; the bound exists for dead routes,
+        // not for slow queries
+        let stream_idle_timeout = match timeout_option(&server.options, "stream_idle_timeout") {
+            Some(parsed) => parsed?,
+            None => std::time::Duration::from_secs(600),
+        };
 
         Ok(MssqlFdwRq {
             config,
             pool_key,
             log_remote_query,
+            connect_timeout,
+            stream_idle_timeout,
             rx: None,
             tgt_cols: Vec::new(),
             column_positions: None,
@@ -691,6 +744,11 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
                     "log_remote_query",
                     "auth",
                     "tds_version",
+                    // whole seconds; connect_timeout bounds TCP+login
+                    // (default 15), stream_idle_timeout bounds every wait
+                    // for the server's next response (default 600, 0=off)
+                    "connect_timeout",
+                    "stream_idle_timeout",
                 ])?;
                 if !names.contains(&"conn_string") && !names.contains(&"conn_string_id") {
                     return Err(MssqlFdwRqError::InvalidOption(

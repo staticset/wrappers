@@ -20,6 +20,7 @@
 //!   so the map mutex must never be held across `block_on`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -105,10 +106,53 @@ pub(super) fn release(key: &str, conn: Conn) {
     }
 }
 
+/// Await `fut` under a response deadline, mapping expiry to a `TimedOut`
+/// error. `Duration::ZERO` disables the bound. Callers must already run
+/// inside a task on [`runtime`] — tokio timers need the reactor, and
+/// wrapping the outer `block_on` instead panics with "no reactor running".
+pub(super) async fn bounded<T>(
+    timeout: Duration,
+    fut: impl Future<Output = T>,
+) -> Result<T, tiberius::error::Error> {
+    if timeout.is_zero() {
+        return Ok(fut.await);
+    }
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| timeout_error(timeout))
+}
+
+fn timeout_error(timeout: Duration) -> tiberius::error::Error {
+    tiberius::error::Error::from(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("mssql_fdw_rq: no response from the server within {timeout:?}"),
+    ))
+}
+
 /// Open a fresh connection (the only place a login is ever paid for).
-pub(super) async fn connect(config: &Config) -> Result<Conn, tiberius::error::Error> {
-    let tcp = TcpStream::connect(config.get_addr()).await?;
-    tcp.set_nodelay(true)?;
-    let tcp = tcp.compat_write();
-    Client::connect(config.clone(), tcp).await
+/// The whole TCP+login sequence is bounded by `timeout`: a WAN route that
+/// went dark would otherwise park the backend in the OS's own TCP timeout
+/// (minutes), uninterruptible from PostgreSQL until pg_terminate (review
+/// 2026-09-28, HIGH-1).
+pub(super) async fn connect(
+    config: &Config,
+    timeout: Duration,
+) -> Result<Conn, tiberius::error::Error> {
+    let handshake = async {
+        let tcp = TcpStream::connect(config.get_addr()).await?;
+        tcp.set_nodelay(true)?;
+        let tcp = tcp.compat_write();
+        Client::connect(config.clone(), tcp).await
+    };
+    match bounded(timeout, handshake).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(tiberius::error::Error::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "mssql_fdw_rq: connect to {} timed out after {timeout:?} — \
+                 check the route/firewall",
+                config.get_addr()
+            ),
+        ))),
+    }
 }

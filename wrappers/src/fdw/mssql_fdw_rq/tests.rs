@@ -2229,6 +2229,84 @@ mod tests {
         assert_eq!(rows[4], (5, 5));
     }
 
+    /// Run `sql` and return its error message; the caller asserts failure.
+    /// PostgreSQL errors raised inside SPI cross back into Rust as panics
+    /// (`Spi::get_one` does not hand them out as `Err`), so catch them with
+    /// PgTryBuilder — a plain `.expect_err` would abort the test function.
+    fn pg_error_message(sql: &str) -> String {
+        pgrx::PgTryBuilder::new(|| {
+            Spi::get_one::<i64>(sql).ok();
+            // reached only if the query unexpectedly succeeded
+            String::new()
+        })
+        .catch_others(|e| match e {
+            pgrx::pg_sys::panic::CaughtError::ErrorReport(r)
+            | pgrx::pg_sys::panic::CaughtError::PostgresError(r) => r.message().to_string(),
+            other => other.rethrow(),
+        })
+        .execute()
+    }
+
+    // 2026-10-02 round 9 (review 2026-09-28, HIGH-1): a black-holed WAN
+    // route used to park the backend in the OS's own TCP timeout — minutes,
+    // uninterruptible until pg_terminate. `connect_timeout` bounds the
+    // TCP+login handshake, so the query must fail with the timeout error in
+    // seconds. 10.255.255.1 is a non-routable address: SYNs leave the CI
+    // docker network and never come back.
+    #[pg_test]
+    fn connect_timeout_bounds_black_holed_route() {
+        setup();
+        Spi::run(&format!(
+            "CREATE SERVER mssql_rq_srv_blackhole FOREIGN DATA WRAPPER mssql_fdw_rq_fwd \
+             OPTIONS (conn_string 'server=10.255.255.1;port=1433;database=rqtest;\
+             User ID=sa;Password={};TrustServerCertificate=true', connect_timeout '2')",
+            mssql_password()
+        ))
+        .unwrap();
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_blackhole (id bigint) \
+             SERVER mssql_rq_srv_blackhole OPTIONS (schema 'dbo', table 'orders')",
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let message = pg_error_message("SELECT id FROM rq_blackhole LIMIT 1");
+        assert!(
+            message.contains("timed out"),
+            "expected a timeout error, got: {message:?}"
+        );
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "the failure took {:?} — the timeout did not bound the connect",
+            started.elapsed()
+        );
+    }
+
+    // 2026-10-02 round 9: a malformed timeout option is a configuration
+    // error at FDW-construction time, not a silent fall-back to the default
+    #[pg_test]
+    fn malformed_timeout_option_fails_loudly() {
+        setup();
+        Spi::run(&format!(
+            "CREATE SERVER mssql_rq_srv_badtimeout FOREIGN DATA WRAPPER mssql_fdw_rq_fwd \
+             OPTIONS (conn_string '{};User ID=sa;Password={}', connect_timeout 'soon')",
+            mssql_conn_string(),
+            mssql_password()
+        ))
+        .unwrap();
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_badtimeout (id bigint) \
+             SERVER mssql_rq_srv_badtimeout OPTIONS (schema 'dbo', table 'orders')",
+        )
+        .unwrap();
+
+        let message = pg_error_message("SELECT id FROM rq_badtimeout LIMIT 1");
+        assert!(
+            message.contains("whole number of seconds"),
+            "got: {message:?}"
+        );
+    }
+
     /// The framework deparses the TOP-LEVEL statement for join queries, which
     /// inside a #[pg_test] is the test function call. The join acceptance
     /// query therefore runs through dblink (a real top-level statement) in a
