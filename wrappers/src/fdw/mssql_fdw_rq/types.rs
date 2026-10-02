@@ -595,8 +595,16 @@ pub(super) fn field_to_cell(
             // recovers the exact number of cents: |raw| ≤ 9.2e18 means
             // |raw/1e4 * 1e4 - raw| < 0.5 after f64 round-trip.
             if matches!(
-                src_row.columns()[idx].column_type(),
-                tiberius::ColumnType::Money | tiberius::ColumnType::Money4
+                src_row
+                    .columns()
+                    .get(idx)
+                    // the result columns are expected to line up with the
+                    // scan's target columns (resjunk is filtered out before
+                    // the mapping is built) — a mismatch here is a framework
+                    // bug worth a clear message, not an index panic
+                    // (review 2026-09-28, LOW)
+                    .map(|col| col.column_type()),
+                Some(tiberius::ColumnType::Money | tiberius::ColumnType::Money4)
             ) {
                 let v = src_row.try_get::<f64, usize>(idx)?;
                 return Ok(v

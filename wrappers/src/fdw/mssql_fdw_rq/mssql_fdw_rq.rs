@@ -24,12 +24,44 @@ fn bracket_name(name: &str) -> MssqlFdwRqResult<String> {
 
 /// Does an ADO-style connection string carry a user? tiberius parses the
 /// canonical `User ID=` and the `UID=` alias; a bare `user=` key does not
-/// exist in its grammar.
-fn conn_str_has_user(conn_str: &str) -> bool {
-    conn_str.split(';').any(|kv| {
+/// exist in its grammar. Entries are split on `;` outside single-quoted
+/// values — `Password='a;uid=x'` is one entry whose value merely contains
+/// a `uid=` fragment (review 2026-09-28, LOW).
+pub(super) fn conn_str_has_user(conn_str: &str) -> bool {
+    split_ado_entries(conn_str).any(|kv| {
         let key = kv.trim_start().to_ascii_lowercase();
         key.starts_with("user id=") || key.starts_with("uid=") || key.starts_with("user=")
     })
+}
+
+/// Split an ADO connection string into entries on `;` that sit outside
+/// single-quoted values (`''` inside a value is an escaped quote). Both
+/// characters are ASCII, so byte indexing never splits a UTF-8 sequence.
+fn split_ado_entries(conn_str: &str) -> impl Iterator<Item = &str> {
+    let mut entries = Vec::new();
+    let bytes = conn_str.as_bytes();
+    let mut in_value = false;
+    let mut entry_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                if in_value && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2; // escaped quote inside the value
+                    continue;
+                }
+                in_value = !in_value;
+            }
+            b';' if !in_value => {
+                entries.push(&conn_str[entry_start..i]);
+                entry_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    entries.push(&conn_str[entry_start..]);
+    entries.into_iter()
 }
 
 /// Parse a whole-seconds network timeout server option (`connect_timeout`,
@@ -385,9 +417,22 @@ impl MssqlFdwRq {
         let user = options.get("user").or_else(|| options.get("username"));
         let password = match options.get("password") {
             Some(p) => Some(p.clone()),
+            // a missing vault secret must not degrade to an empty password
+            // (and then a confusing "must provide both" or a localhost
+            // login attempt) — name the secret instead (review 2026-09-28,
+            // LOW)
             None => options
                 .get("password_id")
-                .map(|id| get_vault_secret(id).unwrap_or_default()),
+                .map(|id| {
+                    get_vault_secret(id)
+                        .filter(|p| !p.is_empty())
+                        .ok_or_else(|| {
+                            MssqlFdwRqError::InvalidOption(format!(
+                                "password_id: vault secret '{id}' not found or empty"
+                            ))
+                        })
+                })
+                .transpose()?,
         };
         match (user, password) {
             (Some(user), Some(password)) if !user.is_empty() && !password.is_empty() => Ok(Some((
@@ -656,7 +701,17 @@ impl ForeignDataWrapper<MssqlFdwRqError> for MssqlFdwRq {
             Some(conn_str) => conn_str.to_owned(),
             None => {
                 let conn_str_id = require_option("conn_string_id", &server.options)?;
-                get_vault_secret(conn_str_id).unwrap_or_default()
+                // a missing vault secret must not degrade to an empty
+                // connection string — that parses as a valid Config, points
+                // at localhost:1433 and produces a baffling connect error
+                // (review 2026-09-28, LOW)
+                get_vault_secret(conn_str_id)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        MssqlFdwRqError::InvalidOption(format!(
+                            "conn_string_id: vault secret '{conn_str_id}' not found or empty"
+                        ))
+                    })?
             }
         };
         let mut config = Config::from_ado_string(&conn_str)?;

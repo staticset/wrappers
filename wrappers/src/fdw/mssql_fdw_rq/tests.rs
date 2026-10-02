@@ -116,6 +116,22 @@ mod unit {
         );
     }
 
+    // 2026-10-02 round 9 (review 2026-09-28, LOW): a quoted value containing
+    // `;uid=x` is one entry — its value must not be mistaken for a user key
+    #[test]
+    fn conn_str_user_detection_respects_quotes() {
+        use super::super::mssql_fdw_rq::conn_str_has_user;
+        assert!(!conn_str_has_user("server=mssql;database=rqtest"));
+        assert!(conn_str_has_user("server=mssql;User ID=sa;Password=x"));
+        assert!(conn_str_has_user("server=mssql;uid=sa"));
+        // the review's case: uid= lives inside the quoted password value
+        assert!(!conn_str_has_user("server=mssql;Password='a;uid=x'"));
+        // an escaped '' does NOT close the value — still one entry
+        assert!(!conn_str_has_user("server=mssql;Password='a'';uid=x'"));
+        // a properly closed value lets the next entry be real
+        assert!(conn_str_has_user("server=mssql;Password='a';uid=x"));
+    }
+
     // -- operators -----------------------------------------------------------------
 
     #[test]
