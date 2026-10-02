@@ -2065,6 +2065,49 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
     }
 }
 
+/// Does the deparsed statement reference the external parameter `$id` as a
+/// placeholder? String literals are skipped (`''` is an escaped quote), so a
+/// `$1` inside a literal does not count; the deparser only produces real
+/// placeholders as standalone `$<digits>` tokens.
+fn sql_references_parameter(sql: &str, id: usize) -> bool {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_literal = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_literal {
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_literal = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_literal = true,
+            b'$' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1
+                    && sql[i + 1..j]
+                        .parse::<usize>()
+                        .is_ok_and(|parsed| parsed == id)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Decode a pushdown parameter datum, failing the query when a non-NULL
 /// value cannot be decoded. Silently substituting NULL would bind NULL into
 /// a used placeholder and push a filter that matches nothing (review
@@ -2118,10 +2161,27 @@ unsafe fn assign_remote_query_parameters<E: Into<ErrorReport>, W: ForeignDataWra
             (*estate).es_param_list_info
         };
         if !plist_info.is_null() {
+            // Decode only external parameters the deparsed statement actually
+            // references: the executor's parameter list can carry bindings the
+            // statement never mentions (a prepared statement's unused argument,
+            // SPI/PL-pgSQL scope arguments — the top-level statement and the
+            // deparsed one are different texts there). An unreferenced
+            // parameter cannot reach the pushed SQL, and fail-closed decoding
+            // would reject types the FDW never binds (review 2026-09-28,
+            // HIGH-3: `PREPARE p(date[]) AS <statement without $1>` died with
+            // "cannot decode a non-NULL parameter of type OID 1182").
+            let statement_sql = state
+                .full_query
+                .as_ref()
+                .map(|query| query.sql.clone())
+                .unwrap_or_default();
             let params_cnt = (*plist_info).numParams as usize;
             let plist = (*plist_info).params.as_slice(params_cnt);
             for (idx, param) in plist.iter().enumerate() {
                 if param.ptype == Oid::INVALID {
+                    continue;
+                }
+                if !sql_references_parameter(&statement_sql, idx + 1) {
                     continue;
                 }
                 let cell = decode_parameter(param.value, param.isnull, param.ptype);

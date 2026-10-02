@@ -2209,6 +2209,10 @@ fn is_plain_ident(piece: &str) -> bool {
 /// parameter list even when the deparsed statement never uses them; those
 /// are bound as NULL by the executor, so only a placeholder that actually
 /// appears (as a whole token, not a prefix of `@P10`) forces type support.
+/// String literals are skipped: the FDW quotes user text as `'…'`/`N'…'`
+/// with `''` escaping, and a placeholder-shaped substring inside one
+/// (`N'call @P5 at noon'`) is data, not a placeholder (review 2026-09-28,
+/// LOW beside HIGH-3).
 pub(super) fn param_placeholder_used(tsql: &str, id: usize) -> bool {
     let needle = format!("@P{id}");
     let bytes = tsql.as_bytes();
@@ -2217,10 +2221,40 @@ pub(super) fn param_placeholder_used(tsql: &str, id: usize) -> bool {
         let at = from + rel;
         let after = at + needle.len();
         let next_is_digit = bytes.get(after).is_some_and(|b| b.is_ascii_digit());
-        if !next_is_digit {
+        if !next_is_digit && !inside_string_literal(bytes, at) {
             return true;
         }
         from = after;
+    }
+    false
+}
+
+/// Is byte offset `at` inside a single-quoted T-SQL literal (`'…'`, `''`
+/// escaped)? The literal scan restarts from the beginning each call — the
+/// T-SQL is short and the function runs once per parameter.
+fn inside_string_literal(bytes: &[u8], at: usize) -> bool {
+    let mut i = 0usize;
+    while i < at {
+        if bytes[i] == b'\'' {
+            // N'…' opens at the quote; '' inside is an escaped quote
+            let mut j = i + 1;
+            loop {
+                match bytes.get(j) {
+                    Some(&b'\'') if bytes.get(j + 1) == Some(&b'\'') => j += 2,
+                    Some(&b'\'') => {
+                        i = j + 1;
+                        break;
+                    }
+                    Some(_) => j += 1,
+                    None => return true, // unterminated: treat the tail as literal
+                }
+            }
+            if i > at {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
     }
     false
 }

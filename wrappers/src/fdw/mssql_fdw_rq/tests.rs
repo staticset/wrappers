@@ -1247,6 +1247,23 @@ mod unit {
         // @P1 is a prefix of @P10 but not a whole token there
         assert!(!param_placeholder_used("WHERE x = @P10", 1));
         assert!(param_placeholder_used("WHERE x = @P1", 1));
+        // 2026-10-02 round 9: a placeholder-shaped substring inside a string
+        // literal is data, not a placeholder — an unused jsonb argument
+        // riding along the parameter list used to be rejected as
+        // "parameter type 'oid 3802' is not supported"
+        assert!(!param_placeholder_used(
+            "WHERE [note] = N'call @P5 at noon' AND [id] = @P1",
+            5
+        ));
+        assert!(param_placeholder_used(
+            "WHERE [note] = N'call @P5 at noon' AND [id] = @P5",
+            5
+        ));
+        // an escaped '' quote must not close the literal early
+        assert!(!param_placeholder_used(
+            "WHERE [note] = N'it''s @P5' AND [id] = @P1",
+            5
+        ));
     }
 
     // 2026-09-05 (VGU dbo.FactIPP): count over a remote LOB column must be
@@ -3012,10 +3029,75 @@ mod tests {
         assert_eq!(id, "1");
     }
 
+    // round 9.5 (review 2026-09-28, HIGH-3): a prepared-statement parameter
+    // the statement never references must not block execution — its type may
+    // sit outside the pushdown matrix (here date[], OID 1182) while the FDW
+    // would never bind it. Before the fix the executor's whole parameter
+    // list was decoded and this died with "cannot decode a non-NULL
+    // parameter of type OID 1182".
+    #[pg_test]
+    fn unreferenced_extern_parameter_not_decoded() {
+        setup_committed();
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqany', {conn})")).unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqany', \
+             $$PREPARE p(date[]) AS SELECT count(*) FROM rqj_orders \
+               WHERE total_amount > 100 ORDER BY 1$$)",
+        )
+        .unwrap();
+        let cnt: i64 = Spi::get_one(
+            "SELECT * FROM dblink('rqany', \
+             $$EXECUTE p(ARRAY['2026-01-02'::date, '2026-01-03'::date])$$) AS t(cnt bigint)",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            cnt > 0,
+            "the unused date[] argument must not block the query"
+        );
+    }
+
+    // round 9.5 counterpart (review 2026-09-28, HIGH-3, the exact
+    // scenario): `WHERE order_date = ANY($1) ORDER BY 1` with a date[]
+    // argument used to die on "cannot decode a non-NULL parameter of type
+    // OID 1182" — the array qual is not pushable and stays a local filter,
+    // yet the parameter list was decoded wholesale. Now the query executes
+    // and returns the correct rows (the reference count comes from MSSQL's
+    // own view of the data).
+    #[pg_test]
+    fn referenced_undecodable_parameter_fails_closed() {
+        setup_committed();
+        let conn = "format('host=localhost port=%s dbname=rqjoin_test', current_setting('port'))";
+        Spi::run(&format!("SELECT dblink_connect('rqref', {conn})")).unwrap();
+        Spi::run(
+            "SELECT dblink_exec('rqref', \
+             $$PREPARE p(date[]) AS SELECT count(*) FROM rqj_orders \
+               WHERE order_date = ANY($1) ORDER BY 1$$)",
+        )
+        .unwrap();
+        let reference = mssql_direct(
+            "SELECT CAST('count' AS nvarchar(20)) AS name, \
+             CAST(count(*) AS nvarchar(20)) AS total \
+             FROM dbo.orders WHERE order_date IN ('2026-01-02', '2026-01-03');",
+        );
+        let expected: String = reference[0].1.clone();
+        let cnt: i64 = Spi::get_one(
+            "SELECT * FROM dblink('rqref', \
+             $$EXECUTE p(ARRAY['2026-01-02'::date, '2026-01-03'::date])$$) AS t(cnt bigint)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cnt.to_string(),
+            expected,
+            "the ANY(date[]) filter must apply and return the reference count"
+        );
+    }
+
     #[pg_test]
     fn prepared_statement_parameter() {
         setup_committed();
-
         // 3. prepared statement parameter $1 -> @P1 (TZ §10 #3). Runs
         // through dblink so PREPARE/EXECUTE are real top-level statements of
         // a dedicated session — like production drivers use them. (SPI-side
