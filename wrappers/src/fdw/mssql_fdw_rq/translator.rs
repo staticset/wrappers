@@ -1592,6 +1592,18 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         let Tok::Str(s) = &toks[i + 1] else {
                             unreachable!();
                         };
+                        // an ESCAPE clause changes which characters the
+                        // pattern's escapes match, and T-SQL has no ESCAPE
+                        // syntax at all — the tokens used to pass through
+                        // silently and corrupt the query (review
+                        // 2026-09-28, MEDIUM-8)
+                        if matches!(toks.get(i + 2), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("escape"))
+                        {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: "LIKE ... ESCAPE".to_string(),
+                                reason: "ESCAPE clauses are not supported in v1".to_string(),
+                            });
+                        }
                         out.push("LIKE".to_string());
                         out.push(tsql_string_literal(&tsql_like_pattern(s)?));
                         i += 2;
@@ -2701,6 +2713,19 @@ fn translate_like_operator(
             });
         }
     };
+
+    // ESCAPE may follow the pattern and its optional ::cast: it changes
+    // which characters the pattern's escapes match, T-SQL has no ESCAPE
+    // syntax, and the tokens used to pass through into the T-SQL silently
+    // (review 2026-09-28, MEDIUM-8) — translate_ilike gates its own spelling
+    if let Some(Tok::Word(w)) = toks.get(i + 1 + consumed) {
+        if w.eq_ignore_ascii_case("escape") {
+            return Err(TranslateError::UnsupportedConstruct {
+                sql_fragment: "LIKE ... ESCAPE".to_string(),
+                reason: "ESCAPE clauses are not supported in v1".to_string(),
+            });
+        }
+    }
 
     // the deparser wraps the operator expression in parens —
     // `(x ~~ 'p')` — strip them so the rewrite does not double-nest

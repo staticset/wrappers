@@ -156,6 +156,23 @@ mod unit {
         );
     }
 
+    // 2026-10-02 round 9 (review 2026-09-28, MEDIUM-8): the ESCAPE gate
+    // existed only in the ILIKE spelling; the keyword and the deparser's
+    // `~~` operator forms passed the ESCAPE tokens through silently — PG
+    // with ESCAPE '!' reads `\%` as a literal backslash+wildcard while the
+    // emitted T-SQL matched a different set of strings
+    #[test]
+    fn escape_clause_rejected_in_all_like_spellings() {
+        for sql in [
+            "SELECT id FROM public.dbo_orders WHERE note LIKE 'a\\%b' ESCAPE '!'",
+            "SELECT id FROM public.dbo_orders WHERE note ~~ 'a%b' ESCAPE '!'",
+            "SELECT id FROM public.dbo_orders WHERE note ~~ 'a%b'::text ESCAPE '!'",
+            "SELECT id FROM public.dbo_orders WHERE note ILIKE 'a%b' ESCAPE '!'",
+        ] {
+            assert_unsupported(sql, &orders_ctx(), "ESCAPE");
+        }
+    }
+
     // -- LIMIT / OFFSET ------------------------------------------------------------
 
     #[test]
