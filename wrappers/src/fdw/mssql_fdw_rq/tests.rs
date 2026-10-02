@@ -108,10 +108,11 @@ mod unit {
 
     #[test]
     fn param_in_cast() {
+        // a parameter is not a literal: the scale-faithful default applies
         assert_tsql(
             "SELECT id FROM public.dbo_orders WHERE amount > $1::numeric",
             &orders_ctx(),
-            "SELECT id FROM [dbo].[Orders] WHERE amount > CAST(@P1 AS numeric(38, 10))",
+            "SELECT id FROM [dbo].[Orders] WHERE amount > CAST(@P1 AS numeric(38, 18))",
         );
     }
 
@@ -602,7 +603,7 @@ mod unit {
         assert_tsql(
             "SELECT note::character varying FROM public.dbo_orders",
             &orders_ctx(),
-            "SELECT CAST(note AS nvarchar(4000)) FROM [dbo].[Orders]",
+            "SELECT CAST(note AS nvarchar(max)) FROM [dbo].[Orders]",
         );
     }
 
@@ -611,7 +612,67 @@ mod unit {
         assert_tsql(
             "SELECT note::character varying(10) FROM public.dbo_orders",
             &orders_ctx(),
-            "SELECT CAST(note AS nvarchar(4000)) FROM [dbo].[Orders]",
+            "SELECT CAST(note AS nvarchar(max)) FROM [dbo].[Orders]",
+        );
+    }
+
+    // 2026-10-02 round 9 (review 2026-09-28, MEDIUM-5): the deparser prints
+    // numeric Consts as `'…'::numeric`; the old fixed numeric(38, 10) target
+    // rounded any scale past 10 away — `rate > 0.123456789012` silently
+    // matched the wrong rows. A literal subject now sizes the CAST to the
+    // literal's own scale; a literal wider than 38 digits is refused
+    // instead of rounded.
+    #[test]
+    fn bare_numeric_cast_sizes_to_the_literal() {
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE rate > '0.123456789012'::numeric",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE rate > \
+             CAST('0.123456789012' AS numeric(13, 12))",
+        );
+        // integers keep scale 0
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE amount > '2000'::numeric",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE amount > \
+             CAST('2000' AS numeric(4, 0))",
+        );
+        // signed
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE amount > '-1.50'::numeric",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE amount > \
+             CAST('-1.50' AS numeric(3, 2))",
+        );
+        // the typed-literal spelling `NUMERIC '…'` sizes the same way
+        assert_tsql(
+            "SELECT id FROM public.dbo_orders WHERE rate > NUMERIC '0.123456789012'",
+            &orders_ctx(),
+            "SELECT id FROM [dbo].[Orders] WHERE rate > \
+             CAST('0.123456789012' AS numeric(13, 12))",
+        );
+        // 39 digits of precision cannot exist in MSSQL numeric — reject
+        let err = translate(
+            "SELECT id FROM public.dbo_orders WHERE x > '1234567890123456789012345678901234567890.5'::numeric",
+            &orders_ctx(),
+        )
+        .expect_err("must fail");
+        assert!(
+            err.to_string().contains("MSSQL numeric maximum is 38"),
+            "{err}"
+        );
+    }
+
+    // 2026-10-02 round 9 (MEDIUM-6): nvarchar(4000) silently truncated
+    // literals longer than 4000 characters, so the comparison never matched;
+    // bare text casts are nvarchar(max) and never truncate
+    #[test]
+    fn long_text_literal_cast_keeps_full_length() {
+        let long = "x".repeat(5000);
+        assert_tsql(
+            &format!("SELECT id FROM public.dbo_orders WHERE note = '{long}'::text"),
+            &orders_ctx(),
+            &format!("SELECT id FROM [dbo].[Orders] WHERE note = CAST('{long}' AS nvarchar(max))"),
         );
     }
 
@@ -1624,7 +1685,7 @@ dbb19de8-57d2-11f0-b512-00620b98e933}'::uuid[])",
              WHERE ((status <> 'Не задано'::text)) LIMIT '10'::bigint",
             &orders_ctx(),
             "SELECT TOP (10) id FROM [dbo].[Orders] \
-             WHERE ((status <> CAST(N'Не задано' AS nvarchar(4000))))",
+             WHERE ((status <> CAST(N'Не задано' AS nvarchar(max))))",
         );
     }
 
@@ -1689,7 +1750,7 @@ dbb19de8-57d2-11f0-b512-00620b98e933}'::uuid[])",
         assert_eq!(m("int2"), Some("smallint"));
         assert_eq!(m("int4"), Some("int"));
         assert_eq!(m("int8"), Some("bigint"));
-        assert_eq!(m("numeric"), Some("numeric(38, 10)"));
+        assert_eq!(m("numeric"), Some("numeric(38, 18)"));
         assert_eq!(m("bool"), Some("bit"));
         assert_eq!(m("uuid"), Some("uniqueidentifier"));
         assert_eq!(m("bytea"), Some("varbinary(8000)"));
@@ -2305,6 +2366,39 @@ mod tests {
             message.contains("whole number of seconds"),
             "got: {message:?}"
         );
+    }
+
+    // 2026-10-02 round 9 (review 2026-09-28, MEDIUM-5): the full-query
+    // pushdown inlines numeric Consts as `'…'::numeric`; the old fixed
+    // numeric(38,10) cast rounded a 12-decimal literal to 10 decimals, so
+    // `rate > 0.123456789012` also returned rows with rate
+    // 0.123456789011 — silently wrong financial comparisons. The cast now
+    // sizes to the literal: only rate 0.123456789099 passes.
+    #[pg_test]
+    fn numeric_12_scale_comparison_is_exact() {
+        setup();
+        mssql_direct(
+            "IF OBJECT_ID('dbo.rates') IS NOT NULL DROP TABLE dbo.rates; \
+             CREATE TABLE dbo.rates (id int PRIMARY KEY, rate numeric(20,12) NOT NULL); \
+             INSERT dbo.rates (id, rate) VALUES \
+               (1, 0.123456789099), (2, 0.123456789011), (3, 0.123456789001); \
+             SELECT CAST(id AS nvarchar(20)) AS name, CAST(rate AS nvarchar(40)) AS total \
+             FROM dbo.rates ORDER BY id;",
+        );
+        Spi::run(
+            "CREATE FOREIGN TABLE rq_rates (id int, rate numeric(20,12)) \
+             SERVER mssql_rq_srv OPTIONS (schema 'dbo', table 'rates')",
+        )
+        .unwrap();
+
+        let count: i64 = Spi::get_one("SELECT count(*) FROM rq_rates WHERE rate > 0.123456789012")
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1, "the 12-decimal literal must not be rounded");
+        let id: i32 = Spi::get_one("SELECT id FROM rq_rates WHERE rate > 0.123456789012")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 1, "only the row above the exact literal passes");
     }
 
     /// The framework deparses the TOP-LEVEL statement for join queries, which

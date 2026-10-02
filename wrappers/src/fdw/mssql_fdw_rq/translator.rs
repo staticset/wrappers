@@ -904,7 +904,13 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         continue;
                     }
                     "::" => {
-                        let mssql_type = parse_cast_type(&toks[i + 1..])?;
+                        // the subject of `'…'::type`: a literal Const gets
+                        // an exact numeric typmod (see numeric_literal_typmod)
+                        let literal = i.checked_sub(1).and_then(|k| match toks.get(k) {
+                            Some(Tok::Str(s)) => Some(s.clone()),
+                            _ => None,
+                        });
+                        let mssql_type = parse_cast_type(&toks[i + 1..], literal.as_deref())?;
                         let end = type_token_len(&toks[i + 1..]);
                         let start = capture_subject(&out, case_depth)?;
                         let mut expr = out[start..].join(" ");
@@ -1470,30 +1476,42 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     _ if matches!(toks.get(i + 1), Some(Tok::Str(_)))
                         && types::is_pg_type_name(&lw) =>
                     {
-                        match types::pg_type_to_mssql(&lw) {
-                            Some(mssql_type) => {
-                                let Tok::Str(s) = &toks[i + 1] else {
-                                    unreachable!();
-                                };
-                                let body = if mssql_type == "datetimeoffset" {
-                                    normalize_tz_literal(s)
-                                } else {
-                                    s.clone()
-                                };
-                                out.push(format!(
-                                    "CAST({} AS {mssql_type})",
-                                    tsql_string_literal(&body)
-                                ));
-                                i += 2;
-                                continue;
+                        // NUMERIC '…' sizes the CAST to the literal's own
+                        // scale (review 2026-09-28, MEDIUM-5) — the fixed
+                        // mapping used to round it to 10 decimals
+                        let mssql_type = if lw.eq_ignore_ascii_case("numeric")
+                            || lw.eq_ignore_ascii_case("decimal")
+                        {
+                            let Tok::Str(s) = &toks[i + 1] else {
+                                unreachable!();
+                            };
+                            numeric_literal_typmod(Some(s))?
+                                .unwrap_or_else(|| "numeric(38, 18)".to_string())
+                        } else {
+                            match types::pg_type_to_mssql(&lw) {
+                                Some(mssql_type) => mssql_type.to_string(),
+                                None => {
+                                    return Err(TranslateError::UnsupportedConstruct {
+                                        sql_fragment: format!("{lw} '…'"),
+                                        reason: "typed literal has no T-SQL mapping".to_string(),
+                                    });
+                                }
                             }
-                            None => {
-                                return Err(TranslateError::UnsupportedConstruct {
-                                    sql_fragment: format!("{lw} '…'"),
-                                    reason: "typed literal has no T-SQL mapping".to_string(),
-                                });
-                            }
-                        }
+                        };
+                        let Tok::Str(s) = &toks[i + 1] else {
+                            unreachable!();
+                        };
+                        let body = if mssql_type == "datetimeoffset" {
+                            normalize_tz_literal(s)
+                        } else {
+                            s.clone()
+                        };
+                        out.push(format!(
+                            "CAST({} AS {mssql_type})",
+                            tsql_string_literal(&body)
+                        ));
+                        i += 2;
+                        continue;
                     }
                     "any" | "all" if matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") => {
                         let is_any = lw == "any";
@@ -2021,7 +2039,7 @@ fn is_literal_expr(expr: &str) -> bool {
         || t.eq_ignore_ascii_case("NULL")
         || {
             // a literal rendered through a cast: CAST('100' AS int),
-            // CAST(NULL AS nvarchar(4000)), CAST(1.5 AS numeric(18,2)).
+            // CAST(NULL AS nvarchar(max)), CAST(1.5 AS numeric(18,2)).
             // positional_select_item joins the pieces with single spaces,
             // so normalize the spacing around the parens first
             let n = t.replace(" (", "(").replace("( ", "(").replace(" )", ")");
@@ -2311,7 +2329,46 @@ fn type_token_len(toks: &[Tok]) -> usize {
     len
 }
 
-fn parse_cast_type(toks: &[Tok]) -> Result<String, TranslateError> {
+/// Exact `numeric(p, s)` for a bare `::numeric` cast whose subject is a
+/// plain-decimal literal: size the CAST to the literal itself (its own
+/// scale) instead of the fixed default mapping, which rounded any scale
+/// past 10 away and silently changed which rows a comparison matched
+/// (review 2026-09-28, MEDIUM-5).
+///
+/// `Ok(None)` — the subject is not a plain decimal literal (an expression,
+/// a parameter, scientific notation): the caller falls back to the default
+/// mapping. `Err` — the literal needs more than MSSQL's 38 digits: refuse
+/// rather than round it.
+fn numeric_literal_typmod(literal: Option<&str>) -> Result<Option<String>, TranslateError> {
+    let Some(lit) = literal else {
+        return Ok(None);
+    };
+    let unsigned = lit.strip_prefix(['+', '-']).unwrap_or(lit);
+    if unsigned.is_empty() || !unsigned.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return Ok(None);
+    }
+    let (int_part, frac_part) = unsigned
+        .split_once('.')
+        .map_or((unsigned, ""), |(i, f)| (i, f));
+    // a second '.' is not a plain decimal — treat as a non-literal subject
+    if frac_part.contains('.') || int_part.is_empty() {
+        return Ok(None);
+    }
+    let scale = frac_part.len() as i32;
+    let precision = int_part.len() as i32 + scale;
+    if !(1..=38).contains(&precision) {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: format!("'{lit}'::numeric"),
+            reason: format!(
+                "the literal needs numeric precision {precision}; \
+                 MSSQL numeric maximum is 38"
+            ),
+        });
+    }
+    Ok(Some(format!("numeric({precision}, {scale})")))
+}
+
+fn parse_cast_type(toks: &[Tok], literal: Option<&str>) -> Result<String, TranslateError> {
     let len = type_token_len(toks);
     // reconstruct the name after the optional schema qualifier
     // (pg_catalog.int8 → int8), joining multi-word names with spaces
@@ -2343,10 +2400,10 @@ fn parse_cast_type(toks: &[Tok]) -> Result<String, TranslateError> {
     }
 
     // `::numeric(p, s)` rounds to s decimals in PostgreSQL — keep the
-    // declared scale instead of the default numeric(38, 10) mapping, and
-    // keep timestamp/time precisions. varchar-style modifiers stay on the
-    // fixed nvarchar(4000) mapping: remote lengths do not travel with the
-    // cast and the local value already fits (locked by test).
+    // declared scale instead of the default mapping, and keep timestamp/
+    // time precisions. varchar-style modifiers stay on the default
+    // nvarchar(max) mapping: remote lengths do not travel with the cast and
+    // (max) never truncates (locked by test).
     //
     // `len` (type_token_len) already includes the modifier list; find the
     // name's end to read the modifier at the right offset.
@@ -2360,6 +2417,12 @@ fn parse_cast_type(toks: &[Tok]) -> Result<String, TranslateError> {
     let mods = modifier_list(toks, name_end);
     let mod_err = || cast_mod_err(&name);
     let mssql_type = match (name.as_str(), mods.as_slice()) {
+        // bare `::numeric`: an exact typmod when the subject is a literal
+        // (the deparser prints Const values as `'…'::numeric`), the scale-
+        // faithful default for expressions (review 2026-09-28, MEDIUM-5)
+        ("numeric" | "decimal", []) => {
+            numeric_literal_typmod(literal)?.unwrap_or_else(|| "numeric(38, 18)".to_string())
+        }
         ("numeric" | "decimal", mods) if !mods.is_empty() => {
             let precision: i32 = mods[0].parse().map_err(|_| mod_err())?;
             let scale: i32 = if mods.len() > 1 {

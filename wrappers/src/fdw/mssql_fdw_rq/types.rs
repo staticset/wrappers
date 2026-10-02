@@ -30,10 +30,19 @@ pub(super) fn pg_type_to_mssql(pg_name: &str) -> Option<&'static str> {
         "int8" | "bigint" => "bigint",
         "float4" | "real" => "real",
         "float8" | "double precision" => "float(53)",
-        "numeric" | "decimal" => "numeric(38, 10)",
+        // bare numeric (no typmod): PostgreSQL's numeric is unbounded, no
+        // MSSQL decimal is exact — prefer scale fidelity with a LOUD integer
+        // overflow over silently rounding scale > 10 (a rate(20,12) column
+        // compared through the old (38,10) matched the wrong rows; review
+        // 2026-09-28, MEDIUM-5). Literal subjects get an exact typmod in the
+        // translator instead of this default.
+        "numeric" | "decimal" => "numeric(38, 18)",
         "bool" | "boolean" => "bit",
+        // bare text: nvarchar(4000) silently truncated values longer than
+        // 4000 characters, making the comparison never true (MEDIUM-6);
+        // (max) never truncates
         "text" | "varchar" | "character varying" | "bpchar" | "char" | "character" | "name" => {
-            "nvarchar(4000)"
+            "nvarchar(max)"
         }
         "uuid" => "uniqueidentifier",
         "bytea" => "varbinary(8000)",
