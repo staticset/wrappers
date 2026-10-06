@@ -58,6 +58,100 @@ mod unit {
         );
     }
 
+    // ---- round 10: the `~~` paren rewrite must not desync the depth counter
+    // (bridge 2026-10-06, customer file 2). postgres_fdw's aggregate pushdown
+    // ships LIKE as the ~~ operator; translate_like_operator strips the
+    // wrapping parens by consuming the input `)` — and until round 10 that
+    // paren never reached the main loop, leaving depth +1 for the rest of the
+    // statement. Every top-level (depth == 0) gate after the first ~~ was
+    // silently disarmed: GROUP BY ordinals shipped verbatim (MSSQL error
+    // 164), ORDER BY NULL tiebreakers were dropped (silent reordering).
+
+    fn bridge3_ctx() -> TranslateContext {
+        TranslateContext {
+            relations: vec![
+                RelationMapping {
+                    local_schema: "srcext".into(),
+                    local_table: "factpurchaserequestseconomy_1261000000019".into(),
+                    remote_schema: "navtest".into(),
+                    remote_table: "factpurchaserequestseconomy".into(),
+                },
+                RelationMapping {
+                    local_schema: "srcext".into(),
+                    local_table: "dimcalendar_1261000000001".into(),
+                    remote_schema: "navtest".into(),
+                    remote_table: "dimcalendar".into(),
+                },
+                RelationMapping {
+                    local_schema: "srcext".into(),
+                    local_table: "dimusers_1261000000023".into(),
+                    remote_schema: "navtest".into(),
+                    remote_table: "dimusers".into(),
+                },
+            ],
+            bool_columns: vec![],
+            not_null_columns: vec![],
+            text_columns: vec![],
+        }
+    }
+
+    #[test]
+    fn order_by_ordinal_keeps_null_tiebreaker_after_tilde() {
+        // ORDER BY machinery after a ~~ predicate: the ordinal must resolve to
+        // the SELECT expression and keep its NULL tiebreaker (ASC → NULLS LAST
+        // in PostgreSQL, NULL first in T-SQL)
+        assert_tsql(
+            "SELECT r2.amount FROM public.dbo_orders r2 \
+             WHERE ((r2.note ~~ 'a%'::text)) ORDER BY 1",
+            &orders_ctx(),
+            "SELECT r2.amount FROM [dbo].[Orders] r2 \
+             WHERE ((r2 . note LIKE 'a%')) \
+             ORDER BY CASE WHEN r2.amount IS NULL THEN 1 ELSE 0 END, r2.amount",
+        );
+    }
+
+    #[test]
+    fn const_group_item_dropped_after_tilde() {
+        // `100 AS pct` grouped via its ordinal is a no-op grouping in
+        // PostgreSQL and error 164 on MSSQL — the drop must still happen with
+        // a ~~ predicate earlier in the statement
+        assert_tsql(
+            "SELECT 100 AS pct, r2.note FROM public.dbo_orders r2 \
+             WHERE ((r2.note ~~ 'a%'::text)) GROUP BY 1, 2",
+            &orders_ctx(),
+            "SELECT 100 AS [pct], r2.note FROM [dbo].[Orders] r2 \
+             WHERE ((r2 . note LIKE 'a%')) \
+             GROUP BY r2.note",
+        );
+    }
+
+    #[test]
+    fn bridge_group_by_ordinals_survive_tilde_predicate() {
+        // the exact statement observed arriving from postgres_fdw (bridge log
+        // 2026-10-06): aggregate pushdown with LIKE spelled as ~~, the IN-list
+        // as ANY('{…}'::integer[]) and GROUP BY as tlist ordinals — before
+        // round 10 this shipped with `GROUP BY 1, 2` verbatim and MSSQL
+        // rejected it with error 164
+        assert_tsql(
+            "SELECT r4.shortusername, r2.monthofyearname, sum(r1.economytotal) FROM \
+             ((srcext.factpurchaserequestseconomy_1261000000019 r1 INNER JOIN \
+             srcext.dimcalendar_1261000000001 r2 ON (((r1.dateorderclose = r2.dateid)) \
+             AND ((r2.monthofyearid = ANY ('{1,2,3,4,5,6,7,8,9,10,11,12}'::integer[]))) \
+             AND ((r2.yearid = 2026::smallint)))) INNER JOIN \
+             srcext.dimusers_1261000000023 r4 ON (((r1.usermanagerid = r4.userid)) \
+             AND ((upper(r4.shortusername) ~~ '%тест%'::text)))) GROUP BY 1, 2",
+            &bridge3_ctx(),
+            "SELECT r4.shortusername, r2.monthofyearname, sum(r1.economytotal) \
+             FROM(([navtest].[factpurchaserequestseconomy] r1 INNER JOIN \
+             [navtest].[dimcalendar] r2 ON (((r1.dateorderclose = r2.dateid)) \
+             AND (((r2.monthofyearid IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)))) \
+             AND ((r2.yearid = CAST(2026 AS smallint))))) INNER JOIN \
+             [navtest].[dimusers] r4 ON (((r1.usermanagerid = r4.userid)) \
+             AND ((upper ( r4 . shortusername ) LIKE N'%тест%')))) \
+             GROUP BY r4.shortusername, r2.monthofyearname",
+        );
+    }
+
     fn assert_unsupported(sql: &str, ctx: &TranslateContext, fragment: &str) {
         match translate(sql, ctx) {
             Err(TranslateError::UnsupportedConstruct { sql_fragment, .. }) => assert!(

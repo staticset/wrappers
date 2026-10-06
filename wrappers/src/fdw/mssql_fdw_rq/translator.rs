@@ -900,16 +900,8 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     // the deparser's operator spellings of LIKE / NOT LIKE /
                     // ILIKE / NOT ILIKE
                     "~~" | "!~~" | "~~*" | "!~~*" => {
-                        let case_insensitive = o.ends_with('*');
-                        let negated = o.starts_with('!');
                         translate_like_operator(
-                            &toks,
-                            i,
-                            &mut out,
-                            &mut i,
-                            case_depth,
-                            case_insensitive,
-                            negated,
+                            &toks, i, &mut out, &mut i, &mut depth, case_depth, o,
                         )?;
                         continue;
                     }
@@ -2706,11 +2698,12 @@ fn translate_like_operator(
     i: usize,
     out: &mut Vec<String>,
     next_i: &mut usize,
+    depth: &mut usize,
     case_depth: usize,
-    case_insensitive: bool,
-    negated: bool,
+    op: &str,
 ) -> Result<(), TranslateError> {
-    let negated = negated || pop_if_word(out, "not");
+    let case_insensitive = op.ends_with('*');
+    let negated = op.starts_with('!') || pop_if_word(out, "not");
     let start = capture_subject(out, case_depth)?;
     let lhs = out[start..].join(" ");
 
@@ -2769,6 +2762,13 @@ fn translate_like_operator(
         && matches!(toks.get(i + used_total), Some(Tok::Op(o)) if o == ")");
     let keep_from = if wrapped_by_parens {
         used_total += 1; // consume the closing paren too
+        // and account it in the caller's depth counter: the main loop only
+        // adjusts depth on paren tokens it processes itself, so a `)` eaten
+        // here silently left depth one higher for the rest of the statement,
+        // disarming every top-level (depth == 0) gate after the first `~~`
+        // predicate — GROUP BY ordinals shipped verbatim (MSSQL error 164),
+        // ORDER BY NULL tiebreakers silently dropped (bridge 2026-10-06)
+        *depth = depth.saturating_sub(1);
         start - 1
     } else {
         start
