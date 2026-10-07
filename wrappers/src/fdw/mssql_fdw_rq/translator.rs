@@ -707,8 +707,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     // top-level SELECT DISTINCT: its ORDER BY items must match the SELECT
     // list in T-SQL (error 145), which the NULL tiebreaker cannot
     let mut select_distinct = false;
-    // CASE ... END tracking: casts/ILIKE may not cross an open CASE
-    let mut case_depth = 0usize;
     // current top-level clause: the deparser prints top-level AND-chains in
     // WHERE/HAVING/ON as comma-separated lists, which must become AND
     let mut in_condition_clause = false;
@@ -827,7 +825,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                                 // entirely while the popped direction is
                                 // already gone — the key would silently sort
                                 // differently (and lose DESC) in T-SQL
-                                let start = capture_subject(&out, case_depth).map_err(|_| {
+                                let start = capture_subject(&out).map_err(|_| {
                                     TranslateError::UnsupportedConstruct {
                                         sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
                                         reason: "the window's sort key is not a simple column \
@@ -881,7 +879,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 None,
                                 &declared_aliases,
                                 select_distinct,
@@ -900,9 +897,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     // the deparser's operator spellings of LIKE / NOT LIKE /
                     // ILIKE / NOT ILIKE
                     "~~" | "!~~" | "~~*" | "!~~*" => {
-                        translate_like_operator(
-                            &toks, i, &mut out, &mut i, &mut depth, case_depth, o,
-                        )?;
+                        translate_like_operator(&toks, i, &mut out, &mut i, &mut depth, o)?;
                         continue;
                     }
                     "::" => {
@@ -914,7 +909,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         });
                         let mssql_type = parse_cast_type(&toks[i + 1..], literal.as_deref())?;
                         let end = type_token_len(&toks[i + 1..]);
-                        let start = capture_subject(&out, case_depth)?;
+                        let start = capture_subject(&out)?;
                         let mut expr = out[start..].join(" ");
                         if mssql_type == "datetimeoffset" {
                             // a timestamptz literal's whole-hour offset needs
@@ -1173,7 +1168,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 None,
                                 &declared_aliases,
                                 select_distinct,
@@ -1213,7 +1207,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 None,
                                 &declared_aliases,
                                 select_distinct,
@@ -1244,7 +1237,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 None,
                                 &declared_aliases,
                                 select_distinct,
@@ -1287,8 +1279,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         }
                         continue;
                     }
-                    "case" => case_depth += 1,
-                    "end" => case_depth = case_depth.saturating_sub(1),
                     // condition clauses: their top-level `,` lists mean AND
                     "where" | "having" | "on" if depth == 0 => {
                         in_condition_clause = true;
@@ -1325,7 +1315,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 None,
                                 &declared_aliases,
                                 select_distinct,
@@ -1353,7 +1342,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 None,
                                 &declared_aliases,
                                 select_distinct,
@@ -1381,7 +1369,6 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             close_order_item(
                                 &mut out,
                                 ctx,
-                                case_depth,
                                 Some(desc),
                                 &declared_aliases,
                                 select_distinct,
@@ -1397,7 +1384,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     {
                         // the capture must succeed — a swallowed error would
                         // skip the NULL-ordering check for this key entirely
-                        let start = capture_subject(&out, case_depth).map_err(|_| {
+                        let start = capture_subject(&out).map_err(|_| {
                             TranslateError::UnsupportedConstruct {
                                 sql_fragment: "ORDER BY … inside OVER(…)".to_string(),
                                 reason: "the window's sort key is not a simple column \
@@ -1461,7 +1448,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         let tsql_default_last = dir_desc; // NULL smallest
                         if pg_last != tsql_default_last {
                             // opposite of T-SQL default → prepend CASE tiebreaker
-                            let start = capture_subject(&out, case_depth)?;
+                            let start = capture_subject(&out)?;
                             let expr = out[start..].join(" ");
                             if !is_whole_order_item(&out, start) {
                                 return Err(TranslateError::UnsupportedConstruct {
@@ -1570,11 +1557,11 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     }
                     "any" | "all" if matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") => {
                         let is_any = lw == "any";
-                        translate_any_all(&toks, i, &mut out, &mut i, case_depth, is_any)?;
+                        translate_any_all(&toks, i, &mut out, &mut i, is_any)?;
                         continue;
                     }
                     "ilike" => {
-                        translate_ilike(&toks, i, &mut out, &mut i, case_depth)?;
+                        translate_ilike(&toks, i, &mut out, &mut i)?;
                         continue;
                     }
                     // client text may spell LIKE as a keyword (the deparser
@@ -1602,7 +1589,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         continue;
                     }
                     "is" => {
-                        translate_is(&toks, i, &mut out, &mut i, case_depth)?;
+                        translate_is(&toks, i, &mut out, &mut i)?;
                         continue;
                     }
                     "true" => {
@@ -1676,14 +1663,7 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
 
     // an ORDER BY list can end with the statement itself
     if in_order && !order_item_closed {
-        close_order_item(
-            &mut out,
-            ctx,
-            case_depth,
-            None,
-            &declared_aliases,
-            select_distinct,
-        )?;
+        close_order_item(&mut out, ctx, None, &declared_aliases, select_distinct)?;
     }
 
     Ok(join_pieces(&out))
@@ -1769,7 +1749,6 @@ fn push_null_tiebreaker(out: &mut Vec<String>, start: usize, expr: &str, desc: b
 fn close_order_item(
     out: &mut Vec<String>,
     ctx: &TranslateContext,
-    case_depth: usize,
     desc: Option<bool>,
     declared_aliases: &HashSet<String>,
     select_distinct: bool,
@@ -1789,7 +1768,7 @@ fn close_order_item(
                 .to_string(),
         }
     }
-    let start = capture_subject(out, case_depth)?;
+    let start = capture_subject(out)?;
     let expr = out[start..].join(" ");
     if !is_whole_order_item(out, start) {
         return Err(TranslateError::UnsupportedConstruct {
@@ -2296,17 +2275,30 @@ fn lob_count_arg(toks: &[Tok], ctx: &TranslateContext) -> Option<(Vec<String>, u
     Some((pieces, len))
 }
 
+/// CASE keywords delimit arms of a `CASE … END` construct. They are statement
+/// words, not expressions: a subject capture that would land on one cannot be
+/// rewritten around (`CASE … END :: type` would capture just `END` and emit
+/// `CAST(END …)` garbage), and one standing in front of a `(...)` group is an
+/// arm boundary (`WHEN (a OR b) :: type`), not a function name. Comparison is
+/// case-insensitive like every keyword match here; a column actually named
+/// `end` arrives quoted (`[end]`) and never matches.
+fn is_case_keyword(piece: &str) -> bool {
+    matches!(
+        piece.to_lowercase().as_str(),
+        "case" | "when" | "then" | "else" | "end"
+    )
+}
+
 /// Capture the start index of the "subject" expression that ends at the end of
 /// `out`: a single primary token, a dotted name, or a balanced parenthesized
 /// group optionally preceded by a function name. Returns `Err` (→ caller
 /// reports unsupported) for anything more complex.
-fn capture_subject(out: &[String], case_depth: usize) -> Result<usize, TranslateError> {
-    if case_depth > 0 {
-        return Err(TranslateError::UnsupportedConstruct {
-            sql_fragment: "CASE ... END".to_string(),
-            reason: "casts/ILIKE over CASE expressions are not supported in v1".to_string(),
-        });
-    }
+///
+/// The subject may sit inside an open CASE arm: the bridge's conditional
+/// aggregation arrives as `CASE WHEN r3.monthofyearid = ANY('{…}') THEN … END`
+/// (customer round 11, 2026-10-07), and an open CASE by itself is no reason to
+/// refuse — only a capture landing on a bare CASE keyword is.
+fn capture_subject(out: &[String]) -> Result<usize, TranslateError> {
     if out.is_empty() {
         return Err(TranslateError::UnsupportedConstruct {
             sql_fragment: ":: type".to_string(),
@@ -2315,6 +2307,12 @@ fn capture_subject(out: &[String], case_depth: usize) -> Result<usize, Translate
     }
 
     let last = out.last().unwrap();
+    if is_case_keyword(last) {
+        return Err(TranslateError::UnsupportedConstruct {
+            sql_fragment: "CASE ... END".to_string(),
+            reason: "casts/ILIKE over CASE expressions are not supported in v1".to_string(),
+        });
+    }
     if last == ")" {
         // walk back to the matching "("
         let mut balance = 0i32;
@@ -2326,8 +2324,13 @@ fn capture_subject(out: &[String], case_depth: usize) -> Result<usize, Translate
             } else if out[j] == "(" {
                 balance -= 1;
                 if balance == 0 {
-                    // allow one function name in front of the group
-                    if j >= 1 && is_plain_ident(&out[j - 1]) && out[j - 1] != ")" {
+                    // allow one function name in front of the group — but a
+                    // CASE keyword there is an arm boundary, not a call
+                    if j >= 1
+                        && is_plain_ident(&out[j - 1])
+                        && !is_case_keyword(&out[j - 1])
+                        && out[j - 1] != ")"
+                    {
                         j -= 1;
                     }
                     return Ok(j);
@@ -2640,11 +2643,10 @@ fn translate_ilike(
     i: usize,
     out: &mut Vec<String>,
     next_i: &mut usize,
-    case_depth: usize,
 ) -> Result<(), TranslateError> {
     // `NOT ILIKE`: strip the NOT first so it does not block subject capture
     let negated = pop_if_word(out, "not");
-    let start = capture_subject(out, case_depth)?;
+    let start = capture_subject(out)?;
     let lhs = out[start..].join(" ");
     out.truncate(start);
 
@@ -2699,12 +2701,11 @@ fn translate_like_operator(
     out: &mut Vec<String>,
     next_i: &mut usize,
     depth: &mut usize,
-    case_depth: usize,
     op: &str,
 ) -> Result<(), TranslateError> {
     let case_insensitive = op.ends_with('*');
     let negated = op.starts_with('!') || pop_if_word(out, "not");
-    let start = capture_subject(out, case_depth)?;
+    let start = capture_subject(out)?;
     let lhs = out[start..].join(" ");
 
     let (rhs, consumed) = match toks.get(i + 1) {
@@ -2935,7 +2936,6 @@ fn translate_any_all(
     i: usize,
     out: &mut Vec<String>,
     next_i: &mut usize,
-    case_depth: usize,
     is_any: bool,
 ) -> Result<(), TranslateError> {
     // expected tail: ( ARRAY [ items ] [::type []] )
@@ -2959,7 +2959,7 @@ fn translate_any_all(
         });
     }
     out.pop();
-    let start = capture_subject(out, case_depth)?;
+    let start = capture_subject(out)?;
     // postgres_fdw qualifies every column (`r2.monthofyearid`), so the
     // subject may be a dotted reference, not just a bare name
     let Some(field) = joined_column_reference(out, start) else {
@@ -3084,7 +3084,6 @@ fn translate_is(
     i: usize,
     out: &mut Vec<String>,
     next_i: &mut usize,
-    case_depth: usize,
 ) -> Result<(), TranslateError> {
     let (what, consumed) = match toks.get(i + 1) {
         Some(Tok::Word(w)) if w.eq_ignore_ascii_case("true") => ("true", 2),
@@ -3126,7 +3125,7 @@ fn translate_is(
         }
     };
 
-    let start = capture_subject(out, case_depth)?;
+    let start = capture_subject(out)?;
     let lhs = out[start..].join(" ");
     out.truncate(start);
     let negated = consumed == 3 || pop_if_word(out, "not");

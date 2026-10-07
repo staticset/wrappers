@@ -78,6 +78,12 @@ mod unit {
                 },
                 RelationMapping {
                     local_schema: "srcext".into(),
+                    local_table: "factrevenuetotal_1261000000044".into(),
+                    remote_schema: "navtest".into(),
+                    remote_table: "factrevenuetotal".into(),
+                },
+                RelationMapping {
+                    local_schema: "srcext".into(),
                     local_table: "dimcalendar_1261000000001".into(),
                     remote_schema: "navtest".into(),
                     remote_table: "dimcalendar".into(),
@@ -149,6 +155,110 @@ mod unit {
              [navtest].[dimusers] r4 ON (((r1.usermanagerid = r4.userid)) \
              AND ((upper ( r4 . shortusername ) LIKE N'%тест%')))) \
              GROUP BY r4.shortusername, r2.monthofyearname",
+        );
+    }
+
+    // ---- round 11: subject captures inside an open CASE arm. The bridge's
+    // conditional aggregation (customer round 11, 2026-10-07) arrives as
+    // `SUM(CASE WHEN d.monthofyearid = ANY('{…}'::integer[]) THEN f.x END)`;
+    // the planner folds `string_to_array(…)` into the literal array before
+    // postgres_fdw deparses it. Until round 11 capture_subject refused every
+    // capture while a CASE was open, so the whole widget died with
+    // "casts/ILIKE over CASE expressions are not supported in v1" — an
+    // over-broad gate for a subject (`d.monthofyearid`) that never touches
+    // the CASE keywords. Now only a capture landing ON a bare CASE keyword
+    // (`CASE … END :: type`, unparenthesized) is refused.
+
+    #[test]
+    fn bridge_conditional_aggregation_case_any() {
+        // the exact statement observed arriving from postgres_fdw (bridge log
+        // 2026-10-07, ERROR context): conditional aggregation shipped as one
+        // remote query, the planner having folded `string_to_array('…')` into
+        // literal arrays and the deparser spelling the implicit ELSE as
+        // `ELSE NULL::numeric`. Before round 11 this died with the
+        // "casts/ILIKE over CASE" reject; the dispatched T-SQL below matches
+        // the reference computed by sqlcmd on MSSQL directly.
+        assert_tsql(
+            "SELECT sum((CASE WHEN (r2.monthofyearid = \
+             ANY ('{1,2,3,4,5,6,7,8,9,10,11,12}'::integer[])) THEN r1.amountactual \
+             ELSE NULL::numeric END)), sum((CASE WHEN (r2.monthofyearid = \
+             ANY ('{1,2,3,4,5,6,7,8,9,10,11,12}'::integer[])) THEN r1.quantityactual \
+             ELSE NULL::numeric END)), sum(r1.amountforecast), sum(r1.quantityforecast) \
+             FROM (srcext.factrevenuetotal_1261000000044 r1 INNER JOIN \
+             srcext.dimcalendar_1261000000001 r2 ON (((r1.dateid = r2.dateid)) \
+             AND ((r2.yearid = 2026::smallint)) \
+             AND ((r1.organisationid = ANY ('{b1eac65f-635b-11e9-810b-005056927aa5,\
+57bc09cd-20b2-11ea-8128-005056927aa5,7af417d6-6c51-11e7-8130-001e674b89f9,\
+0634af5f-d7e4-11ef-b510-00620b98e932}'::text[])))))",
+            &bridge3_ctx(),
+            "SELECT sum((CASE WHEN ((r2.monthofyearid \
+             IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))) THEN r1.amountactual \
+             ELSE CAST(NULL AS numeric(38, 18)) END)), sum((CASE WHEN ((r2.monthofyearid \
+             IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))) THEN r1.quantityactual \
+             ELSE CAST(NULL AS numeric(38, 18)) END)), sum(r1.amountforecast), \
+             sum(r1.quantityforecast) \
+             FROM([navtest].[factrevenuetotal] r1 INNER JOIN \
+             [navtest].[dimcalendar] r2 ON (((r1.dateid = r2.dateid)) \
+             AND ((r2.yearid = CAST(2026 AS smallint))) \
+             AND (((r1.organisationid IN ('b1eac65f-635b-11e9-810b-005056927aa5', \
+'57bc09cd-20b2-11ea-8128-005056927aa5', '7af417d6-6c51-11e7-8130-001e674b89f9', \
+'0634af5f-d7e4-11ef-b510-00620b98e932'))))))",
+        );
+    }
+
+    #[test]
+    fn cast_over_column_inside_case_then() {
+        // a :: cast whose subject is a plain column inside a THEN arm — legal
+        // before only outside CASE, silently miscaptured never
+        assert_tsql(
+            "SELECT sum(CASE WHEN ((r2.monthofyearid = ANY ('{1,2}'::integer[]))) \
+             THEN r2.dateid::bigint END) FROM srcext.dimcalendar_1261000000001 r2",
+            &bridge3_ctx(),
+            "SELECT sum(CASE WHEN (((r2.monthofyearid IN (1, 2)))) \
+             THEN CAST(r2 . dateid AS bigint) END) FROM [navtest].[dimcalendar] r2",
+        );
+    }
+
+    #[test]
+    fn like_operator_inside_case_when() {
+        // ~~ inside a WHEN arm: the LIKE subject is a dotted column, not a
+        // CASE keyword — must translate exactly as it does in WHERE
+        assert_tsql(
+            "SELECT sum(CASE WHEN ((r4.shortusername ~~ '%тест%'::text)) \
+             THEN r1.economytotal END) \
+             FROM ((srcext.factpurchaserequestseconomy_1261000000019 r1 INNER JOIN \
+             srcext.dimusers_1261000000023 r4 ON ((r1.usermanagerid = r4.userid))))",
+            &bridge3_ctx(),
+            "SELECT sum(CASE WHEN ((r4 . shortusername LIKE N'%тест%')) \
+             THEN r1.economytotal END) \
+             FROM(([navtest].[factpurchaserequestseconomy] r1 INNER JOIN \
+             [navtest].[dimusers] r4 ON ((r1.usermanagerid = r4.userid))))",
+        );
+    }
+
+    #[test]
+    fn cast_over_parenthesized_case_works() {
+        // `(CASE … END)::type` is a balanced group capture: the whole CASE is
+        // the cast's argument and T-SQL accepts it verbatim
+        assert_tsql(
+            "SELECT ((CASE WHEN ((r2.yearid = 2026::smallint)) THEN r2.dateid END))::bigint \
+             FROM srcext.dimcalendar_1261000000001 r2",
+            &bridge3_ctx(),
+            "SELECT CAST(( ( CASE WHEN ( ( r2 . yearid = CAST(2026 AS smallint) ) ) \
+             THEN r2 . dateid END ) ) AS bigint) FROM [navtest].[dimcalendar] r2",
+        );
+    }
+
+    #[test]
+    fn cast_over_bare_case_end_still_rejected() {
+        // the true unsupported shape the v1 gate was built for: without
+        // parens the walk-back would capture just the `END` keyword and ship
+        // `CAST(END …)` garbage to MSSQL — fail closed instead
+        assert_unsupported(
+            "SELECT CASE WHEN ((r2.yearid = 2026::smallint)) THEN r2.dateid END::bigint \
+             FROM srcext.dimcalendar_1261000000001 r2",
+            &bridge3_ctx(),
+            "CASE ... END",
         );
     }
 
