@@ -262,6 +262,119 @@ mod unit {
         );
     }
 
+    // ---- round 12: self-join — the planner lists one RangeTblEntry per
+    // alias, so `relations` carries the SAME mapping twice. relation_maps
+    // used to treat any duplicate bare name as ambiguous, which un-resolved
+    // the table in its own statement text and killed the query with the
+    // misleading "statement text does not reference the foreign tables".
+
+    fn self_join_ctx() -> TranslateContext {
+        // one foreign table referenced twice (two aliases)
+        let mut ctx = orders_ctx();
+        let dup = ctx.relations[0].clone();
+        ctx.relations.push(dup);
+        ctx
+    }
+
+    #[test]
+    fn self_join_same_table_renders_both_aliases() {
+        assert_tsql(
+            "SELECT r1.id, r2.id FROM public.dbo_orders r1 \
+             JOIN public.dbo_orders r2 ON r1.id = r2.customer_id \
+             WHERE r2.amount > 100",
+            &self_join_ctx(),
+            "SELECT r1.id, r2.id FROM [dbo].[Orders] r1 \
+             JOIN [dbo].[Orders] r2 ON r1.id = r2.customer_id \
+             WHERE r2.amount > 100",
+        );
+    }
+
+    #[test]
+    fn mentions_relation_survives_duplicate_relation() {
+        use super::super::translator::mentions_relation;
+        let ctx = self_join_ctx();
+        assert!(mentions_relation(
+            "SELECT * FROM dbo_orders a JOIN dbo_orders b ON a.id = b.id",
+            &ctx.relations
+        ));
+        // two DIFFERENT relations sharing a bare name stay ambiguous
+        let mut ctx = orders_ctx();
+        ctx.relations.push(RelationMapping {
+            local_schema: "other".into(),
+            local_table: "dbo_orders".into(),
+            remote_schema: "dbo".into(),
+            remote_table: "Orders2".into(),
+        });
+        assert!(!mentions_relation(
+            "SELECT * FROM dbo_orders a JOIN dbo_orders b ON a.id = b.id",
+            &ctx.relations
+        ));
+    }
+
+    // ---- round 12: bare boolean literals in condition position and
+    // boolean select-list items. T-SQL has neither `ON 1` (error 4145) nor
+    // boolean select-list items (error 156) — the former becomes a real
+    // predicate, the latter is refused instead of shipping a guaranteed
+    // remote syntax error.
+
+    #[test]
+    fn boolean_literal_in_condition_is_a_predicate() {
+        assert_tsql(
+            "SELECT true AS flag FROM public.dbo_orders WHERE amount > 0 AND true",
+            &orders_ctx(),
+            "SELECT 1 AS [flag] FROM [dbo].[Orders] WHERE amount > 0 AND (1 = 1)",
+        );
+    }
+
+    #[test]
+    fn on_true_becomes_real_predicate() {
+        assert_tsql(
+            "SELECT count(*) FROM public.dbo_orders a \
+             JOIN public.dbo_customers b ON true",
+            &two_tables_ctx(),
+            "SELECT count(*) FROM [dbo].[Orders] a \
+             JOIN [dbo].[Customers] b ON (1 = 1)",
+        );
+    }
+
+    #[test]
+    fn case_predicate_in_select_list_still_works() {
+        // the CASE itself is a value expression: comparisons inside its
+        // WHEN arms must not trip the select-list guard
+        assert_tsql(
+            "SELECT CASE WHEN amount > 0 THEN 1 ELSE 0 END AS flag \
+             FROM public.dbo_orders WHERE true",
+            &orders_ctx(),
+            "SELECT CASE WHEN amount > 0 THEN 1 ELSE 0 END AS [flag] \
+             FROM [dbo].[Orders] WHERE (1 = 1)",
+        );
+    }
+
+    #[test]
+    fn boolean_select_items_rejected() {
+        // bare and parenthesized spellings, word and operator forms
+        assert_unsupported(
+            "SELECT id, note IS NOT NULL FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT … is …",
+        );
+        assert_unsupported(
+            "SELECT id = 1 FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT … = …",
+        );
+        assert_unsupported(
+            "SELECT (amount > 0) AS flag FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT ( … boolean … )",
+        );
+        assert_unsupported(
+            "SELECT (note ~~ 'a%') AS flag FROM public.dbo_orders",
+            &orders_ctx(),
+            "SELECT ( … boolean … )",
+        );
+    }
+
     fn assert_unsupported(sql: &str, ctx: &TranslateContext, fragment: &str) {
         match translate(sql, ctx) {
             Err(TranslateError::UnsupportedConstruct { sql_fragment, .. }) => assert!(
@@ -2874,6 +2987,75 @@ mod tests {
         };
         assert_eq!(pg, mssql);
         assert_eq!(pg.len(), 4);
+    }
+
+    // ---- round 12: wrapper-shaped statements and self-joins used to be
+    // vetoed by the dead pull-up RTE left in the range table (RTE_RESULT on
+    // PG16+, a NULL-subquery RTE_SUBQUERY on PG15) — they silently ran as
+    // local aggregation over plain scans, and calling pg_get_querydef on
+    // that tree crashed the backend (probe 2026-10-07).
+
+    #[pg_test]
+    fn wrapper_subquery_pushdown_matches_reference() {
+        setup_committed();
+
+        // the widget-constructor form: aggregate over a renaming subquery
+        // (dead RTE after pull-up; T-SQL takes the derived table natively,
+        // so no text inlining is needed)
+        let pg = dblink_pairs(
+            "SELECT 'k' AS name, COUNT(*)::text AS total \
+             FROM (SELECT id FROM rqj_orders WHERE total_amount > 2000) t",
+        );
+        let mssql = mssql_direct(
+            "SELECT 'k' AS name, CAST(COUNT(*) AS nvarchar(30)) AS total \
+             FROM (SELECT id FROM dbo.orders WHERE total_amount > 2000) t",
+        );
+        assert_eq!(pg, mssql);
+        assert_eq!(pg[0].1.parse::<i64>().unwrap(), 10); // ids 51..60
+    }
+
+    #[pg_test]
+    fn multi_table_wrapper_pushdown_matches_reference() {
+        setup_committed();
+
+        // two base relations inside the wrapper: the statement text (not
+        // querydef) is what reaches the translator, wrapper included
+        let pg = dblink_pairs(
+            "SELECT t.n::text AS name, '1' AS total \
+             FROM (SELECT o.total_amount AS n FROM rqj_orders o \
+                   JOIN rqj_customers c ON o.customer_id = c.id \
+                   WHERE o.total_amount > 2000) t \
+             ORDER BY t.n",
+        );
+        let mssql = mssql_direct(
+            "SELECT CAST(n AS nvarchar(30)) AS name, '1' AS total \
+             FROM (SELECT o.total_amount AS n FROM dbo.orders o \
+                   JOIN dbo.customers c ON o.customer_id = c.id \
+                   WHERE o.total_amount > 2000) t \
+             ORDER BY n",
+        );
+        assert_eq!(pg, mssql);
+        assert_eq!(pg.len(), 10);
+    }
+
+    #[pg_test]
+    fn self_join_pushdown_matches_reference() {
+        setup_committed();
+
+        // one foreign table under two aliases: the duplicate relation entry
+        // must not turn into a bare-name ambiguity
+        let pg = dblink_pairs(
+            "SELECT 'k' AS name, COUNT(*)::text AS total \
+             FROM rqj_orders a JOIN rqj_orders b ON a.id = b.id \
+             WHERE a.total_amount > 2000",
+        );
+        let mssql = mssql_direct(
+            "SELECT 'k' AS name, CAST(COUNT(*) AS nvarchar(30)) AS total \
+             FROM dbo.orders a JOIN dbo.orders b ON a.id = b.id \
+             WHERE a.total_amount > 2000",
+        );
+        assert_eq!(pg, mssql);
+        assert_eq!(pg[0].1.parse::<i64>().unwrap(), 10);
     }
 
     /// Fetch (name, total) pairs from rqjoin_test through dblink with a

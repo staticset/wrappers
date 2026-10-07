@@ -647,12 +647,19 @@ unsafe fn full_query_sql_from_planner(root: *mut pg_sys::PlannerInfo) -> Option<
         }
 
         // pg_get_querydef works for single-relation trees but crashes on
-        // multi-relation (join) trees while the planner holds them. For
-        // those, fall back to the original statement text; note this is the
-        // TOP-LEVEL statement, so queries executed through SPI or PL/pgSQL
-        // resolve to the enclosing statement, not the query being planned.
-        // FDWs should reject such queries themselves (see mssql_fdw_rq).
-        if query_has_multiple_base_relations(root) || query_has_non_relation_inputs(root) {
+        // multi-relation (join) trees while the planner holds them — and,
+        // the same way, on trees that still carry dead pull-up leftovers
+        // (RTE_RESULT / a NULL-subquery RTE_SUBQUERY from an inlined
+        // subquery): ruleutils dereferences them (SIGSEGV, round-12 probe
+        // 2026-10-07). For those, fall back to the original statement
+        // text; note this is the TOP-LEVEL statement, so queries executed
+        // through SPI or PL/pgSQL resolve to the enclosing statement, not
+        // the query being planned. FDWs should reject such queries
+        // themselves (see mssql_fdw_rq).
+        if query_has_multiple_base_relations(root)
+            || query_has_non_relation_inputs(root)
+            || query_has_dead_pullup_rtes(root)
+        {
             return current_statement_sql_from_debug_query_string(root);
         }
 
@@ -662,6 +669,46 @@ unsafe fn full_query_sql_from_planner(root: *mut pg_sys::PlannerInfo) -> Option<
         }
 
         Some(CStr::from_ptr(sql).to_string_lossy().into_owned())
+    }
+}
+
+/// Does the range table still carry dead subquery pull-up leftovers?
+/// PostgreSQL 16+ marks them RTE_RESULT, PostgreSQL 15 keeps an
+/// RTE_SUBQUERY whose subquery pointer is NULL. `pg_get_querydef` cannot
+/// run on such a tree mid-planning, and the FDW's relation walk must skip
+/// them (see query_foreign_relations).
+unsafe fn query_has_dead_pullup_rtes(root: *mut pg_sys::PlannerInfo) -> bool {
+    unsafe {
+        if root.is_null() || (*root).parse.is_null() {
+            return false;
+        }
+
+        let rtable = (*(*root).parse).rtable;
+        let len = if rtable.is_null() {
+            0
+        } else {
+            (*rtable).length as usize
+        };
+
+        for i in 0..len {
+            let cell = (*rtable).elements.add(i);
+            let rte = (*cell).ptr_value as *mut pg_sys::RangeTblEntry;
+            if rte.is_null() {
+                continue;
+            }
+
+            let dead = match (*rte).rtekind {
+                #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+                pg_sys::RTEKind::RTE_RESULT => true,
+                pg_sys::RTEKind::RTE_SUBQUERY => (*rte).subquery.is_null(),
+                _ => false,
+            };
+            if dead {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -1102,6 +1149,16 @@ unsafe fn query_foreign_relations(
                     relations.push(foreign_relation_from_rte(rte)?);
                 }
                 pg_sys::RTEKind::RTE_JOIN => {}
+                // Dead range-table entries left behind by subquery pull-up:
+                // PostgreSQL 16+ marks them RTE_RESULT, PostgreSQL 15 keeps
+                // an RTE_SUBQUERY whose subquery pointer is NULL. Either way
+                // the flattened query no longer references them (vars point
+                // at the base relations), so they must not veto the
+                // full-query path for wrapper-shaped statements — the FDW
+                // still has to make sense of the statement text itself.
+                #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+                pg_sys::RTEKind::RTE_RESULT => {}
+                pg_sys::RTEKind::RTE_SUBQUERY if (*rte).subquery.is_null() => {}
                 _ => return None,
             }
         }
@@ -1310,6 +1367,11 @@ unsafe fn query_has_non_relation_inputs(root: *mut pg_sys::PlannerInfo) -> bool 
 
             match (*rte).rtekind {
                 pg_sys::RTEKind::RTE_RELATION | pg_sys::RTEKind::RTE_JOIN => {}
+                // dead pull-up leftovers (see query_foreign_relations):
+                // RTE_RESULT on PG16+, a NULL-subquery RTE_SUBQUERY on PG15
+                #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+                pg_sys::RTEKind::RTE_RESULT => {}
+                pg_sys::RTEKind::RTE_SUBQUERY if (*rte).subquery.is_null() => {}
                 _ => return true,
             }
         }

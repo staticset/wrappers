@@ -707,6 +707,20 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
     // top-level SELECT DISTINCT: its ORDER BY items must match the SELECT
     // list in T-SQL (error 145), which the NULL tiebreaker cannot
     let mut select_distinct = false;
+    // condition context for bare boolean literals: the depth a
+    // WHERE/HAVING/ON clause started at (ANY depth — deparser prints join
+    // trees inside parentheses). `ON true`/`WHERE … AND true` must become
+    // `(1 = 1)`, because T-SQL refuses a non-boolean condition (error 4145)
+    let mut condition_depth: Option<usize> = None;
+    // select-list context (ANY depth — wrappers nest): boolean expressions
+    // are not valid T-SQL select-list items (error 156), so they are
+    // rejected instead of shipped as a guaranteed remote syntax error.
+    // Tracked as the (paren depth, case depth) at the SELECT keyword: an
+    // item is at list top level exactly while both match
+    let mut target_list: Option<(usize, usize)> = None;
+    // CASE-arm guard for the select-list check (round 11 removed the old
+    // capture plumbing; only this local counter came back)
+    let mut case_depth = 0usize;
     // current top-level clause: the deparser prints top-level AND-chains in
     // WHERE/HAVING/ON as comma-separated lists, which must become AND
     let mut in_condition_clause = false;
@@ -751,6 +765,25 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         });
                     }
                     "(" => {
+                        // a parenthesized select-list item at list top level
+                        // (PG deparses boolean items as `(a = b)`) containing
+                        // a top-level boolean operator is not translatable
+                        // into a valid T-SQL select list (error 156). The
+                        // OVER ( … ) group is a window specification, not an
+                        // item: its frame's `ROWS BETWEEN … AND …` is not a
+                        // boolean conjunction
+                        if target_list.is_some_and(|(d0, c0)| depth == d0 && case_depth == c0)
+                            && !out.last().is_some_and(|p| p.eq_ignore_ascii_case("over"))
+                            && group_has_toplevel_boolean(&toks, i)
+                        {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: "SELECT ( … boolean … )".to_string(),
+                                reason: "boolean expressions are not valid T-SQL \
+                                         select-list items; wrap the predicate in \
+                                         CASE WHEN … THEN 1 ELSE 0 END"
+                                    .to_string(),
+                            });
+                        }
                         depth += 1;
                         if next_opens_over {
                             over_paren_depth = Some(depth);
@@ -897,6 +930,17 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                     // the deparser's operator spellings of LIKE / NOT LIKE /
                     // ILIKE / NOT ILIKE
                     "~~" | "!~~" | "~~*" | "!~~*" => {
+                        // LIKE over a select-list item is a boolean in T-SQL
+                        // terms — same fail-closed as the word spellings
+                        if target_list.is_some_and(|(d0, c0)| depth == d0 && case_depth == c0) {
+                            return Err(TranslateError::UnsupportedConstruct {
+                                sql_fragment: "SELECT … ~~ …".to_string(),
+                                reason: "boolean expressions are not valid T-SQL \
+                                         select-list items; wrap the predicate in \
+                                         CASE WHEN … THEN 1 ELSE 0 END"
+                                    .to_string(),
+                            });
+                        }
                         translate_like_operator(&toks, i, &mut out, &mut i, &mut depth, o)?;
                         continue;
                     }
@@ -941,6 +985,19 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                             i += 1 + item_len + extra;
                             continue;
                         }
+                    }
+                    // comparison operators in a select-list item: same
+                    // fail-closed as the word spellings (error 156)
+                    "=" | "!=" | "<>" | "<" | ">" | "<=" | ">="
+                        if target_list.is_some_and(|(d0, c0)| depth == d0 && case_depth == c0) =>
+                    {
+                        return Err(TranslateError::UnsupportedConstruct {
+                            sql_fragment: format!("SELECT … {o} …"),
+                            reason: "boolean expressions are not valid T-SQL \
+                                     select-list items; wrap the predicate in \
+                                     CASE WHEN … THEN 1 ELSE 0 END"
+                                .to_string(),
+                        });
                     }
                     _ => {}
                 }
@@ -1124,6 +1181,76 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                 }
 
                 let lw = w.to_lowercase();
+
+                // --- clause-context tracking (round 12) --------------------
+                // WHERE/HAVING/ON open a condition context at any depth;
+                // a structural keyword at or outside that depth closes it
+                match lw.as_str() {
+                    "where" | "having" | "on" => condition_depth = Some(depth),
+                    "select" => target_list = Some((depth, case_depth)),
+                    "case" => case_depth += 1,
+                    "end" => case_depth = case_depth.saturating_sub(1),
+                    _ => {}
+                }
+                if condition_depth.is_some_and(|d| depth <= d)
+                    && matches!(
+                        lw.as_str(),
+                        "select"
+                            | "from"
+                            | "group"
+                            | "order"
+                            | "limit"
+                            | "offset"
+                            | "fetch"
+                            | "union"
+                            | "intersect"
+                            | "except"
+                            | "returning"
+                            | "window"
+                    )
+                {
+                    condition_depth = None;
+                }
+                if target_list.is_some_and(|(d0, _)| depth == d0)
+                    && matches!(
+                        lw.as_str(),
+                        "from"
+                            | "where"
+                            | "having"
+                            | "group"
+                            | "order"
+                            | "limit"
+                            | "offset"
+                            | "fetch"
+                            | "union"
+                            | "intersect"
+                            | "except"
+                            | "into"
+                            | "window"
+                    )
+                {
+                    target_list = None;
+                }
+
+                // --- boolean predicates as select-list items ----------------
+                // T-SQL has no boolean select-list items: these spellings
+                // always die on MSSQL with error 156 — fail closed instead
+                // (round 12; parenthesized forms are caught at the `(` arm)
+                if target_list.is_some_and(|(d0, c0)| depth == d0 && case_depth == c0)
+                    && matches!(
+                        lw.as_str(),
+                        "and" | "or" | "is" | "like" | "ilike" | "between" | "in"
+                    )
+                {
+                    return Err(TranslateError::UnsupportedConstruct {
+                        sql_fragment: format!("SELECT … {lw} …"),
+                        reason: "boolean expressions are not valid T-SQL \
+                                 select-list items; wrap the predicate in \
+                                 CASE WHEN … THEN 1 ELSE 0 END"
+                            .to_string(),
+                    });
+                }
+
                 // `cast (` opens a parenthesized type position — its AS is
                 // not an alias (see the alias bracketing below)
                 if lw == "cast" && matches!(toks.get(i + 1), Some(Tok::Op(o)) if o == "(") {
@@ -1592,13 +1719,25 @@ pub fn translate(sql: &str, ctx: &TranslateContext) -> Result<String, TranslateE
                         translate_is(&toks, i, &mut out, &mut i)?;
                         continue;
                     }
-                    "true" => {
-                        out.push("1".to_string());
-                        i += 1;
-                        continue;
-                    }
-                    "false" => {
-                        out.push("0".to_string());
+                    "true" | "false" => {
+                        // T-SQL has no boolean literals. Value positions
+                        // (SELECT list, CASE THEN/ELSE, the right side of a
+                        // comparison — `active = true`) take 1/0; predicate
+                        // positions (`ON true`, `WHERE … AND true`) need a
+                        // real predicate or MSSQL rejects the query with
+                        // error 4145 (round 12)
+                        let value_position = out.last().is_some_and(|p| {
+                            matches!(p.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=")
+                        });
+                        if condition_depth.is_some_and(|d| depth >= d) && !value_position {
+                            out.push(if lw == "true" {
+                                "(1 = 1)".to_string()
+                            } else {
+                                "(1 = 0)".to_string()
+                            });
+                        } else {
+                            out.push(if lw == "true" { "1" } else { "0" }.to_string());
+                        }
                         i += 1;
                         continue;
                     }
@@ -2298,6 +2437,55 @@ fn is_case_keyword(piece: &str) -> bool {
 /// aggregation arrives as `CASE WHEN r3.monthofyearid = ANY('{…}') THEN … END`
 /// (customer round 11, 2026-10-07), and an open CASE by itself is no reason to
 /// refuse — only a capture landing on a bare CASE keyword is.
+/// Does the balanced `(...)` group starting at `start` (the `(` itself)
+/// contain a boolean operator at the group's own top level? PostgreSQL
+/// deparses boolean select-list items parenthesized (`(a = b)`), so the
+/// parenthesized spelling needs the same fail-closed treatment as the
+/// bare one. CASE arms inside the group are value contexts and do not
+/// count.
+fn group_has_toplevel_boolean(toks: &[Tok], start: usize) -> bool {
+    let mut paren_depth = 0usize;
+    let mut case_depth = 0usize;
+    let mut k = start;
+    while k < toks.len() {
+        match &toks[k] {
+            Tok::Op(o) if o == "(" => paren_depth += 1,
+            Tok::Op(o) if o == ")" => {
+                paren_depth = paren_depth.saturating_sub(1);
+                if paren_depth == 0 {
+                    return false;
+                }
+            }
+            Tok::Op(o)
+                if paren_depth == 1
+                    && case_depth == 0
+                    && matches!(
+                        o.as_str(),
+                        "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=" | "~~" | "!~~" | "~~*" | "!~~*"
+                    ) =>
+            {
+                return true;
+            }
+            Tok::Word(w) if paren_depth == 1 => {
+                let lw = w.to_lowercase();
+                match lw.as_str() {
+                    "case" => case_depth += 1,
+                    "end" => case_depth = case_depth.saturating_sub(1),
+                    "and" | "or" | "is" | "like" | "ilike" | "between" | "in"
+                        if case_depth == 0 =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    false
+}
+
 fn capture_subject(out: &[String]) -> Result<usize, TranslateError> {
     if out.is_empty() {
         return Err(TranslateError::UnsupportedConstruct {
@@ -3181,9 +3369,22 @@ fn relation_maps(relations: &[RelationMapping]) -> RelationMaps<'_> {
             rel,
         );
         let bare = rel.local_table.to_lowercase();
-        if maps.by_table.contains_key(&bare) || maps.ambiguous_bare.contains(&bare) {
+        if let Some(existing) = maps.by_table.get(&bare) {
+            // a self-join lists the same relation twice (one RangeTblEntry per
+            // alias): both map to the same remote table, so the bare name
+            // still resolves unambiguously. Only two DIFFERENT relations
+            // sharing a bare name are genuinely ambiguous.
+            if existing
+                .local_schema
+                .eq_ignore_ascii_case(&rel.local_schema)
+                && existing.local_table.eq_ignore_ascii_case(&rel.local_table)
+            {
+                continue;
+            }
             maps.by_table.remove(&bare);
             maps.ambiguous_bare.insert(bare);
+        } else if maps.ambiguous_bare.contains(&bare) {
+            // stays ambiguous until a different name arrives
         } else {
             maps.by_table.insert(bare, rel);
         }
